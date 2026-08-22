@@ -1,0 +1,27 @@
+# virtualenvs / caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# papers: fetched on demand by scripts/fetch_papers.sh (copyright + repo size)
+pdfs/*.pdf
+pdfs/txt/
+
+# experiment outputs. The two recorded test logs referenced by the README are
+# force-added; everything else here is regenerable.
+outputs/*
+!outputs/.gitkeep
+!outputs/smoke_test_output.txt
+!outputs/unit_test_output.txt
+
+# model checkpoints / adapters
+*.safetensors
+*.bin
+*.pt
+!latentsql/**/*.py
+
+# os
+.DS_Store
+Thumbs.db

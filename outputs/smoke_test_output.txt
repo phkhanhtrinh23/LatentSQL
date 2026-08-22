@@ -1,0 +1,128 @@
+==========================================================================
+LatentSQL smoke test
+  scratch: outputs\_smoke
+  teacher: mock backend (offline test double - not a language model)
+==========================================================================
+
+--------------------------------------------------------------------------
+tier 1 - data, database layer
+--------------------------------------------------------------------------
+  PASS  synthetic benchmark builds  (0.03s)  30 questions, 2 databases
+  PASS  gold queries all execute  (0.02s)  30/30 ok
+  PASS  execution accuracy metric is sound  (0.00s)  match / mismatch / order-sensitivity all correct
+  PASS  write statements are refused  (0.00s)  DROP rejected
+  PASS  schema introspection + CR^p rendering  (0.00s)  4 tables, 17 cols, 3 FKs
+  PASS  LSH value index retrieves cell values  (0.01s)  exact + fuzzy hits (singer.country = 'France')
+
+--------------------------------------------------------------------------
+tier 1 - teacher multi-agent system
+--------------------------------------------------------------------------
+  PASS  FusionSQL teacher produces a labelled trace  (0.10s)  EX=8/8, agents=['dail_icl', 'divide_conquer', 'query_plan'], max_rounds=2
+  PASS  debate beats its own panellists  (0.00s)  debate=8/8 vs best single agent=8/8
+  PASS  trace renders, parses and round-trips through jsonl  (0.02s)  1720 chars, 2 rounds, 6 turns
+  PASS  SFT corpus filtering  (0.00s)  8/8 traces kept (dropped: no_consensus=0, incorrect=0, no_sql=0, exec_failed=0, too_long=0, duplicate=0)
+
+--------------------------------------------------------------------------
+tier 1 - published baselines
+--------------------------------------------------------------------------
+  PASS  all four baselines run  (0.13s)  single:5/8@462tok | din_sql:7/8@1250tok | dail_sql:7/8@2323tok | chess:8/8@2803tok | chase_sql:8/8@2719tok
+
+--------------------------------------------------------------------------
+tier 1 - IMAD reward function
+--------------------------------------------------------------------------
+  PASS  reward schedule anneals w_fmt and l  (0.00s)  w_fmt 1.00->0.05, l 2000->500
+  PASS  R_fmt + R(y;l) behave as IMAD eq. 1-2  (0.01s)  full=2.200 internalised=1.225 late_full=1.250 wrong=0.225
+  PASS  length clipping actually clips  (0.00s)  verbose trace earns 0 under a 12-token clip
+  PASS  GRPO group advantages normalise within a group  (0.00s)  advantages=[1.732, -0.577, -0.577, -0.577]
+  downloading tiny test model hf-internal-testing/tiny-random-LlamaForCausalLM ...
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 10 files:  10%|#         | 1/10 [00:00<00:02,  3.96it/s]Fetching 10 files:  70%|#######   | 7/10 [00:00<00:00, 14.51it/s]Fetching 10 files:  90%|######### | 9/10 [00:03<00:00,  2.17it/s]Fetching 10 files: 100%|##########| 10/10 [00:03<00:00,  3.00it/s]
+
+--------------------------------------------------------------------------
+tier 2 - torch 2.13.0+cpu | model C:\Users\TrinhPham\Dropbox\thesis\latent_agent_text2sql\outputs\_smoke\hub\models--hf-internal-testing--tiny-random-LlamaForCausalLM\snapshots\9fb191250dd56d0ba7ec9785a025ed29c03d5998
+--------------------------------------------------------------------------
+[transformers] Model config: pad_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got -1. This may result in unexpected behavior.
+[transformers] The following generation flags are not valid and may be ignored: ['pad_token_id']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+Loading weights:   0%|          | 0/21 [00:00<?, ?it/s]Loading weights: 100%|##########| 21/21 [00:00<?, ?it/s]
+trainable params: 23,552 || all params: 1,055,824 || trainable%: 2.2307
+  PASS  student loads with LoRA attached  (6.71s)  1.1M params, 24K trainable
+  PASS  prompt tokens are masked out of the SFT loss  (0.01s)  653 prompt tokens masked; full-trace supervises 371 vs 36 for consensus-only
+[sft] 4 examples | 2 optimizer steps | device=cpu | lora=True
+[sft] {'step': 1, 'loss': 10.370613098144531, 'lr': 0.0001, 'elapsed_s': 0.3}
+[sft] {'step': 2, 'loss': 10.373355865478516, 'lr': 0.0, 'elapsed_s': 0.5}
+  PASS  SFT runs and the loss is finite  (0.61s)  2 steps, loss=10.373, 0.6s
+
+--------------------------------------------------------------------------
+tier 2 - GRPO with the annealed reward
+--------------------------------------------------------------------------
+[grpo] 2 prompts | group=2 | 2 optimizer steps | w_fmt 1.0->0.05 | l 20->8
+[grpo] {'step': 1, 'w_fmt': 0.050000000000000044, 'length_limit': 8, 'reward_mean': 0.0, 'r_fmt_mean': 0.0, 'r_clip_mean': 0.0, 'gen_tokens_mean': 24.0, 'elapsed_s': 0.1}
+[grpo] {'step': 2, 'w_fmt': 0.050000000000000044, 'length_limit': 8, 'reward_mean': 0.0, 'r_fmt_mean': 0.0, 'r_clip_mean': 0.0, 'gen_tokens_mean': 24.0, 'elapsed_s': 0.3}
+  PASS  GRPO takes a real optimizer step  (0.32s)  2 steps, params_changed=False, 3 SQL executions, l=8
+[grpo] 1 prompts | group=2 | 1 optimizer steps | w_fmt 1.0->0.05 | l 20->8
+[grpo] {'step': 1, 'w_fmt': 0.050000000000000044, 'length_limit': 8, 'reward_mean': 0.5, 'r_fmt_mean': 0.0, 'r_clip_mean': 0.0, 'gen_tokens_mean': 24.0, 'elapsed_s': 0.4}
+  PASS  GRPO updates parameters when the group has reward variance  (0.46s)  28/28 LoRA tensors updated over 2 rollouts
+
+--------------------------------------------------------------------------
+tier 2 - LatentMAS latent thoughts
+--------------------------------------------------------------------------
+  PASS  input-output aligners map hidden states to embedding space  (0.01s)  soft_embed:|e|=0.02 linear:|e|=0.06 identity:|e|=3.18 (emb ref 0.08)
+  PASS  latent roles run and only the final query is decoded  (0.16s)  6 latent steps emitted 0 tokens; 12 tokens decoded
+  PASS  latent working memory carries earlier roles forward  (0.13s)  shared memory = 684 positions vs 7 when isolated (same 6 latent steps)
+  PASS  latent-slot curriculum replaces agent blocks  (0.00s)  1720 -> 1497 -> 1185 chars
+
+--------------------------------------------------------------------------
+tier 2 - agent subspaces (CAA)
+--------------------------------------------------------------------------
+  PASS  contrastive pairs are built from the traces  (0.00s)  8 pairs, context ends at the target agent tag
+  PASS  steering vectors extract and are separable  (0.48s)  3 unit vectors @ layer 1, cos={dail_icl|divide_conquer:-0.51, dail_icl|query_plan:+0.51, divide_conquer|query_plan:-1.00}
+  PASS  steering hook changes generation  (0.04s)  2 layers; steering altered the output
+
+--------------------------------------------------------------------------
+tier 2 - student evaluation path
+--------------------------------------------------------------------------
+  PASS  student evaluation produces scored predictions  (0.11s)  n=2 EX=0% avg_tokens=672
+
+--------------------------------------------------------------------------
+summary
+--------------------------------------------------------------------------
+  PASS  synthetic benchmark builds
+  PASS  gold queries all execute
+  PASS  execution accuracy metric is sound
+  PASS  write statements are refused
+  PASS  schema introspection + CR^p rendering
+  PASS  LSH value index retrieves cell values
+  PASS  FusionSQL teacher produces a labelled trace
+  PASS  debate beats its own panellists
+  PASS  trace renders, parses and round-trips through jsonl
+  PASS  SFT corpus filtering
+  PASS  all four baselines run
+  PASS  reward schedule anneals w_fmt and l
+  PASS  R_fmt + R(y;l) behave as IMAD eq. 1-2
+  PASS  length clipping actually clips
+  PASS  GRPO group advantages normalise within a group
+  PASS  student loads with LoRA attached
+  PASS  prompt tokens are masked out of the SFT loss
+  PASS  SFT runs and the loss is finite
+  PASS  GRPO takes a real optimizer step
+  PASS  GRPO updates parameters when the group has reward variance
+  PASS  input-output aligners map hidden states to embedding space
+  PASS  latent roles run and only the final query is decoded
+  PASS  latent working memory carries earlier roles forward
+  PASS  latent-slot curriculum replaces agent blocks
+  PASS  contrastive pairs are built from the traces
+  PASS  steering vectors extract and are separable
+  PASS  steering hook changes generation
+  PASS  student evaluation produces scored predictions
+
+28/28 checks passed in 16.0s
+
+Mock-backend pipeline sanity (NOT results - the teacher is a stub):
+  single       5/8 correct, ~462 tokens/question
+  din_sql      7/8 correct, ~1250 tokens/question
+  dail_sql     7/8 correct, ~2323 tokens/question
+  chess        8/8 correct, ~2803 tokens/question
+  chase_sql    8/8 correct, ~2719 tokens/question
+  fusion_mas   8/8 correct, ~5425 tokens/question
+
+(scratch kept at outputs\_smoke - pass --keep to reuse, it is deleted on rerun)

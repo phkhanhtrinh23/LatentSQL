@@ -1,0 +1,30 @@
+test_masking_removes_domain_words (__main__.TestDailSelection.test_masking_removes_domain_words) ... ok
+test_query_skeleton (__main__.TestDailSelection.test_query_skeleton) ... ok
+test_bad_sql_is_an_error_not_a_crash (__main__.TestExecution.test_bad_sql_is_an_error_not_a_crash) ... ok
+test_execution_accuracy_semantics (__main__.TestExecution.test_execution_accuracy_semantics) ... ok
+test_gold_queries_execute (__main__.TestExecution.test_gold_queries_execute) ... ok
+test_order_sensitivity (__main__.TestExecution.test_order_sensitivity) ... ok
+test_ordered_comparison_respects_row_order (__main__.TestExecution.test_ordered_comparison_respects_row_order) ... ok
+test_read_only_guard (__main__.TestExecution.test_read_only_guard) ... ok
+test_unordered_comparison_ignores_row_order (__main__.TestExecution.test_unordered_comparison_ignores_row_order) ... ok
+test_group_advantages (__main__.TestRewards.test_group_advantages) ... ok
+test_schedule_is_stable_for_a_single_step (__main__.TestRewards.test_schedule_is_stable_for_a_single_step) ... ok
+test_weight_and_length_anneal_monotonically (__main__.TestRewards.test_weight_and_length_anneal_monotonically) ... ok
+test_introspection (__main__.TestSchema.test_introspection) ... ok
+test_prune_keeps_join_keys (__main__.TestSchema.test_prune_keeps_join_keys) ... ok
+test_prune_with_empty_links_is_identity (__main__.TestSchema.test_prune_with_empty_links_is_identity) ... ok
+test_render_includes_keys_and_examples (__main__.TestSchema.test_render_includes_keys_and_examples) ... ok
+test_identical_results_group_together (__main__.TestSelectorGrouping.test_identical_results_group_together) ... ok
+test_extract_final_sql_handles_internalised_output (__main__.TestTrace.test_extract_final_sql_handles_internalised_output) ... ok
+test_extract_prefers_consensus_over_earlier_agent_sql (__main__.TestTrace.test_extract_prefers_consensus_over_earlier_agent_sql) ... ok
+test_format_score (__main__.TestTrace.test_format_score) ... ok
+test_normalize_sql (__main__.TestTrace.test_normalize_sql) ... ok
+test_render_parse_roundtrip (__main__.TestTrace.test_render_parse_roundtrip) ... ok
+test_tag_order_score_penalises_scrambling (__main__.TestTrace.test_tag_order_score_penalises_scrambling) ... ok
+test_exact_and_fuzzy_retrieval (__main__.TestValueIndex.test_exact_and_fuzzy_retrieval) ... ok
+test_numeric_columns_are_not_indexed (__main__.TestValueIndex.test_numeric_columns_are_not_indexed) ... ok
+
+----------------------------------------------------------------------
+Ran 25 tests in 0.060s
+
+OK

@@ -1,0 +1,129 @@
+#!/usr/bin/env python
+"""Stage 2: internalisation via GRPO with dynamic reward scheduling (IMAD 2.3).
+
+    python scripts/03_grpo.py --config configs/bird_local.yaml \
+        --data outputs/traces/sft.jsonl --sft outputs/sft
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from latentsql.config import load_config
+from latentsql.distill.build_dataset import load_records
+from latentsql.distill.grpo import GRPOTrainer, load_reference, tasks_from_records
+from latentsql.distill.rewards import ExecutionOracle
+from latentsql.distill.sft import prepare_student
+from latentsql.llm.hf_local import load_model
+from latentsql.utils.common import banner, set_seed, write_json
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--data", default="outputs/traces/sft.jsonl")
+    ap.add_argument("--sft", default=None, help="SFT adapter dir (default: sft.output_dir)")
+    ap.add_argument("--base", default=None, help="base model (default: sft.model_name_or_path)")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--epochs", type=float, default=None)
+    ap.add_argument("--group-size", type=int, default=None)
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--len-start", type=int, default=None)
+    ap.add_argument("--len-end", type=int, default=None)
+    ap.add_argument(
+        "--from-examples", default=None,
+        help="build GRPO prompts straight from a benchmark (bird|spider|synthetic) "
+             "instead of from teacher traces. With --sft pointing nowhere this is "
+             "the no-teacher ablation: RL from the base model on execution reward only.",
+    )
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    sft_dir = args.sft or cfg.sft.output_dir
+    base = args.base or cfg.sft.model_name_or_path
+    if args.out:
+        cfg.grpo.output_dir = args.out
+    if args.epochs is not None:
+        cfg.grpo.epochs = args.epochs
+    if args.group_size:
+        cfg.grpo.group_size = args.group_size
+    if args.len_start:
+        cfg.grpo.reward.len_start = args.len_start
+    if args.len_end:
+        cfg.grpo.reward.len_end = args.len_end
+    set_seed(cfg.grpo.seed)
+
+    banner("loading tasks")
+    if args.from_examples:
+        from latentsql.db import schema as schema_mod
+        from latentsql.distill.grpo import tasks_from_examples
+        from latentsql.utils.common import resolve_examples
+
+        examples, used = resolve_examples(
+            cfg, dataset=args.from_examples, limit=args.limit, split="train"
+        )
+
+        def _render(ex):
+            return schema_mod.render_schema(
+                schema_mod.load_schema_cached(ex.db_path, ex.db_id), style="code"
+            )
+
+        tasks = tasks_from_examples(examples, _render)
+        print(f"no-teacher ablation: prompts built directly from {used}")
+    else:
+        records = load_records(args.data)
+        if args.limit:
+            records = records[: args.limit]
+        tasks = tasks_from_records(records)
+    if not tasks:
+        print("no GRPO tasks: prompts need db_path and gold_sql")
+        return 1
+    print(f"{len(tasks)} prompts | group_size={cfg.grpo.group_size}")
+
+    banner(f"loading SFT student ({base} + {sft_dir})")
+    from latentsql.llm.hf_local import resolve_model_path
+
+    base_path = resolve_model_path(
+        base, hub_dir=cfg.paths.hf_hub, local_only=False
+    )
+    bundle = load_model(
+        base_path,
+        device=cfg.grpo.device,
+        dtype=("bfloat16" if cfg.grpo.bf16 else "auto"),
+        hub_dir=cfg.paths.hf_hub,
+        adapter_path=(sft_dir if os.path.exists(os.path.join(sft_dir, "adapter_config.json")) else None),
+        trainable=True,
+    )
+    if not hasattr(bundle.model, "disable_adapter"):
+        # no LoRA found: attach fresh adapters so GRPO stays parameter-efficient
+        from peft import LoraConfig, get_peft_model
+
+        bundle.model = get_peft_model(
+            bundle.model,
+            LoraConfig(
+                r=cfg.sft.lora_r, lora_alpha=cfg.sft.lora_alpha,
+                lora_dropout=cfg.sft.lora_dropout,
+                target_modules=cfg.sft.lora_target_modules,
+                task_type="CAUSAL_LM", bias="none",
+            ),
+        )
+    for n, p in bundle.model.named_parameters():
+        p.requires_grad_("lora_" in n)
+
+    banner("GRPO")
+    oracle = ExecutionOracle(timeout=cfg.mas.execution_timeout)
+    trainer = GRPOTrainer(bundle, cfg.grpo, oracle)
+    ref = load_reference(bundle)
+    result = trainer.train(
+        tasks, ref, log_path=os.path.join(cfg.grpo.output_dir, "grpo_log.json")
+    )
+    write_json(result, os.path.join(cfg.grpo.output_dir, "grpo_result.json"))
+    print(f"\nsaved internalised student to {result['output_dir']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
