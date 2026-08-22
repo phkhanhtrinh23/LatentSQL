@@ -112,6 +112,19 @@ python scripts/00_list_models.py --hub /mnt/win_d/hub --max-params 7
 Prints name / parameter count / path for every causal LM in the hub. Put a name
 from that list into `llm.model` (teacher) and `sft.model_name_or_path` (student).
 
+### Full pipeline on BIRD + Spider combined
+
+[`configs/mix_local.yaml`](configs/mix_local.yaml) — a 7B teacher distilled
+into a 3B student over one set drawn from **both** benchmarks:
+
+```bash
+python scripts/01_build_traces.py --config configs/mix_local.yaml --limit 600
+python scripts/02_sft.py          --config configs/mix_local.yaml
+python scripts/03_grpo.py         --config configs/mix_local.yaml
+python scripts/04_eval.py         --config configs/mix_local.yaml \
+    --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas,student,latent
+```
+
 ### Full pipeline on BIRD
 
 ```bash
@@ -200,6 +213,57 @@ numbers copied from four papers:
 ```bash
 python scripts/04_eval.py --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas
 ```
+
+### Option: make the four systems *be* the panel
+
+The default panel is three prompt personas. The four published systems can
+instead sit on the panel themselves, so the debate the student internalises is
+an argument **between DIN-SQL, DAIL-SQL, CHESS and CHASE-SQL**:
+
+```yaml
+mas:
+  agents: [din_sql, dail_sql, chess, chase_sql]
+```
+
+Round 1 runs each system's own published pipeline end to end and takes its
+winning candidate; round 2+ uses the shared debate prompt, so the systems argue
+over each other's answers with execution feedback attached. Tags come out as
+`<|agent din_sql|>`, `<|agent chess|>`, … and the reasoning behind each
+system's selected candidate is preserved
+([`_pick`](latentsql/mas/baselines.py)), which is what makes the transcript
+worth training on.
+
+Why it is worth the cost with a 7B teacher: `trace.require_correct` throws away
+every question the teacher gets wrong, so **trace yield is the binding
+constraint**, and four independent pipelines give four shots at a correct
+candidate instead of three prompt variants of one.
+
+The price is that each panellist is itself multi-call. Measured on the
+workstation (Qwen2.5-7B-Instruct, bf16, one RTX 4090, `rounds: 2`, one prompt
+at a time through `model.generate`):
+
+| Panel | s / question | LLM calls | Output tokens | 3 000-question pass |
+|---|---:|---:|---:|---:|
+| `[din_sql, dail_sql, chess, chase_sql]` | 49.6 | 26.2 | 2 134 | ~41 h |
+| `[divide_conquer, query_plan, dail_icl]` | 18.6 | 13.8 | 968 | ~16 h |
+
+Cost is strongly split-dependent — BIRD questions ran 62-84 s against Spider's
+23-30 s, tracking schema size. Only the questions the teacher gets *right*
+survive into the corpus, so size a pass by target trace count, not question
+count.
+
+On the same four questions both panels scored 1/4 correct, but only the
+four-system panel also **reached consensus** on the one it got right, so it
+yielded 1 usable trace against the persona panel's 0. That is n = 4 — an
+illustration of where the extra 2.7x cost can pay (yield through
+`require_consensus`, not raw accuracy), *not* evidence. Run a yield probe over
+60-100 mixed questions before committing a multi-day pass.
+
+The single biggest lever is not the panel: it is that `HFLocalBackend.chat`
+generates **one prompt at a time**. Serving the same weights behind vLLM and
+switching to `backend: openai` + `base_url` (already supported, see
+[configs/teacher_openai.yaml](configs/teacher_openai.yaml)) buys continuous
+batching on the same GPU. Do that before scaling the question count.
 
 ---
 
@@ -363,14 +427,51 @@ for runaway queries, and a guard that refuses any non-read-only statement
 Expected layout (auto-detected; vanilla BIRD/Spider layouts also work):
 
 ```
-/mnt/win_d/data_FusionSQL/bird/sft_bird_dev_text2sql.json
-/mnt/win_d/data_FusionSQL/bird/dev/dev_databases/<db_id>/<db_id>.sqlite
-/mnt/win_d/data_FusionSQL/spider/sft_spider_dev_text2sql.json
-/mnt/win_d/data_FusionSQL/spider/database/<db_id>/<db_id>.sqlite
+<bird_root>/dev/dev.json          + dev/dev_databases/<db_id>/<db_id>.sqlite
+<bird_root>/train/train.json      + train/train_databases/<db_id>/<db_id>.sqlite
+<spider_root>/dev.json            + database/<db_id>/<db_id>.sqlite
+<spider_root>/train_spider.json   + database/<db_id>/<db_id>.sqlite
 ```
 
 Override with `paths.bird_root` / `paths.spider_root` or
-`$LATENTSQL_BIRD_ROOT` / `$LATENTSQL_SPIDER_ROOT`.
+`$LATENTSQL_BIRD_ROOT` / `$LATENTSQL_SPIDER_ROOT`. The database root is chosen
+per split, so `split: train` reads `train_databases` rather than silently
+resolving train questions against the dev databases.
+
+> **On this workstation:** `/mnt/win_d/data_FusionSQL/bird` contains only
+> unfetched **git-lfs pointers** — 131-byte text files where the manifests and
+> `.sqlite` files should be. The complete copy is
+> `/mnt/win_d/data/sft_data_collections/{bird,spider}` (BIRD 1 534 dev / 9 428
+> train, Spider 1 034 dev / 8 659 train), which is what `mix_local.yaml`
+> points at. Manifest probing now rejects LFS pointers and zero-byte files
+> instead of failing three frames deep in `json.load`.
+
+### The combined BIRD + Spider set
+
+`dataset: mix` (also `bird+spider`) builds one set from both benchmarks:
+
+```yaml
+mix:
+  bird: 1500
+  spider: 1500
+  bird_split: train
+  spider_split: train
+```
+
+Each half is sampled independently under `seed` and the two are **interleaved
+by ratio**, so any prefix holds the configured mixture — `--limit 200` on a
+50/50 mix gives 100 + 100, not 200 BIRD. Every example keeps its `dataset`
+field through prediction and scoring, so `04_eval.py` reports EX per benchmark
+next to the blended number:
+
+```
+| Method | Dataset | n | EX (%) | EX bird (%) | EX spider (%) | VES | ... |
+```
+
+That split matters: BIRD and Spider differ sharply in difficulty, only BIRD
+carries the `evidence` hint, and VES is a BIRD metric — so it is averaged over
+the BIRD rows only. A single combined EX number is not comparable to any
+published result on either benchmark; report the per-benchmark columns.
 
 DAIL-SQL few-shot examples are drawn **only from the teacher-train split**;
 `split_train_dev` holds out a deterministic slice written to `heldout.jsonl`,

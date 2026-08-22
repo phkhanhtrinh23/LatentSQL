@@ -6,7 +6,11 @@ the same schema rendering, the same executor and the same scorer, not against
 numbers copied from four different papers.
 
 Each entry point has the signature ``fn(llm, cfg, example, pool=()) -> str|None``
-and returns one predicted SQL string. They share the agents in ``agents.py``
+and returns one predicted SQL string. Each also has a ``*_turn`` twin returning
+the full :class:`AgentTurn` - reasoning, SQL and execution feedback - which is
+what lets a whole published system sit on the teacher's debate panel
+(``mas.agents: [din_sql, dail_sql, chess, chase_sql]``) instead of only serving
+as a comparison baseline. They share the agents in ``agents.py``
 wherever the papers genuinely share a component (e.g. DIN-SQL's schema linking
 is the same module the fusion teacher uses).
 """
@@ -29,7 +33,32 @@ from .agents import (
     Selector,
     select_dail_examples,
 )
-from .trace import normalize_sql
+from .trace import AgentTurn, normalize_sql
+
+
+def _as_turn(
+    ctx: Context, agent_id: str, sql: Optional[str], round_index: int = 0,
+    reasoning: str = "",
+) -> AgentTurn:
+    """Wrap a bare SQL string in an ``AgentTurn`` with execution feedback."""
+    sql = normalize_sql(sql) or None
+    res = ctx.execute(sql)
+    return AgentTurn(
+        agent=agent_id,
+        round=round_index,
+        reasoning=reasoning,
+        sql=sql,
+        exec_ok=res.ok,
+        exec_error="" if res.ok else res.error,
+        exec_preview=res.preview() if res.ok else "",
+    )
+
+
+def _relabel(turn: AgentTurn, agent_id: str, round_index: int) -> AgentTurn:
+    """Re-tag an inner agent's turn as the *system* that produced it."""
+    turn.agent = agent_id
+    turn.round = round_index
+    return turn
 
 
 def _context(cfg: Any, example: Any) -> Context:
@@ -74,7 +103,14 @@ def single_agent(llm: LLMBackend, cfg: Any, example: Any, pool: Sequence[Any] = 
 #   schema linking -> classify & decompose -> class-specific generation -> self-correct
 # --------------------------------------------------------------------------
 def din_sql(llm: LLMBackend, cfg: Any, example: Any, pool: Sequence[Any] = ()) -> Optional[str]:
-    ctx = _context(cfg, example)
+    return din_sql_turn(llm, cfg, example, pool).sql
+
+
+def din_sql_turn(
+    llm: LLMBackend, cfg: Any, example: Any, pool: Sequence[Any] = (),
+    ctx: Optional[Context] = None, round_index: int = 0,
+) -> AgentTurn:
+    ctx = ctx or _context(cfg, example)
     SchemaLinker(llm, cfg).run(ctx)
     QueryClassifier(llm, cfg).run(ctx)
 
@@ -83,7 +119,7 @@ def din_sql(llm: LLMBackend, cfg: Any, example: Any, pool: Sequence[Any] = ()) -
     agent = DivideConquerAgent(llm, cfg) if ctx.query_class == "NESTED" else QueryPlanAgent(llm, cfg)
     turn = agent.propose(ctx, round_index=0)
     turn = QueryFixer(llm, cfg).run(ctx, turn)     # 4.4 self-correction
-    return turn.sql
+    return _relabel(turn, "din_sql", round_index)
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +133,19 @@ def dail_sql(
     pool: Sequence[Any] = (),
     self_consistency: int = 3,
 ) -> Optional[str]:
-    ctx = _context(cfg, example)
+    return dail_sql_turn(llm, cfg, example, pool, self_consistency=self_consistency).sql
+
+
+def dail_sql_turn(
+    llm: LLMBackend,
+    cfg: Any,
+    example: Any,
+    pool: Sequence[Any] = (),
+    self_consistency: int = 3,
+    ctx: Optional[Context] = None,
+    round_index: int = 0,
+) -> AgentTurn:
+    ctx = ctx or _context(cfg, example)
     if pool:
         ctx.examples = select_dail_examples(
             ctx, pool, k=cfg.dail_shots,
@@ -107,9 +155,9 @@ def dail_sql(
     turns = [agent.propose(ctx, round_index=0, sample_index=i) for i in range(max(1, self_consistency))]
     cands = [t for t in turns if t.sql]
     if not cands:
-        return None
+        return _as_turn(ctx, "dail_sql", None, round_index)
     if len(cands) == 1:
-        return cands[0].sql
+        return _relabel(cands[0], "dail_sql", round_index)
     # self-consistency over execution results
     buckets: Dict[str, List[Any]] = {}
     for t in cands:
@@ -118,7 +166,7 @@ def dail_sql(
         buckets.setdefault(sig, []).append(t)
     good = {k: v for k, v in buckets.items() if k != "ERR"} or buckets
     best = max(good.values(), key=len)
-    return best[0].sql
+    return _relabel(best[0], "dail_sql", round_index)
 
 
 # --------------------------------------------------------------------------
@@ -132,7 +180,19 @@ def chess(
     pool: Sequence[Any] = (),
     n_candidates: int = 3,
 ) -> Optional[str]:
-    ctx = _context(cfg, example)
+    return chess_turn(llm, cfg, example, pool, n_candidates=n_candidates).sql
+
+
+def chess_turn(
+    llm: LLMBackend,
+    cfg: Any,
+    example: Any,
+    pool: Sequence[Any] = (),
+    n_candidates: int = 3,
+    ctx: Optional[Context] = None,
+    round_index: int = 0,
+) -> AgentTurn:
+    ctx = ctx or _context(cfg, example)
     InformationRetriever(llm, cfg).run(ctx)            # IR agent
     SchemaLinker(llm, cfg).run(ctx)                    # SS agent
     agent = QueryPlanAgent(llm, cfg)                   # CG agent
@@ -142,7 +202,7 @@ def chess(
         t = agent.propose(ctx, round_index=0, sample_index=i)
         turns.append(fixer.run(ctx, t))                # CG "revise" loop
     sel_cfg = _with(cfg, selector="unit_test")         # UT agent
-    return Selector(llm, sel_cfg).run(ctx, turns).sql
+    return _pick(ctx, "chess", Selector(llm, sel_cfg).run(ctx, turns), turns, round_index)
 
 
 # --------------------------------------------------------------------------
@@ -155,7 +215,18 @@ def chase_sql(
     example: Any,
     pool: Sequence[Any] = (),
 ) -> Optional[str]:
-    ctx = _context(cfg, example)
+    return chase_sql_turn(llm, cfg, example, pool).sql
+
+
+def chase_sql_turn(
+    llm: LLMBackend,
+    cfg: Any,
+    example: Any,
+    pool: Sequence[Any] = (),
+    ctx: Optional[Context] = None,
+    round_index: int = 0,
+) -> AgentTurn:
+    ctx = ctx or _context(cfg, example)
     InformationRetriever(llm, cfg).run(ctx)
     SchemaLinker(llm, cfg).run(ctx)
     if pool:
@@ -171,7 +242,7 @@ def chase_sql(
         t = agent.propose(ctx, round_index=0)
         turns.append(fixer.run(ctx, t))
     sel_cfg = _with(cfg, selector="pairwise")
-    return Selector(llm, sel_cfg).run(ctx, turns).sql
+    return _pick(ctx, "chase_sql", Selector(llm, sel_cfg).run(ctx, turns), turns, round_index)
 
 
 # --------------------------------------------------------------------------
@@ -200,6 +271,24 @@ BASELINES: Dict[str, Callable[..., Optional[str]]] = {
     "chase_sql": chase_sql,
     "fusion_mas": fusion_mas,
 }
+
+
+def _pick(
+    ctx: Context, agent_id: str, selection: Any, turns: Sequence[AgentTurn],
+    round_index: int,
+) -> AgentTurn:
+    """Recover the ``AgentTurn`` behind a ``Selection`` so its reasoning survives.
+
+    The selector returns a SQL string; the reasoning that produced it lives on
+    the candidate turn. Matching them back up is what lets a whole system act
+    as one panellist without losing the text the student has to learn.
+    """
+    if selection.sql:
+        want = (normalize_sql(selection.sql) or "").lower()
+        for t in turns:
+            if t.sql and (normalize_sql(t.sql) or "").lower() == want:
+                return _relabel(t, agent_id, round_index)
+    return _as_turn(ctx, agent_id, selection.sql, round_index)
 
 
 def _with(cfg: Any, **overrides: Any) -> Any:

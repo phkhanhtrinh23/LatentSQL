@@ -101,7 +101,14 @@ class Agent:
 class InformationRetriever(Agent):
     id = "information_retriever"
 
-    def run(self, ctx: Context, cache_dir: Optional[str] = None) -> None:
+    def run(
+        self, ctx: Context, cache_dir: Optional[str] = None, force: bool = False
+    ) -> None:
+        # idempotent: when a whole published system sits on the panel it calls
+        # this again on the ctx the orchestrator already populated, and paying
+        # for the same retrieval once per panellist is pure waste
+        if ctx.keywords and not force:
+            return
         raw = self.llm.ask(
             P.KEYWORD_SYSTEM,
             P.KEYWORD_USER.format(
@@ -146,8 +153,10 @@ _COLUMNS_RE = re.compile(r"(?im)^\s*columns?\s*:\s*(.+)$")
 class SchemaLinker(Agent):
     id = "schema_linker"
 
-    def run(self, ctx: Context) -> None:
+    def run(self, ctx: Context, force: bool = False) -> None:
         assert ctx.schema is not None
+        if ctx.schema_links and not force:   # see InformationRetriever.run
+            return
         raw = self.llm.ask(
             P.SCHEMA_LINK_SYSTEM,
             P.SCHEMA_LINK_USER.format(
@@ -214,7 +223,9 @@ class SchemaLinker(Agent):
 class QueryClassifier(Agent):
     id = "query_classifier"
 
-    def run(self, ctx: Context) -> None:
+    def run(self, ctx: Context, force: bool = False) -> None:
+        if ctx.query_class and not force:   # see InformationRetriever.run
+            return
         raw = self.llm.ask(
             P.CLASSIFY_SYSTEM,
             P.CLASSIFY_USER.format(
@@ -365,8 +376,69 @@ class DailICLAgent(CandidateAgent):
         return P.render_dail_examples(ctx.examples)
 
 
+# --------------------------------------------------------------------------
+# whole published systems as panellists
+# --------------------------------------------------------------------------
+class SystemAgent(CandidateAgent):
+    """A panellist that *is* one of the four published systems.
+
+    Round 1 runs that system's own published pipeline end to end (DIN-SQL's
+    link/classify/self-correct, CHESS's IR + unit tester, and so on) and takes
+    its winning candidate as the panellist's answer. Round 2+ falls back to the
+    inherited debate prompt, so the later rounds are a genuine argument
+    *between the four systems* over their round-1 answers plus execution
+    feedback - which is the transcript the student then internalises.
+
+    Selected with ``mas.agents: [din_sql, dail_sql, chess, chase_sql]``. Note
+    this is several times more expensive per question than the default
+    three-persona panel, because each panellist is itself multi-call.
+    """
+
+    #: name of the ``*_turn`` entry point in ``baselines``
+    system_fn: str = ""
+
+    def propose(self, ctx: Context, round_index: int = 0, sample_index: int = 0) -> AgentTurn:
+        from . import baselines
+
+        fn = getattr(baselines, self.system_fn)
+        # ctx is passed through rather than an example: it already carries the
+        # schema, the retrieved values, the links and the DAIL few-shot pairs
+        # the orchestrator selected. The context stages are idempotent, so a
+        # panellist re-invoking them is a no-op rather than a repeated bill;
+        # an empty ``pool`` likewise skips re-running example selection.
+        return fn(self.llm, self.cfg, None, (), ctx=ctx, round_index=round_index)
+
+
+class DinSQLAgent(SystemAgent):
+    id = "din_sql"
+    system_fn = "din_sql_turn"
+    system_prompt = P.QUERY_PLAN_SYSTEM
+
+
+class DailSQLAgent(SystemAgent):
+    id = "dail_sql"
+    system_fn = "dail_sql_turn"
+    system_prompt = P.DAIL_ICL_SYSTEM
+
+
+class ChessAgent(SystemAgent):
+    id = "chess"
+    system_fn = "chess_turn"
+    system_prompt = P.QUERY_PLAN_SYSTEM
+
+
+class ChaseSQLAgent(SystemAgent):
+    id = "chase_sql"
+    system_fn = "chase_sql_turn"
+    system_prompt = P.DIVIDE_CONQUER_SYSTEM
+
+
 AGENT_REGISTRY = {
-    a.id: a for a in (DivideConquerAgent, QueryPlanAgent, DailICLAgent)
+    a.id: a
+    for a in (
+        DivideConquerAgent, QueryPlanAgent, DailICLAgent,
+        DinSQLAgent, DailSQLAgent, ChessAgent, ChaseSQLAgent,
+    )
 }
 
 

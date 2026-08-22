@@ -36,6 +36,10 @@ def read_json(path: str) -> Any:
         return json.load(fh)
 
 
+#: names that select the combined BIRD + Spider set
+MIX_ALIASES = frozenset({"mix", "mixed", "bird+spider", "spider+bird", "combined"})
+
+
 def resolve_examples(
     cfg: Any,
     dataset: Optional[str] = None,
@@ -50,13 +54,34 @@ def resolve_examples(
     Returns ``(examples, dataset_name_actually_used)`` so callers can label
     their results honestly when they fell back.
     """
-    from ..data.loaders import available, load_dataset
+    from ..data.loaders import available, load_dataset, load_mixed
     from ..data.synthetic import load_synthetic
 
     name = (dataset or cfg.eval.dataset or "bird").lower()
     roots = {"bird": cfg.paths.bird_root, "spider": cfg.paths.spider_root}
 
-    if name in roots and available(roots[name], name):
+    if name in MIX_ALIASES:
+        mix = getattr(cfg, "mix", None)
+        n_bird = getattr(mix, "bird", None) if mix else None
+        n_spider = getattr(mix, "spider", None) if mix else None
+        if available(roots["bird"], "bird") or available(roots["spider"], "spider"):
+            return (
+                load_mixed(
+                    roots["bird"], roots["spider"],
+                    n_bird=n_bird, n_spider=n_spider,
+                    bird_split=getattr(mix, "bird_split", split) if mix else split,
+                    spider_split=getattr(mix, "spider_split", split) if mix else split,
+                    limit=limit, seed=cfg.seed,
+                    shuffle=getattr(mix, "shuffle", shuffle) if mix else shuffle,
+                ),
+                "mix",
+            )
+        if not fallback_to_synthetic:
+            raise FileNotFoundError(
+                f"neither bird ({roots['bird']!r}) nor spider ({roots['spider']!r}) "
+                f"is readable; set paths.bird_root / paths.spider_root"
+            )
+    elif name in roots and available(roots[name], name):
         return (
             load_dataset(
                 roots[name], dataset=name, split=split, limit=limit,

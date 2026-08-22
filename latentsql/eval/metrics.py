@@ -27,6 +27,7 @@ class Prediction:
     correct: Optional[bool] = None
     ves: Optional[float] = None
     difficulty: str = ""
+    dataset: str = ""              # which benchmark the question came from
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_s: float = 0.0
@@ -52,6 +53,10 @@ class EvalReport:
     avg_completion_tokens: float = 0.0
     avg_latency_s: float = 0.0
     by_difficulty: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    #: EX per source benchmark. Only meaningful for a combined set, where a
+    #: single headline number would average two benchmarks of very different
+    #: difficulty; on a single-benchmark run it holds one entry.
+    by_dataset: Dict[str, Dict[str, float]] = field(default_factory=dict)
     n_unparseable: int = 0
     notes: str = ""
 
@@ -65,6 +70,13 @@ class EvalReport:
             f"EX={self.ex * 100:6.2f}%  VES={ves}  "
             f"tok={self.avg_total_tokens:8.1f}  out={self.avg_completion_tokens:7.1f}  "
             f"{self.avg_latency_s:6.2f}s"
+            + (f"   [{self.per_dataset_text()}]" if len(self.by_dataset) > 1 else "")
+        )
+
+    def per_dataset_text(self) -> str:
+        return "  ".join(
+            f"{k}: {v['ex'] * 100:.2f}% (n={int(v['n'])})"
+            for k, v in sorted(self.by_dataset.items())
         )
 
 
@@ -94,7 +106,14 @@ def build_report(
         return EvalReport(method=method, dataset=dataset, n=0, ex=0.0, notes=notes)
 
     ex = sum(1 for p in preds if p.correct) / n
-    ves = (sum(p.ves or 0.0 for p in preds) / n) if compute_ves else None
+
+    # VES is a BIRD metric (it needs BIRD's runtime-efficiency definition), so
+    # on a combined set average it over the BIRD rows only rather than diluting
+    # it with Spider rows that have no meaningful value.
+    ves = None
+    if compute_ves:
+        scored = [p for p in preds if p.dataset in ("", "bird")] or list(preds)
+        ves = sum(p.ves or 0.0 for p in scored) / len(scored)
 
     by_diff: Dict[str, Dict[str, float]] = {}
     for p in preds:
@@ -103,6 +122,14 @@ def build_report(
         bucket["n"] += 1
         bucket["correct"] += 1.0 if p.correct else 0.0
     for key, bucket in by_diff.items():
+        bucket["ex"] = round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0
+
+    by_ds: Dict[str, Dict[str, float]] = {}
+    for p in preds:
+        bucket = by_ds.setdefault(p.dataset or dataset, {"n": 0.0, "correct": 0.0})
+        bucket["n"] += 1
+        bucket["correct"] += 1.0 if p.correct else 0.0
+    for bucket in by_ds.values():
         bucket["ex"] = round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0
 
     return EvalReport(
@@ -115,6 +142,7 @@ def build_report(
         avg_completion_tokens=round(statistics.fmean(p.completion_tokens for p in preds), 2),
         avg_latency_s=round(statistics.fmean(p.latency_s for p in preds), 3),
         by_difficulty=by_diff,
+        by_dataset=by_ds,
         n_unparseable=sum(1 for p in preds if not p.pred_sql),
         notes=notes,
     )
@@ -135,10 +163,17 @@ def save_reports(reports: Sequence[EvalReport], path: str) -> None:
 
 def render_table(reports: Sequence[EvalReport]) -> str:
     """A markdown table in IMAD's shape: accuracy next to token consumption."""
+    # a combined BIRD+Spider run gets one EX column per benchmark, because the
+    # blended number on its own is not comparable to any published result
+    sources = sorted({k for r in reports for k in r.by_dataset})
+    split = [s for s in sources if s in ("bird", "spider")] if len(sources) > 1 else []
+
+    extra_head = "".join(f" EX {s} (%) |" for s in split)
     head = (
-        "| Method | Dataset | n | EX (%) | VES | Avg tokens | Avg output tokens | "
-        "Tokens vs MAS |\n"
-        "|---|---|---:|---:|---:|---:|---:|---:|\n"
+        "| Method | Dataset | n | EX (%) |" + extra_head + " VES | Avg tokens | "
+        "Avg output tokens | Tokens vs MAS |\n"
+        "|---|---|---:|---:|" + "---:|" * len(split) +
+        "---:|---:|---:|---:|\n"
     )
     base = next(
         (r.avg_total_tokens for r in reports if r.method in ("fusion_mas", "mas")), None
@@ -150,8 +185,12 @@ def render_table(reports: Sequence[EvalReport]) -> str:
             if base and base > 0 else "-"
         )
         ves = f"{r.ves:.3f}" if r.ves is not None else "-"
+        cells = ""
+        for s in split:
+            b = r.by_dataset.get(s)
+            cells += f" {b['ex'] * 100:.2f} |" if b and b["n"] else " - |"
         rows.append(
-            f"| {r.method} | {r.dataset} | {r.n} | {r.ex * 100:.2f} | {ves} | "
-            f"{r.avg_total_tokens:.1f} | {r.avg_completion_tokens:.1f} | {rel} |"
+            f"| {r.method} | {r.dataset} | {r.n} | {r.ex * 100:.2f} |" + cells +
+            f" {ves} | {r.avg_total_tokens:.1f} | {r.avg_completion_tokens:.1f} | {rel} |"
         )
     return head + "\n".join(rows)

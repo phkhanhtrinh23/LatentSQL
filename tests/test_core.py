@@ -256,5 +256,119 @@ class TestSelectorGrouping(unittest.TestCase):
         self.assertEqual(sizes, [1, 2])
 
 
+class TestMixedDataset(unittest.TestCase):
+    """The combined BIRD + Spider set (``dataset: mix``)."""
+
+    def test_every_prefix_holds_the_configured_ratio(self):
+        from latentsql.data.loaders import Example, dataset_counts, interleave_by_ratio
+
+        bird = [Example(qid=f"b{i}", db_id="d", question="q", gold_sql="s",
+                        dataset="bird") for i in range(60)]
+        spider = [Example(qid=f"s{i}", db_id="d", question="q", gold_sql="s",
+                          dataset="spider") for i in range(20)]
+        merged = interleave_by_ratio(bird, spider)
+
+        self.assertEqual(dataset_counts(merged), {"bird": 60, "spider": 20})
+        # slicing with --limit must not silently turn into a BIRD-only run
+        for k in (8, 20, 40, 80):
+            counts = dataset_counts(merged[:k])
+            self.assertAlmostEqual(counts.get("bird", 0) / k, 0.75, delta=0.06)
+
+    def test_interleave_is_deterministic(self):
+        from latentsql.data.loaders import Example, interleave_by_ratio
+
+        a = [Example(qid=f"a{i}", db_id="d", question="q", gold_sql="s") for i in range(7)]
+        b = [Example(qid=f"b{i}", db_id="d", question="q", gold_sql="s") for i in range(3)]
+        first = [e.qid for e in interleave_by_ratio(a, b)]
+        self.assertEqual(first, [e.qid for e in interleave_by_ratio(a, b)])
+
+    def test_git_lfs_pointers_are_not_mistaken_for_data(self):
+        """An unfetched LFS pointer is a small text file that json.load chokes on."""
+        from latentsql.data.loaders import _is_placeholder
+
+        root = tempfile.mkdtemp(prefix="latentsql_lfs_")
+        pointer = os.path.join(root, "dev.json")
+        with open(pointer, "w", encoding="utf-8") as fh:
+            fh.write("version https://git-lfs.github.com/spec/v1\n"
+                     "oid sha256:9b4c38da7f07\nsize 780246\n")
+        empty = os.path.join(root, "empty.json")
+        open(empty, "w").close()
+        real = os.path.join(root, "real.json")
+        with open(real, "w", encoding="utf-8") as fh:
+            fh.write("[]")
+
+        self.assertTrue(_is_placeholder(pointer))
+        self.assertTrue(_is_placeholder(empty))
+        self.assertFalse(_is_placeholder(real))
+
+    def test_db_root_follows_the_split(self):
+        """BIRD ships dev/ and train/ databases side by side."""
+        from latentsql.data.loaders import find_db_root
+
+        root = tempfile.mkdtemp(prefix="latentsql_split_")
+        for sub in ("dev/dev_databases/x", "train/train_databases/x"):
+            os.makedirs(os.path.join(root, sub), exist_ok=True)
+        self.assertTrue(find_db_root(root, "bird", "dev").endswith("dev_databases"))
+        self.assertTrue(find_db_root(root, "bird", "train").endswith("train_databases"))
+
+    def test_report_splits_ex_by_benchmark(self):
+        from latentsql.eval.metrics import Prediction, build_report
+
+        preds = [
+            Prediction(qid="1", db_id="d", db_path="", question="q", gold_sql="g",
+                       pred_sql="p", correct=True, dataset="bird"),
+            Prediction(qid="2", db_id="d", db_path="", question="q", gold_sql="g",
+                       pred_sql="p", correct=False, dataset="bird"),
+            Prediction(qid="3", db_id="d", db_path="", question="q", gold_sql="g",
+                       pred_sql="p", correct=True, dataset="spider"),
+            Prediction(qid="4", db_id="d", db_path="", question="q", gold_sql="g",
+                       pred_sql="p", correct=True, dataset="spider"),
+        ]
+        rep = build_report(preds, method="student", dataset="mix")
+        self.assertAlmostEqual(rep.ex, 0.75)
+        self.assertAlmostEqual(rep.by_dataset["bird"]["ex"], 0.5)
+        self.assertAlmostEqual(rep.by_dataset["spider"]["ex"], 1.0)
+
+
+class TestSystemPanel(unittest.TestCase):
+    """The four published systems used as debate panellists."""
+
+    def test_all_four_systems_are_registered_as_agents(self):
+        from latentsql.mas.agents import AGENT_REGISTRY
+
+        for name in ("din_sql", "dail_sql", "chess", "chase_sql"):
+            self.assertIn(name, AGENT_REGISTRY)
+            self.assertTrue(AGENT_REGISTRY[name].system_fn)
+
+    def test_system_tags_are_in_the_vocabulary(self):
+        from latentsql.mas.trace import agent_tag, special_tokens
+
+        toks = special_tokens()
+        for name in ("din_sql", "dail_sql", "chess", "chase_sql"):
+            self.assertIn(agent_tag(name), toks)
+
+    def test_every_baseline_has_a_turn_twin(self):
+        from latentsql.mas import baselines
+
+        for name in ("din_sql", "dail_sql", "chess", "chase_sql"):
+            self.assertTrue(callable(getattr(baselines, f"{name}_turn")))
+
+    def test_pick_recovers_the_reasoning_behind_a_selection(self):
+        from latentsql.mas.agents import Context
+        from latentsql.mas.baselines import _pick
+
+        class _Sel:
+            sql = "SELECT COUNT(*) FROM stadium"
+
+        ctx = Context(question="q", db_path=_DB)
+        turns = [
+            AgentTurn("query_plan", 0, "counted the rows", "SELECT count(*) FROM stadium"),
+            AgentTurn("dail_icl", 0, "listed names", "SELECT name FROM stadium"),
+        ]
+        picked = _pick(ctx, "chess", _Sel(), turns, round_index=0)
+        self.assertEqual(picked.agent, "chess")
+        self.assertEqual(picked.reasoning, "counted the rows")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

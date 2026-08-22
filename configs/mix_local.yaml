@@ -1,0 +1,141 @@
+# BIRD + Spider combined, local models only: a 7B teacher distilled into a 3B
+# student. This is the config for the main experiment.
+#
+#   python scripts/01_build_traces.py --config configs/mix_local.yaml --limit 600
+#   python scripts/02_sft.py         --config configs/mix_local.yaml
+#   python scripts/03_grpo.py        --config configs/mix_local.yaml
+#   python scripts/04_eval.py        --config configs/mix_local.yaml \
+#       --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas,student,latent
+#
+# NOTE on paths: /mnt/win_d/data_FusionSQL/bird holds only unfetched git-lfs
+# pointers, so both roots point at the complete copy under
+# /mnt/win_d/data/sft_data_collections instead.
+
+paths:
+  bird_root: /mnt/win_d/data/sft_data_collections/bird
+  spider_root: /mnt/win_d/data/sft_data_collections/spider
+  hf_hub: /mnt/win_d/hub
+  output_dir: outputs/mix
+  cache_dir: outputs/mix/cache
+
+# ---------------------------------------------------------------------------
+# one combined set drawn from both benchmarks. The halves are interleaved by
+# ratio, so `--limit N` still yields the same mixture for any N.
+# ---------------------------------------------------------------------------
+mix:
+  bird: 1500
+  spider: 1500
+  bird_split: train      # keep BIRD/Spider dev clean for evaluation
+  spider_split: train
+  shuffle: true
+
+# ---------------------------------------------------------------------------
+# teacher: the largest model in the local hub. The size limit in the thesis
+# claim applies to the *student*; capping the teacher too would only weaken
+# the distillation signal. Whatever is set here is also the model the four
+# published baselines run on, so the comparison stays like-for-like.
+# ---------------------------------------------------------------------------
+llm:
+  backend: hf
+  local_only: true
+  model: Qwen/Qwen2.5-7B-Instruct
+  model_fallbacks:
+    - Qwen/Qwen2.5-7B-Instruct
+    - Qwen/Qwen3-8B
+    - Qwen/Qwen2.5-Coder-3B-Instruct
+  temperature: 0.7
+  max_tokens: 1024
+  device: auto
+  dtype: auto
+
+# ---------------------------------------------------------------------------
+# the debate panel IS the four published systems. Round 1 runs each system's
+# own pipeline; round 2 is a cross-system argument over those answers plus
+# execution feedback. Four independent pipelines also mean four shots at a
+# correct candidate, which is what carries trace yield at 7B.
+#
+# For the cheaper three-persona panel instead:
+#   agents: [divide_conquer, query_plan, dail_icl]
+# ---------------------------------------------------------------------------
+mas:
+  agents: [din_sql, dail_sql, chess, chase_sql]
+  rounds: 2
+  candidates_per_agent: 1
+  use_value_retrieval: true
+  use_schema_selector: true
+  use_classifier: true
+  use_fixer: true
+  max_fix_attempts: 2
+  selector: unit_test
+  n_unit_tests: 3
+  dail_shots: 5
+  execution_timeout: 30.0
+  schema_keep_all_below_columns: 40
+
+trace:
+  require_consensus: true
+  require_correct: true
+  require_execution: true
+  max_trace_chars: 12000
+  dedup: true
+
+# ---------------------------------------------------------------------------
+# student: 3B, the model the thesis claim is about
+# ---------------------------------------------------------------------------
+sft:
+  model_name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  output_dir: outputs/mix/sft
+  epochs: 3
+  lr: 1.0e-4
+  batch_size: 1
+  grad_accum: 8
+  max_seq_len: 4096
+  lora: true
+  lora_r: 32
+  lora_alpha: 64
+  bf16: true
+  gradient_checkpointing: true
+  train_on_full_trace: true       # false = DebateGPT ablation
+
+grpo:
+  model_name_or_path: outputs/mix/sft
+  output_dir: outputs/mix/grpo
+  epochs: 2
+  lr: 1.0e-6
+  group_size: 4                  # 8 x 2048 tokens does not fit a 24GB 4090
+  batch_prompts: 1
+  grad_accum: 8
+  max_new_tokens: 2048
+  kl_beta: 0.02
+  bf16: true
+  reward:
+    w_fmt_start: 1.0
+    w_fmt_end: 0.05
+    w_clip: 1.0
+    len_start: 2000              # IMAD anneals 2000 -> 500
+    len_end: 500
+    schedule: linear
+    w_exec_ok: 0.1
+    w_tag_order: 0.1
+
+latent:
+  enabled: false                 # turn on for the `latent` eval mode
+  latent_steps: 8
+  roles: [din_sql, dail_sql, chess, chase_sql, consensus]
+  align: soft_embed
+  share_working_memory: true
+
+steering:
+  layer: -8
+  alpha: 1.0
+  n_pairs: 128
+  normalize: true
+
+eval:
+  dataset: mix                   # held-out BIRD + Spider dev, reported separately
+  n_samples: 400
+  max_new_tokens: 1024
+  temperature: 0.0
+  report_ves: true               # averaged over the BIRD half only
+
+seed: 0

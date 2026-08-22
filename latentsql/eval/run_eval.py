@@ -58,7 +58,7 @@ def eval_baseline(
             Prediction(
                 qid=ex.qid, db_id=ex.db_id, db_path=ex.db_path, question=ex.question,
                 gold_sql=ex.gold_sql, pred_sql=normalize_sql(sql) or None,
-                difficulty=ex.difficulty,
+                difficulty=ex.difficulty, dataset=getattr(ex, "dataset", ""),
                 prompt_tokens=llm.usage.prompt_tokens - before[0],
                 completion_tokens=llm.usage.completion_tokens - before[1],
                 latency_s=round(time.time() - t0, 3),
@@ -140,7 +140,7 @@ def eval_student(
                 qid=ex.qid, db_id=ex.db_id, db_path=ex.db_path, question=ex.question,
                 gold_sql=ex.gold_sql,
                 pred_sql=extract_final_sql(text) or extract_sql(text),
-                difficulty=ex.difficulty,
+                difficulty=ex.difficulty, dataset=getattr(ex, "dataset", ""),
                 prompt_tokens=n_in, completion_tokens=n_out,
                 latency_s=round(time.time() - t0, 3),
                 raw_output=text[:4000],
@@ -195,5 +195,13 @@ def run(
             **kw,
         )
     score_predictions(preds, timeout=cfg.mas.execution_timeout, compute_ves=compute_ves)
-    dataset = getattr(examples[0], "dataset", cfg.eval.dataset) if examples else cfg.eval.dataset
+    # label the report by what was actually evaluated: a combined set must not
+    # be reported as whichever benchmark happened to come first
+    sources = {getattr(e, "dataset", "") for e in examples} - {""}
+    if len(sources) > 1:
+        dataset = "mix"
+    elif sources:
+        dataset = sources.pop()
+    else:
+        dataset = cfg.eval.dataset
     return preds, build_report(preds, method=method, dataset=dataset, compute_ves=compute_ves)

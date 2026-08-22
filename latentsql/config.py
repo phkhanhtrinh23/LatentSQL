@@ -248,10 +248,27 @@ class SteeringConfig:
 
 
 @dataclass
+class MixConfig:
+    """A single training/eval set drawn from BIRD *and* Spider.
+
+    Selected with ``dataset: mix`` (equivalently ``bird+spider``). The two
+    halves are sampled independently and interleaved by ratio, so slicing the
+    result with ``--limit`` still gives the configured mixture. ``dataset`` is
+    preserved per example so results stay reportable per benchmark.
+    """
+
+    bird: Optional[int] = None        # questions to draw from BIRD (None = all)
+    spider: Optional[int] = None      # questions to draw from Spider
+    bird_split: str = "dev"
+    spider_split: str = "dev"
+    shuffle: bool = True
+
+
+@dataclass
 class EvalConfig:
     n_samples: int = 100
     split: str = "dev"
-    dataset: str = "bird"           # bird | spider | synthetic
+    dataset: str = "bird"           # bird | spider | mix | synthetic
     mode: str = "internalized"      # single | mas | sft_trace | internalized | latent
     max_new_tokens: int = 1024
     temperature: float = 0.0
@@ -270,6 +287,7 @@ class Config:
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     latent: LatentConfig = field(default_factory=LatentConfig)
     steering: SteeringConfig = field(default_factory=SteeringConfig)
+    mix: MixConfig = field(default_factory=MixConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     seed: int = 0
 

@@ -43,7 +43,13 @@ T_EXEC_OPEN, T_EXEC_CLOSE = "<|exec|>", "<|/exec|>"
 T_CONSENSUS_OPEN, T_CONSENSUS_CLOSE = "<|consensus|>", "<|/consensus|>"
 T_END = "<|endofdebate|>"
 
-AGENT_IDS = ("divide_conquer", "query_plan", "dail_icl")
+#: every panellist id the tag vocabulary covers - the three prompt personas of
+#: the default panel plus the four published systems, which can themselves be
+#: panellists (``mas.agents: [din_sql, dail_sql, chess, chase_sql]``).
+AGENT_IDS = (
+    "divide_conquer", "query_plan", "dail_icl",
+    "din_sql", "dail_sql", "chess", "chase_sql",
+)
 
 
 def round_tag(i: int) -> str:
