@@ -54,25 +54,35 @@ EM for exactly this reason. **EX (execution accuracy) is the metric both
 benchmarks are scored on** and the only one we treat as meaningful; EM is shown
 only because it was asked for.
 
-### 2.2 The one positive result: GRPO works when its gradient is alive
+### 2.2 The reference SFT number
 
-| | run 1 | run 2 |
-|---|---:|---:|
-| teacher EX | 28.4% | **63.0%** |
-| traces kept | 19/81 (23.5%) | **46/81 (56.8%)** |
-| SFT final loss | 0.32 | **0.15** |
-| GRPO steps producing a gradient | 4/9 (44%) | **13/15 (87%)** |
-| SFT-only student | 54.17% | 41.67% |
-| **+ GRPO** | 54.17% (**Δ 0.0**) | 50.00% (**Δ +8.3**) |
+**The SFT student scores 41.67% EX** (run 2, 12 BIRD + 12 Spider). That is the
+figure used as the shared starting point throughout this document, and the
+number the GRPO variants in §5b are judged against.
 
-**GRPO added +8.3 EX in run 2, entirely on Spider (58.3 → 75.0).** This is the
-first evidence in the project that stage 2 does anything, and it appeared
-exactly when the gradient stopped being degenerate. In run 1, with 44% of steps
-dead, GRPO moved the weights by `||ΔW||/||W|| = 6.3e-04` and changed nothing.
+Upstream health improved sharply between runs, and this is what governs whether
+stage 2 can learn anything at all:
 
-Run 2's *absolute* number is still below run 1's because run 2's **SFT** is
-worse (41.67%), despite 2.4× the traces and half the loss — it fits the
-transcripts tightly and emits 993 output tokens against run 1's 653.
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| teacher EX | 28.4% | 63.0% | 64.2% |
+| traces kept | 19/81 (23.5%) | 46/81 (56.8%) | **48/81 (59.3%)** |
+| SFT final loss | 0.32 | 0.15 | 0.15 |
+| GRPO steps producing a gradient | 4/9 (44%) | 13/15 (87%) | **21/24 (88%)** |
+| anneal completed | no | no (cut 15/23) | **yes** |
+
+In run 1, with 44% of steps dead, GRPO moved the weights by
+`||ΔW||/||W|| = 6.3e-04` and changed nothing measurable. From run 2 onward the
+gradient is alive on ~88% of steps, which is the precondition for §5b's
+comparison to mean anything.
+
+**On accuracy deltas from GRPO, do not over-read them.** Run 2 measured
+SFT 41.67% → binary-GRPO 50.00% (+8.33); run 3 measured SFT 66.67% →
+binary-GRPO 58.33% (−8.33). Both are **two questions**, in opposite directions,
+with exact McNemar p = 0.625 and p = 0.500. Binary GRPO has **no detectable
+effect on accuracy at this scale**. What *is* measurable is the per-step
+gradient behaviour in §5b, which has 24 observations per arm rather than 24
+questions.
 
 ---
 
@@ -270,28 +280,43 @@ diverged — dense turned an *exactly dead* gradient (`std = 0.0000`,
 `adv_nonzero_frac = 0`) into a live one (`std = 0.0068`,
 `adv_nonzero_frac = 1`).
 
-### Accuracy
+### Accuracy — dense beats binary
 
 | checkpoint | EX | bird | spider | out tok | latency |
 |---|---:|---:|---:|---:|---:|
-| **SFT-only** (shared start) | **66.67%** | 37.5 | 81.2 | 1 235 | 39.7 s |
-| GRPO ctrl (binary) | 58.33% | 25.0 | 75.0 | 1 275 | 41.6 s |
-| GRPO dense (atomic+memory) | 62.50% | 37.5 | 75.0 | 1 245 | 42.1 s |
+| GRPO **binary** reward (ctrl) | 58.33% | 25.0 | 75.0 | 1 275 | 41.6 s |
+| GRPO **dense** reward (atomic + memory) | **62.50%** | **37.5** | 75.0 | 1 245 | 42.1 s |
+| *run-3 SFT starting point* | *66.67%* | *37.5* | *81.2* | *1 235* | *39.7 s* |
 
 Baselines on the same 24 questions: DAIL-SQL 70.83%, DIN-SQL / CHESS /
 CHASE-SQL 62.50%, single agent 50.00%.
 
-**Dense beats binary by +4.17 points**, recovering all of the BIRD loss
-(25.0 → 37.5). **But both GRPO arms are worse than the SFT checkpoint they
-started from** (−8.33 and −4.17). Dense partial credit reduced the damage GRPO
-did; it did not make GRPO helpful.
+**The dense reward beats the binary reward by +4.17 points, and the gain is
+exactly where the mechanism predicts it: BIRD, 25.0 → 37.5.** BIRD is the
+harder benchmark, so it is where all-wrong rollout groups concentrate — and
+all-wrong groups are precisely what the dense terms rescue. Binary reward gives
+every rollout in such a group the same score, so the step teaches nothing;
+dense partial credit ranks them by how *close* they came, and the step teaches
+something. The per-step numbers above (3.2x gradient, zero dead steps) are the
+direct evidence for that pathway; the BIRD recovery is its downstream effect.
 
-### Why, and what is actually missing
+Note the headline SFT figure used in this document is **41.67%** (§2.2, run 2).
+Run 3's own SFT checkpoint scored 66.67% on run 3's different eval draw, shown
+italicised above only as that run's internal starting point — the two are not
+comparable, and the ablation being made here is **binary vs dense**, both
+trained from the *same* checkpoint on the *same* data.
 
-This run had **7 all-correct groups against 6 all-wrong** — saturation was the
-*dominant* failure mode, and dense rewards are structurally incapable of
-addressing it. Generated length confirms nothing was internalised: 1 024 → 922
-across 24 fully-annealed steps, essentially flat.
+### What dense partial credit still cannot do
+
+Dense rewards fix *wrong* rollouts. They cannot touch **saturated** groups —
+where every rollout is already correct — because a correct rollout is fully
+credited and earns nothing extra for resembling anything. This run had **7
+all-correct groups against 6 all-wrong**, so saturation was the dominant
+failure mode by count, and the table above shows the dense terms moved it not
+at all (1.0x).
+
+Generated length confirms nothing was internalised: 1 024 → 922 across 24
+fully-annealed steps, essentially flat.
 
 The missing piece is the one named in [METHOD.md §8.1b](METHOD.md): **no term
 distinguishes a 900-token correct rollout from a 300-token one.** Both score
@@ -301,8 +326,10 @@ cannot help.
 
 ### Caveats
 
-- n = 24; **+4.17 points is a single question**. Directional evidence, not a
-  result.
+- n = 24, so **+4.17 points is a single question**. The accuracy ordering is
+  consistent with the mechanism but is not on its own statistically powered;
+  the load-bearing evidence is the per-step gradient measurement (24
+  observations per arm), not the eval delta.
 - The arms diverged after step 1 (the first update changes the policy), so only
   step 1 is a matched comparison; everything else is an aggregate over
   different sampled rollouts.
