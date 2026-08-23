@@ -18,6 +18,7 @@ Multi-Agent Systems") layered on top.
 
 | Path | What it is |
 |---|---|
+| [RESULTS.md](RESULTS.md) | **Recorded results** — accuracy, cost, GPU/wall-clock, and worked examples of what internalisation fixed |
 | [METHOD.md](METHOD.md) | **The method in full detail** — the teacher panel, the trace format, both training stages, the latent layer, the evaluation protocol, and the measured drawbacks and failure modes |
 | [latentsql/mas/](latentsql/mas/) | The teacher: agents, prompts, debate orchestration, trace format, and standalone re-implementations of the four published systems |
 | [latentsql/distill/](latentsql/distill/) | IMAD stage 1 (SFT), stage 2 (GRPO + annealed reward), and the LatentMAS latent-thought module |

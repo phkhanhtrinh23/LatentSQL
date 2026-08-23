@@ -7,7 +7,51 @@ import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+def limit_resources() -> Dict[str, Any]:
+    """Cap GPU memory and CPU threads so a long run cannot destabilise the box.
+
+    An RTX 4090 draws transient spikes well above its steady wattage, which is a
+    common cause of sudden PSU shutdowns during multi-hour runs, and torch will
+    otherwise spin up one CPU thread per core for tokenisation and SQL scoring.
+    Both caps are advisory defaults, overridable per run:
+
+    * ``LATENTSQL_GPU_FRACTION`` - fraction of VRAM this process may allocate
+      (default 0.5, i.e. half the card).
+    * ``LATENTSQL_CPU_THREADS``  - torch/OMP thread cap (default: a quarter of
+      the cores, at least 2, at most 8).
+
+    Note this bounds *allocation*, not power draw; lowering the board power
+    limit needs root (``sudo nvidia-smi -pl <watts>``).
+    """
+    info: Dict[str, Any] = {}
+
+    n_cpu = os.cpu_count() or 4
+    threads = int(os.environ.get("LATENTSQL_CPU_THREADS", max(2, min(8, n_cpu // 4))))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, str(threads))
+    info["cpu_threads"] = threads
+
+    try:
+        import torch
+
+        torch.set_num_threads(threads)
+        if torch.cuda.is_available():
+            frac = float(os.environ.get("LATENTSQL_GPU_FRACTION", "0.5"))
+            if 0.0 < frac < 1.0:
+                torch.cuda.set_per_process_memory_fraction(frac)
+                total = torch.cuda.get_device_properties(0).total_memory / 2**30
+                info["gpu_fraction"] = frac
+                info["gpu_cap_gb"] = round(frac * total, 2)
+    except Exception:
+        pass
+    return info
+
+
 def set_seed(seed: int) -> None:
+    caps = limit_resources()
+    if caps:
+        print(f"[limits] {caps}", flush=True)
     random.seed(seed)
     try:
         import numpy as np
