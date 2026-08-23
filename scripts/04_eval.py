@@ -36,16 +36,27 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--ves", action="store_true", help="also compute BIRD VES (slow)")
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--model", default=None,
+                    help="override llm.model, e.g. to run the baselines on a 3B")
     ap.add_argument("--latent-steps", type=int, default=None)
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="override eval.max_new_tokens; the student emits a whole "
+                         "debate before its answer, so too small a budget scores "
+                         "truncation rather than capability")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     if args.backend:
         cfg.llm.backend = args.backend
+    if args.model:
+        cfg.llm.model = args.model
+        cfg.llm.model_fallbacks = [args.model]
     if args.limit:
         cfg.eval.n_samples = args.limit
     if args.latent_steps:
         cfg.latent.latent_steps = args.latent_steps
+    if args.max_new_tokens:
+        cfg.eval.max_new_tokens = args.max_new_tokens
     set_seed(cfg.seed)
     out_dir = args.out or os.path.join(cfg.paths.output_dir, "eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -77,13 +88,26 @@ def main() -> int:
         base_path = resolve_model_path(base, hub_dir=cfg.paths.hf_hub, local_only=False)
         print(f"student: base={base_path} adapter={adapter}")
         bundle = load_model(
-            base_path, device=cfg.eval.seed and "auto" or "auto",
+            base_path, device="auto",
             hub_dir=cfg.paths.hf_hub, adapter_path=adapter,
+            quantization=getattr(cfg.sft, "quantization", "none"),
         )
+
+    from latentsql.utils.telemetry import RunLog, reset_gpu_peak, run_environment
+
+    runlog = RunLog(
+        os.path.join(out_dir, "eval_samples.jsonl"),
+        header=run_environment(
+            stage="eval", dataset=used, n=len(examples), methods=methods,
+            teacher_model=cfg.llm.model, student_base=cfg.sft.model_name_or_path,
+            quantization=getattr(cfg.llm, "quantization", "none"),
+        ),
+    )
 
     reports = []
     for method in methods:
         banner(f"evaluating: {method}")
+        reset_gpu_peak()
         if llm is not None:
             llm.reset_usage()
         preds, report = run(
@@ -91,9 +115,20 @@ def main() -> int:
             pool=[], cache_dir=cfg.paths.cache_dir, compute_ves=args.ves,
         )
         save_predictions(preds, os.path.join(out_dir, f"preds_{method}.jsonl"))
+        for pr in preds:
+            runlog.write({
+                "record": "sample", "method": method, "qid": pr.qid,
+                "dataset": pr.dataset, "db_id": pr.db_id,
+                "difficulty": pr.difficulty, "correct": pr.correct,
+                "prompt_tokens": pr.prompt_tokens,
+                "completion_tokens": pr.completion_tokens,
+                "latency_s": pr.latency_s, "has_sql": bool(pr.pred_sql),
+            })
+        runlog.write({"record": "method_summary", **report.to_dict()})
         reports.append(report)
         print(report.as_row())
 
+    runlog.close()
     save_reports(reports, os.path.join(out_dir, "reports.json"))
     table = render_table(reports)
     with open(os.path.join(out_dir, "results.md"), "w", encoding="utf-8") as fh:

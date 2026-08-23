@@ -144,10 +144,18 @@ def resolve_db_path(db_root: str, db_id: str) -> str:
 # loading
 # --------------------------------------------------------------------------
 def _get(rec: Dict[str, Any], *keys: str, default: str = "") -> str:
+    """First non-empty *scalar* field among ``keys``.
+
+    Containers are skipped rather than stringified. Canonical Spider
+    ``dev.json`` keeps the **parsed** query tree under ``sql`` and the query
+    *string* under ``query``; stringifying that dict yields a Python repr that
+    can never execute, so every Spider question silently scores as wrong.
+    """
     for k in keys:
         v = rec.get(k)
-        if v not in (None, ""):
-            return str(v)
+        if v is None or v == "" or isinstance(v, (dict, list, tuple, set)):
+            continue
+        return str(v)
     return default
 
 

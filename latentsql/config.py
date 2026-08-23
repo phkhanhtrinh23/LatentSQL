@@ -80,6 +80,10 @@ class LLMConfig:
     # only used by backend == "hf"
     device: str = "auto"
     dtype: str = "auto"
+    #: none | 4bit | 8bit - bitsandbytes weight quantisation. Lets a 7B teacher
+    #: and a 3B student share one card by taking turns; slower than bf16 when
+    #: the model already fits, because bnb dequantises on every forward pass.
+    quantization: str = "none"
     hub_dir: Optional[str] = None   # filled from paths.hf_hub by load_config
     max_batch: int = 8              # batched generation for candidates_per_agent > 1
 
@@ -168,6 +172,7 @@ class SFTConfig:
     )
     gradient_checkpointing: bool = True
     bf16: bool = True
+    quantization: str = "none"      # none | 4bit | 8bit (4bit == QLoRA)
     # loss is taken over the whole debate trace, not just the final SQL
     # (IMAD 2.2, in contrast to DebateGPT)
     train_on_full_trace: bool = True
@@ -191,6 +196,22 @@ class RewardConfig:
     # extra text-to-SQL shaping (kept small so IMAD's two terms dominate)
     w_exec_ok: float = 0.1          # query parses and runs without error
     w_tag_order: float = 0.1        # tags appear in the canonical order
+
+    # --- dense partial credit (FINER-SQL, ICDE 2026) -----------------------
+    # Binary R(y;l) gives a rollout group zero variance whenever every rollout
+    # is wrong, and GRPO then has no gradient. These two terms are awarded ONLY
+    # to wrong rollouts, so a near-miss outscores a badly-wrong one and the
+    # group always carries signal. Set both to 0 to recover pure IMAD.
+    w_atomic: float = 0.0           # atomic-SQL-op overlap with gold
+    w_memory: float = 0.0           # similarity to verified reasoning traces
+    #: the memory term rewards *producing* trace-like reasoning, which fights
+    #: the length anneal. Annealing it on w_fmt's schedule lets it guide early
+    #: and fade as verbalisation stops paying. The atomic term scores the query,
+    #: not the prose, so it is not annealed.
+    anneal_memory_with_fmt: bool = True
+    memory_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    memory_top_k: int = 5
+    memory_same_db_only: bool = False
     required_tags: List[str] = field(default_factory=list)  # empty => trace schema default
 
 
@@ -216,6 +237,12 @@ class GRPOConfig:
     save_steps: int = 100
     device: str = "auto"
     bf16: bool = True
+    quantization: str = "none"      # none | 4bit | 8bit
+    #: rollouts pushed through the policy at once when accumulating the group
+    #: gradient. 1 keeps peak memory flat in group_size; raise it only if the
+    #: prompts are short.
+    micro_batch: int = 1
+    gradient_checkpointing: bool = True
     lora: bool = True
     reward: RewardConfig = field(default_factory=RewardConfig)
 
@@ -259,8 +286,12 @@ class MixConfig:
 
     bird: Optional[int] = None        # questions to draw from BIRD (None = all)
     spider: Optional[int] = None      # questions to draw from Spider
-    bird_split: str = "dev"
-    spider_split: str = "dev"
+    #: which split each half is drawn from. ``None`` means "follow whatever
+    #: split the caller asked for", so trace building reads train and
+    #: evaluation reads dev from the same config - set one explicitly only to
+    #: pin a half against the caller.
+    bird_split: Optional[str] = None
+    spider_split: Optional[str] = None
     shuffle: bool = True
 
 

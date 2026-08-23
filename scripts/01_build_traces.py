@@ -56,6 +56,7 @@ def main() -> int:
         train, cfg, llm,
         example_pool=train,                      # DAIL-SQL shots come from train only
         cache_dir=cfg.paths.cache_dir,
+        log_path=os.path.join(out_dir, "teacher_samples.jsonl"),
     )
 
     trace_path = os.path.join(out_dir, "traces.jsonl")
@@ -87,6 +88,10 @@ def main() -> int:
         "sft_path": sft_path,
         "backend": cfg.llm.backend,
         "model": cfg.llm.model,
+        "quantization": getattr(cfg.llm, "quantization", "none"),
+        "panel": list(cfg.mas.agents),
+        "rounds": cfg.mas.rounds,
+        "sample_log": os.path.join(out_dir, "teacher_samples.jsonl"),
     }
     write_json(summary, os.path.join(out_dir, "summary.json"))
     from latentsql.data.loaders import save_examples

@@ -25,3 +25,7 @@ outputs/*
 # os
 .DS_Store
 Thumbs.db
+
+# third-party repo cloned in for reference (FINER-SQL, ICDE 2026).
+# It has its own git history and upstream, so it is not vendored here.
+finer-sql/

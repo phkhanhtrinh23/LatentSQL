@@ -311,6 +311,32 @@ class TestMixedDataset(unittest.TestCase):
         self.assertTrue(find_db_root(root, "bird", "dev").endswith("dev_databases"))
         self.assertTrue(find_db_root(root, "bird", "train").endswith("train_databases"))
 
+    def test_gold_sql_is_never_a_stringified_parse_tree(self):
+        """Canonical Spider dev.json puts the parsed tree in `sql`, the text in `query`.
+
+        Stringifying that dict yields a repr that cannot execute, so every
+        Spider question scores as wrong and the failure is completely silent.
+        """
+        from latentsql.data.loaders import _get
+
+        spider_dev = {
+            "db_id": "concert_singer",
+            "question": "How many singers do we have?",
+            "query": "SELECT count(*) FROM singer",
+            "sql": {"from": {"table_units": [["table_unit", 1]]}, "select": [False, []]},
+        }
+        self.assertEqual(
+            _get(spider_dev, "SQL", "sql", "query", "gold_sql"),
+            "SELECT count(*) FROM singer",
+        )
+
+        # the FusionSQL dumps keep the string under `sql`; that must still win
+        fusion = {"db_id": "x", "question": "q", "sql": "SELECT 1"}
+        self.assertEqual(_get(fusion, "SQL", "sql", "query", "gold_sql"), "SELECT 1")
+
+        # non-string scalars are still coerced (BIRD question_id is an int)
+        self.assertEqual(_get({"question_id": 42}, "question_id"), "42")
+
     def test_report_splits_ex_by_benchmark(self):
         from latentsql.eval.metrics import Prediction, build_report
 
@@ -368,6 +394,79 @@ class TestSystemPanel(unittest.TestCase):
         picked = _pick(ctx, "chess", _Sel(), turns, round_index=0)
         self.assertEqual(picked.agent, "chess")
         self.assertEqual(picked.reasoning, "counted the rows")
+
+
+class TestDenseRewards(unittest.TestCase):
+    """Atomic-op partial credit (FINER-SQL), which keeps GRPO groups non-degenerate."""
+
+    GOLD = "SELECT COUNT(DISTINCT name) FROM director WHERE director = 'Reitherman'"
+
+    def setUp(self):
+        from latentsql.distill.dense_rewards import AtomicOpsReward
+
+        self.a = AtomicOpsReward()
+
+    def test_aliasing_and_case_do_not_change_the_score(self):
+        variant = ("select count(distinct T1.name) from director AS T1 "
+                   "where T1.director = 'Reitherman'")
+        self.assertAlmostEqual(self.a.jaccard(variant, self.GOLD), 1.0)
+
+    def test_near_misses_are_graded_not_binary(self):
+        """The whole point: a wrong query must not always score the same as gold."""
+        exact = self.a.jaccard(self.GOLD, self.GOLD)
+        no_distinct = self.a.jaccard(
+            "SELECT COUNT(name) FROM director WHERE director = 'Reitherman'", self.GOLD)
+        no_where = self.a.jaccard(
+            "SELECT COUNT(DISTINCT name) FROM director", self.GOLD)
+        unrelated = self.a.jaccard("SELECT COUNT(*) FROM movie", self.GOLD)
+
+        self.assertEqual(exact, 1.0)
+        self.assertLess(no_distinct, exact)       # DISTINCT lives inside COUNT()
+        self.assertLess(no_where, exact)
+        self.assertEqual(unrelated, 0.0)
+        self.assertGreater(no_where, unrelated)   # closer is worth more
+
+    def test_unparseable_sql_scores_zero_rather_than_raising(self):
+        self.assertEqual(self.a.jaccard("SELECT COUNT( FROM", self.GOLD), 0.0)
+        self.assertEqual(self.a.score(None, self.GOLD), 0.0)
+
+    def test_shaping_is_monotone_and_bounded(self):
+        prev = -1.0
+        for sql in ("SELECT COUNT(*) FROM movie",
+                    "SELECT COUNT(DISTINCT name) FROM director",
+                    self.GOLD):
+            v = self.a.score(sql, self.GOLD)
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+            self.assertGreater(v, prev)
+            prev = v
+
+    def test_dense_terms_only_reward_wrong_rollouts(self):
+        """A correct rollout must not be able to earn extra by resembling things."""
+        from latentsql.config import RewardConfig
+        from latentsql.distill.rewards import DebateReward, ExecutionOracle, RewardSchedule
+
+        cfg = RewardConfig()
+        cfg.w_atomic = 1.0
+        sched = RewardSchedule(cfg, total_steps=10)
+
+        class _Oracle(ExecutionOracle):
+            def __init__(self, verdict):
+                super().__init__(timeout=1.0)
+                self.verdict = verdict
+
+            def is_correct(self, db_path, pred_sql, gold_sql):
+                return self.verdict
+
+            def executes(self, db_path, pred_sql):
+                return True
+
+        text = f"<|consensus|>\n```sql\n{self.GOLD}\n```\n<|/consensus|>"
+        right = DebateReward(cfg, _Oracle(True), sched)(text, None, "", self.GOLD, 0)
+        wrong = DebateReward(cfg, _Oracle(False), sched)(text, None, "", self.GOLD, 0)
+
+        self.assertEqual(right.r_atomic, 0.0)     # already fully credited
+        self.assertGreater(wrong.r_atomic, 0.0)   # graded partial credit
 
 
 if __name__ == "__main__":

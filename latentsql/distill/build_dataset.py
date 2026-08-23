@@ -164,13 +164,32 @@ def run_teacher(
     cache_dir: Optional[str] = None,
     on_trace: Optional[Any] = None,
     progress: bool = True,
+    log_path: Optional[str] = None,
 ) -> List[DebateTrace]:
     """Run the fusion teacher over ``examples`` and collect the transcripts."""
+    import time
+
     from ..mas.orchestrator import FusionSQL
+    from ..utils.telemetry import RunLog, gpu_stats, reset_gpu_peak, run_environment
+
+    samplelog = None
+    if log_path:
+        samplelog = RunLog(
+            log_path,
+            header=run_environment(
+                stage="teacher", model=cfg.llm.model, backend=cfg.llm.backend,
+                quantization=getattr(cfg.llm, "quantization", "none"),
+                panel=list(cfg.mas.agents), rounds=cfg.mas.rounds,
+                n_examples=len(examples),
+            ),
+        )
+    reset_gpu_peak()
 
     mas = FusionSQL(llm, cfg.mas, example_pool=example_pool, cache_dir=cache_dir)
     traces: List[DebateTrace] = []
     for i, ex in enumerate(examples):
+        before = (llm.usage.prompt_tokens, llm.usage.completion_tokens, llm.usage.calls)
+        t0 = time.time()
         try:
             tr = mas.solve(ex)
         except Exception as exc:  # one bad DB must not kill a long teacher run
@@ -183,9 +202,34 @@ def run_teacher(
             )
         tr.meta["db_path"] = getattr(ex, "db_path", "")
         traces.append(tr)
+        if samplelog is not None:
+            samplelog.write({
+                "record": "sample",
+                "i": i,
+                "qid": getattr(ex, "qid", str(i)),
+                "dataset": getattr(ex, "dataset", ""),
+                "db_id": getattr(ex, "db_id", ""),
+                "difficulty": getattr(ex, "difficulty", ""),
+                "latency_s": round(time.time() - t0, 3),
+                "prompt_tokens": llm.usage.prompt_tokens - before[0],
+                "completion_tokens": llm.usage.completion_tokens - before[1],
+                "llm_calls": llm.usage.calls - before[2],
+                "n_rounds": tr.n_rounds,
+                "consensus": tr.consensus_reached,
+                "correct": tr.correct,
+                "has_sql": bool(tr.consensus_sql),
+                "trace_chars": len(tr.render()) if tr.consensus_sql else 0,
+                "error": tr.meta.get("error", ""),
+                **gpu_stats(),
+            })
         if on_trace is not None:
             on_trace(tr)
         if progress and (i + 1) % 10 == 0:
             n_ok = sum(1 for t in traces if t.correct)
-            print(f"  [teacher] {i + 1}/{len(examples)}  correct={n_ok}", flush=True)
+            print(
+                f"  [teacher] {i + 1}/{len(examples)}  correct={n_ok}  "
+                f"{round(time.time() - t0, 1)}s/q", flush=True,
+            )
+    if samplelog is not None:
+        samplelog.close()
     return traces

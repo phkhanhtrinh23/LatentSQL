@@ -134,11 +134,19 @@ def load_model(
     adapter_path: Optional[str] = None,
     trainable: bool = False,
     attn_implementation: Optional[str] = None,
+    quantization: str = "none",
 ) -> ModelBundle:
     """Load a causal LM, optionally attaching a PEFT adapter.
 
     ``hub_dir`` is set as ``HF_HOME``/``HF_HUB_CACHE`` before import so that an
     offline hub mirror (e.g. ``/mnt/win_d/hub``) is picked up.
+
+    ``quantization`` is ``none`` (default), ``4bit`` (NF4 + double quantisation,
+    the bitsandbytes QLoRA recipe) or ``8bit``. It roughly quarters/halves the
+    weight memory, which is what lets a 7B teacher and a 3B student take turns
+    on one 24GB card with room for activations. It is not free: bitsandbytes
+    dequantises on every forward pass, so single-stream decoding is *slower*
+    than bf16 when the model already fits.
     """
     if hub_dir and os.path.isdir(hub_dir):
         os.environ.setdefault("HF_HOME", hub_dir)
@@ -158,8 +166,28 @@ def load_model(
     kwargs: Dict[str, Any] = {"trust_remote_code": True, "dtype": torch_dtype}
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+
+    quant = (quantization or "none").lower().replace("-", "").replace("_", "")
+    if quant in ("4bit", "8bit"):
+        from transformers import BitsAndBytesConfig
+
+        if quant == "4bit":
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch_dtype,
+            )
+        else:
+            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        # bitsandbytes places the quantised shards itself; .to() would undo it
+        kwargs["device_map"] = {"": 0} if dev.startswith("cuda") else "auto"
+    elif quant not in ("none", ""):
+        raise ValueError(f"unknown quantization {quantization!r}: none | 4bit | 8bit")
+
     model = AutoModelForCausalLM.from_pretrained(name_or_path, **kwargs)
-    model.to(dev)
+    if "quantization_config" not in kwargs:
+        model.to(dev)
 
     if adapter_path:
         from peft import PeftModel
@@ -206,6 +234,7 @@ class HFLocalBackend(LLMBackend):
                 device=getattr(cfg, "device", "auto"),
                 dtype=getattr(cfg, "dtype", "auto"),
                 hub_dir=hub,
+                quantization=getattr(cfg, "quantization", "none"),
             )
         self.bundle = bundle
 

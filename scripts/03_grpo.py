@@ -96,6 +96,7 @@ def main() -> int:
         hub_dir=cfg.paths.hf_hub,
         adapter_path=(sft_dir if os.path.exists(os.path.join(sft_dir, "adapter_config.json")) else None),
         trainable=True,
+        quantization=getattr(cfg.grpo, "quantization", "none"),
     )
     if not hasattr(bundle.model, "disable_adapter"):
         # no LoRA found: attach fresh adapters so GRPO stays parameter-efficient
@@ -113,9 +114,48 @@ def main() -> int:
     for n, p in bundle.model.named_parameters():
         p.requires_grad_("lora_" in n)
 
+    if getattr(cfg.grpo, "gradient_checkpointing", True):
+        # Without this the backward retains every layer's MLP activations for
+        # the whole prompt+completion; on BIRD (schema prompts of thousands of
+        # tokens) that alone is ~8GB per sequence and OOMs a 24GB card partway
+        # through training. Checkpointing only engages while the model is in
+        # training mode, so the eval-mode rollout generation is unaffected.
+        bundle.model.gradient_checkpointing_enable()
+        # LoRA freezes the embeddings, so without this no input to the first
+        # checkpointed block requires grad and the backward silently breaks
+        if hasattr(bundle.model, "enable_input_require_grads"):
+            bundle.model.enable_input_require_grads()
+        bundle.model.config.use_cache = False
+
     banner("GRPO")
     oracle = ExecutionOracle(timeout=cfg.mas.execution_timeout)
-    trainer = GRPOTrainer(bundle, cfg.grpo, oracle)
+
+    # the memory bank is built from the *kept* teacher traces - transcripts
+    # whose final query was confirmed correct by execution - so the term scores
+    # "does this reasoning resemble a debate that actually worked"
+    memory = None
+    if float(getattr(cfg.grpo.reward, "w_memory", 0.0)) > 0:
+        from latentsql.distill.dense_rewards import MemoryReward
+        from latentsql.mas.trace import load_traces
+
+        trace_path = os.path.join(os.path.dirname(args.data), "traces.jsonl")
+        if os.path.exists(trace_path):
+            banked = load_traces(trace_path)
+            kept = {t.qid for t in banked if t.correct and t.consensus_reached}
+            memory = MemoryReward.from_traces(
+                [t for t in banked if t.qid in kept],
+                model_name=cfg.grpo.reward.memory_model,
+                hub_dir=cfg.paths.hf_hub,
+                device="cpu",              # tiny encoder; keep the GPU for the policy
+                top_k=cfg.grpo.reward.memory_top_k,
+                same_db_only=cfg.grpo.reward.memory_same_db_only,
+            )
+            print(f"[memory] bank of {len(memory._emb) if memory.ready else 0} "
+                  f"verified reasoning paths from {trace_path}")
+        else:
+            print(f"[memory] w_memory > 0 but {trace_path} not found; term disabled")
+
+    trainer = GRPOTrainer(bundle, cfg.grpo, oracle, memory=memory)
     ref = load_reference(bundle)
     result = trainer.train(
         tasks, ref, log_path=os.path.join(cfg.grpo.output_dir, "grpo_log.json")

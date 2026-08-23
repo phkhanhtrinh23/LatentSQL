@@ -85,15 +85,41 @@ def tasks_from_examples(examples: Sequence[Any], schema_render) -> List[GRPOTask
 
 
 # --------------------------------------------------------------------------
+#: how many sequence positions are upcast to float32 at once when scoring
+#: log-probabilities. 512 x 152k vocab is ~310MB per block.
+_LOGP_CHUNK = 512
+
+
 def _seq_logprobs(model, input_ids, attention_mask, completion_start: int):
-    """Sum of log p(token) over the completion span, per sequence."""
+    """Sum of log p(token) over the completion span, per sequence.
+
+    The per-token log-probability comes from ``cross_entropy``, not from an
+    explicit ``log_softmax``: the latter materialises a float32
+    ``[batch, seq, vocab]`` tensor, which for a Qwen vocabulary (~152k) is
+    ~2.4GB *per 4k-token sequence* and is what puts a GRPO group over the
+    memory of a 24GB card. ``cross_entropy`` fuses the same computation.
+    """
     import torch
+    import torch.nn.functional as F
 
     out = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = out.logits[:, :-1, :]
     targets = input_ids[:, 1:]
-    logp = torch.log_softmax(logits.float(), dim=-1)
-    token_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+    # Upcasting the whole logits block to float32 is what actually blows the
+    # memory budget: [1, 4000, 152k] in fp32 is ~2.4GB, and the transpose
+    # forces a second contiguous copy. Walk the time axis in blocks so the
+    # fp32 buffer stays bounded; autograd stitches the blocks back together,
+    # so the gradient is unchanged.
+    parts = []
+    for i in range(0, logits.shape[1], _LOGP_CHUNK):
+        lg = logits[:, i : i + _LOGP_CHUNK, :]
+        tg = targets[:, i : i + _LOGP_CHUNK]
+        parts.append(
+            -F.cross_entropy(lg.transpose(1, 2).float(), tg, reduction="none")
+        )
+    token_logp = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+    del out, logits
 
     mask = attention_mask[:, 1:].clone().float()
     mask[:, : max(0, completion_start - 1)] = 0.0
@@ -107,16 +133,19 @@ class GRPOTrainer:
         cfg: Any,
         oracle: ExecutionOracle,
         total_steps: Optional[int] = None,
+        memory: Optional[Any] = None,
     ):
         self.bundle = bundle
         self.cfg = cfg
         self.oracle = oracle
         self.schedule = RewardSchedule(cfg.reward, total_steps=total_steps or 100)
+        self.memory = memory
         self.reward_fn = DebateReward(
             cfg.reward,
             oracle,
             self.schedule,
             decode=lambda ids: bundle.tokenizer.decode(list(ids), skip_special_tokens=True),
+            memory=memory,
         )
         self.history: List[Dict[str, Any]] = []
 
@@ -166,7 +195,21 @@ class GRPOTrainer:
         return rollouts
 
     # -- loss -------------------------------------------------------------
-    def _loss_for(self, rollouts: Sequence[Rollout], ref_model) -> Any:
+    def _loss_for(self, rollouts: Sequence[Rollout], ref_model, scale: float = 1.0) -> Any:
+        """Accumulate the GRPO gradient for one rollout group.
+
+        The group is walked in chunks of ``cfg.micro_batch`` and each chunk's
+        contribution is backwarded as it is computed, rather than holding one
+        activation graph over the whole group. A group is
+        ``group_size`` x (prompt + completion) tokens long - on BIRD, where the
+        prompt alone is thousands of tokens, materialising that at once OOMs a
+        24GB card. Chunking changes only peak memory: every chunk is divided by
+        the *group-wide* token count, so the accumulated gradient is identical
+        to the single-batch form.
+
+        Returns the (unscaled) group loss as a float, or ``None`` when every
+        advantage is zero and there is nothing to learn from.
+        """
         import torch
 
         tok = self.bundle.tokenizer
@@ -174,40 +217,58 @@ class GRPOTrainer:
         if not active:
             return None
 
-        seqs = [r.prompt_ids + r.completion_ids for r in active]
-        n = max(len(s) for s in seqs)
-        pad = tok.pad_token_id
-        input_ids = torch.tensor([s + [pad] * (n - len(s)) for s in seqs], dtype=torch.long)
-        attn = torch.tensor([[1] * len(s) + [0] * (n - len(s)) for s in seqs], dtype=torch.long)
-        input_ids = input_ids.to(self.bundle.device)
-        attn = attn.to(self.bundle.device)
         start = len(active[0].prompt_ids)
+        # mask counts exactly the completion tokens of each rollout, so the
+        # group-wide denominator needs no forward pass
+        denom = float(max(1, sum(len(r.completion_ids) for r in active)))
+        pad = tok.pad_token_id
+        chunk = max(1, int(getattr(self.cfg, "micro_batch", 1)))
+        total = 0.0
 
-        _, token_logp, mask = _seq_logprobs(self.bundle.model, input_ids, attn, start)
-        with torch.no_grad():
-            _, ref_logp, _ = _seq_logprobs(ref_model, input_ids, attn, start)
+        for i in range(0, len(active), chunk):
+            part = active[i : i + chunk]
+            seqs = [r.prompt_ids + r.completion_ids for r in part]
+            n = max(len(s) for s in seqs)
+            input_ids = torch.tensor(
+                [s + [pad] * (n - len(s)) for s in seqs], dtype=torch.long
+            ).to(self.bundle.device)
+            attn = torch.tensor(
+                [[1] * len(s) + [0] * (n - len(s)) for s in seqs], dtype=torch.long
+            ).to(self.bundle.device)
 
-        adv = torch.tensor(
-            [r.advantage for r in active], dtype=torch.float32, device=self.bundle.device
-        ).unsqueeze(-1)
+            _, token_logp, mask = _seq_logprobs(self.bundle.model, input_ids, attn, start)
+            with torch.no_grad():
+                _, ref_logp, _ = _seq_logprobs(ref_model, input_ids, attn, start)
 
-        # We take exactly one gradient update per rollout group, so the policy
-        # that generated the group *is* the policy being scored: the importance
-        # ratio is identically 1 and the clipped surrogate reduces to
-        # -advantage * logp. The clipped form is written out anyway so that
-        # raising the number of inner epochs stays a one-line change.
-        ratio = torch.exp(token_logp - token_logp.detach())
-        unclipped = ratio * adv
-        clipped = torch.clamp(ratio, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps) * adv
-        pg = -torch.min(unclipped, clipped)
+            adv = torch.tensor(
+                [r.advantage for r in part], dtype=torch.float32, device=self.bundle.device
+            ).unsqueeze(-1)
 
-        # k3 estimator of KL(pi || pi_ref), the low-variance form used by GRPO
-        delta = ref_logp - token_logp
-        kl = torch.exp(delta) - delta - 1.0
+            # We take exactly one gradient update per rollout group, so the
+            # policy that generated the group *is* the policy being scored: the
+            # importance ratio is identically 1 and the clipped surrogate
+            # reduces to -advantage * logp. The clipped form is written out
+            # anyway so that raising the number of inner epochs stays a
+            # one-line change.
+            ratio = torch.exp(token_logp - token_logp.detach())
+            unclipped = ratio * adv
+            clipped = torch.clamp(ratio, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps) * adv
+            pg = -torch.min(unclipped, clipped)
 
-        per_token = pg + self.cfg.kl_beta * kl
-        denom = mask.sum().clamp(min=1.0)
-        return (per_token * mask).sum() / denom
+            # k3 estimator of KL(pi || pi_ref), the low-variance form used by GRPO
+            delta = ref_logp - token_logp
+            kl = torch.exp(delta) - delta - 1.0
+
+            per_token = pg + self.cfg.kl_beta * kl
+            loss = (per_token * mask).sum() / denom
+            (loss * scale).backward()
+            total += float(loss.detach())
+
+            del input_ids, attn, token_logp, mask, ref_logp, per_token, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return total
 
     # -- loop -------------------------------------------------------------
     def train(
@@ -237,7 +298,22 @@ class GRPOTrainer:
             flush=True,
         )
 
+        from ..utils.telemetry import RunLog, gpu_stats, reset_gpu_peak, run_environment
+
+        steplog = None
+        if log_path:
+            steplog = RunLog(
+                os.path.splitext(log_path)[0] + "_steps.jsonl",
+                header=run_environment(
+                    stage="grpo", optimizer_steps=total_opt,
+                    group_size=cfg.group_size, n_tasks=len(tasks),
+                    quantization=getattr(cfg, "quantization", "none"),
+                ),
+            )
+        reset_gpu_peak()
+
         order: List[int] = []
+        gen_tokens_total = 0
         micro, opt_step, t0 = 0, 0, time.time()
         optim.zero_grad(set_to_none=True)
 
@@ -248,16 +324,29 @@ class GRPOTrainer:
             take = [order.pop() for _ in range(min(cfg.batch_prompts, len(order)))]
 
             batch_rewards, batch_lens, batch_fmt, batch_clip = [], [], [], []
+            batch_std, batch_live = [], []
             for ti in take:
                 rollouts = self.sample_group(tasks[ti], opt_step)
+                # A group whose rewards are all equal produces all-zero
+                # advantages and therefore NO gradient at all. Tracking how
+                # often that happens is the difference between "training is
+                # slow" and "training is not happening" - log it, do not
+                # infer it from the reward mean.
+                _rs = [r.reward.total for r in rollouts]
+                _m = sum(_rs) / max(1, len(_rs))
+                batch_std.append(
+                    (sum((x - _m) ** 2 for x in _rs) / max(1, len(_rs))) ** 0.5
+                )
+                batch_live += [1.0 if abs(r.advantage) > 1e-8 else 0.0 for r in rollouts]
                 batch_rewards += [r.reward.total for r in rollouts]
                 batch_lens += [r.reward.n_tokens for r in rollouts]
                 batch_fmt += [r.reward.r_fmt for r in rollouts]
                 batch_clip += [r.reward.r_clip for r in rollouts]
+                gen_tokens_total += sum(len(r.completion_ids) for r in rollouts)
 
-                loss = self._loss_for(rollouts, ref_model)
-                if loss is not None:
-                    (loss / cfg.grad_accum).backward()
+                # the loss backwards chunk by chunk inside _loss_for, so a
+                # long BIRD group never has to fit in memory all at once
+                self._loss_for(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
             micro += 1
 
             if micro % cfg.grad_accum == 0:
@@ -274,9 +363,19 @@ class GRPOTrainer:
                         "r_fmt_mean": _mean(batch_fmt),
                         "r_clip_mean": _mean(batch_clip),
                         "gen_tokens_mean": _mean(batch_lens),
+                        #: within-group reward spread; 0 => no learning signal
+                        "reward_std_mean": _mean(batch_std),
+                        #: fraction of rollouts that actually contributed a
+                        #: gradient this step
+                        "adv_nonzero_frac": _mean(batch_live),
+                        "gen_tokens_total": gen_tokens_total,
+                        "n_executions": self.oracle.n_exec,
                         "elapsed_s": round(time.time() - t0, 1),
                     }
+                    rec.update(gpu_stats())
                     self.history.append(rec)
+                    if steplog:
+                        steplog.write({"record": "step", **rec})
                     print(f"[grpo] {rec}", flush=True)
                 if cfg.save_steps and opt_step % cfg.save_steps == 0:
                     self.save(cfg.output_dir)
@@ -284,11 +383,19 @@ class GRPOTrainer:
         self.save(cfg.output_dir)
         result = {
             "output_dir": cfg.output_dir,
+            "model": getattr(self.bundle, "name", ""),
+            "quantization": getattr(cfg, "quantization", "none"),
             "optimizer_steps": opt_step,
             "n_executions": self.oracle.n_exec,
+            "gen_tokens_total": gen_tokens_total,
             "elapsed_s": round(time.time() - t0, 1),
+            **gpu_stats(),
             "history": self.history,
         }
+        if steplog:
+            steplog.write({"record": "summary", **{k: v for k, v in result.items()
+                                                   if k != "history"}})
+            steplog.close()
         if log_path:
             os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
             with open(log_path, "w", encoding="utf-8") as fh:

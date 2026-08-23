@@ -134,6 +134,8 @@ class RewardBreakdown:
     r_clip: float = 0.0
     r_exec_ok: float = 0.0
     r_tag_order: float = 0.0
+    r_atomic: float = 0.0
+    r_memory: float = 0.0
     w_fmt: float = 0.0
     length_limit: int = 0
     n_tokens: int = 0
@@ -142,6 +144,17 @@ class RewardBreakdown:
 
     def as_dict(self) -> Dict[str, Any]:
         return self.__dict__.copy()
+
+
+def _reasoning_of(text: str) -> str:
+    """The prose of a trace with its SQL blocks removed.
+
+    The memory bank holds *reasoning*, so comparing against a string dominated
+    by SQL would score syntax rather than argument.
+    """
+    import re as _re
+
+    return _re.sub(r"```sql.*?```", " ", text or "", flags=_re.S | _re.I).strip()
 
 
 def clip_tokens(token_ids: Sequence[int], limit: int) -> Sequence[int]:
@@ -163,12 +176,19 @@ class DebateReward:
         schedule: RewardSchedule,
         decode: Optional[Callable[[Sequence[int]], str]] = None,
         required_tags: Sequence[str] = (),
+        memory: Optional[Any] = None,
     ):
         self.cfg = cfg
         self.oracle = oracle
         self.schedule = schedule
         self.decode = decode
         self.required_tags = tuple(required_tags or cfg.required_tags or REQUIRED_TAGS)
+        self.memory = memory
+        self.atomic = None
+        if float(getattr(cfg, "w_atomic", 0.0)) > 0:
+            from .dense_rewards import AtomicOpsReward
+
+            self.atomic = AtomicOpsReward()
 
     def __call__(
         self,
@@ -200,14 +220,36 @@ class DebateReward:
         full_sql = extract_final_sql(text)
         r_exec = 1.0 if (clipped_sql and self.oracle.executes(db_path, clipped_sql)) else 0.0
 
+        # --- dense partial credit, awarded ONLY to wrong rollouts -------------
+        # A correct rollout already earns full credit; letting it also earn
+        # similarity credit would let a verbose-but-right answer outscore a
+        # terse-but-right one, which is backwards for internalisation.
+        r_atomic = r_memory = 0.0
+        if r_clip < 1.0:
+            if self.atomic is not None and clipped_sql:
+                r_atomic = self.atomic.score(clipped_sql, gold_sql)
+            if self.memory is not None and float(getattr(self.cfg, "w_memory", 0.0)) > 0:
+                r_memory = self.memory.score(_reasoning_of(clipped_text))
+
+        w_mem = float(getattr(self.cfg, "w_memory", 0.0))
+        if w_mem and getattr(self.cfg, "anneal_memory_with_fmt", True):
+            # scale on w_fmt's trajectory so the incentive to look like a trace
+            # decays together with the incentive to write one
+            span = max(1e-9, self.cfg.w_fmt_start - self.cfg.w_fmt_end)
+            w_mem *= (w_fmt - self.cfg.w_fmt_end) / span
+
         total = (
             w_fmt * r_fmt
             + self.cfg.w_clip * r_clip
             + self.cfg.w_exec_ok * r_exec
             + self.cfg.w_tag_order * r_order
+            + float(getattr(self.cfg, "w_atomic", 0.0)) * r_atomic
+            + w_mem * r_memory
         )
         return RewardBreakdown(
             total=total,
+            r_atomic=r_atomic,
+            r_memory=r_memory,
             r_fmt=r_fmt,
             r_clip=r_clip,
             r_exec_ok=r_exec,

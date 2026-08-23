@@ -69,8 +69,8 @@ def resolve_examples(
                 load_mixed(
                     roots["bird"], roots["spider"],
                     n_bird=n_bird, n_spider=n_spider,
-                    bird_split=getattr(mix, "bird_split", split) if mix else split,
-                    spider_split=getattr(mix, "spider_split", split) if mix else split,
+                    bird_split=(getattr(mix, "bird_split", None) if mix else None) or split,
+                    spider_split=(getattr(mix, "spider_split", None) if mix else None) or split,
                     limit=limit, seed=cfg.seed,
                     shuffle=getattr(mix, "shuffle", shuffle) if mix else shuffle,
                 ),

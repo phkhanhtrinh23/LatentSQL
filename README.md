@@ -18,6 +18,7 @@ Multi-Agent Systems") layered on top.
 
 | Path | What it is |
 |---|---|
+| [METHOD.md](METHOD.md) | **The method in full detail** — the teacher panel, the trace format, both training stages, the latent layer, the evaluation protocol, and the measured drawbacks and failure modes |
 | [latentsql/mas/](latentsql/mas/) | The teacher: agents, prompts, debate orchestration, trace format, and standalone re-implementations of the four published systems |
 | [latentsql/distill/](latentsql/distill/) | IMAD stage 1 (SFT), stage 2 (GRPO + annealed reward), and the LatentMAS latent-thought module |
 | [latentsql/steering/](latentsql/steering/) | Agent-subspace extraction and activation steering (IMAD §3) |
@@ -419,6 +420,248 @@ consumption:
 Execution is sandboxed: read-only URI connections, a progress-handler interrupt
 for runaway queries, and a guard that refuses any non-read-only statement
 (including one smuggled in after a comment or a second statement).
+
+---
+
+## 11b. Run logs, quantization and the pilot
+
+### One JSONL record per unit of work
+
+Every stage writes an append-only log, flushed per record, so a killed run keeps
+everything it had produced ([telemetry.py](latentsql/utils/telemetry.py)):
+
+| File | One record per | Carries |
+|---|---|---|
+| `<run>/traces/teacher_samples.jsonl` | teacher question | latency, prompt/completion tokens, LLM calls, rounds, consensus, correct, trace size, GPU alloc/reserved/peak |
+| `<run>/sft/sft_log_steps.jsonl` | optimizer step | loss, lr, tokens seen, elapsed, GPU |
+| `<run>/grpo/grpo_log_steps.jsonl` | optimizer step | reward mean, `R_fmt`, `R_clip`, generated length, the `w_fmt`/`l` schedule, SQL executions, GPU |
+| `<run>/eval*/eval_samples.jsonl` | question x method | correct, tokens, latency |
+
+Each file opens with a header record naming the GPU, the torch/transformers
+versions, the model and the quantization, so a log identifies the run that
+produced it.
+
+[`scripts/06_report.py`](scripts/06_report.py) folds all of it into one
+`report.md`: accuracy per benchmark, token and latency cost against both the
+teacher and each published baseline, and the training curves.
+
+```bash
+python scripts/06_report.py --run outputs/pilot
+```
+
+### Quantization
+
+`llm.quantization` / `sft.quantization` / `grpo.quantization` take
+`none | 4bit | 8bit` (bitsandbytes NF4 + double quant; `4bit` on the student is
+QLoRA). On this workstation 4-bit is **faster**, not slower, for the teacher:
+
+| 7B teacher, four-system panel | s / question | GPU |
+|---|---:|---:|
+| bf16 | 49.6 | 15.7 GB |
+| 4-bit NF4 | 37.6 | 5.3 GB |
+
+Single-stream decode is memory-bandwidth bound, so quartering the weight traffic
+per token more than pays for bitsandbytes' dequantisation. Expect the ordering
+to flip once generation is batched (vLLM), where compute dominates.
+
+### The pilot
+
+[`configs/pilot_mix.yaml`](configs/pilot_mix.yaml) +
+[`scripts/run_pilot.sh`](scripts/run_pilot.sh) run the whole pipeline end to end
+on real local models, sized for ~1.5 h on one 24GB card:
+
+```bash
+N_TRACE=90 N_EVAL=24 bash scripts/run_pilot.sh
+```
+
+Five stages, each a separate process so **exactly one model is resident on the
+GPU at a time**: 7B teacher builds traces, 3B student takes SFT then GRPO, then
+two separate evaluation passes - the four published systems driven by the *same
+3B backbone as the student*, and the student itself. Trace building reads the
+`train` splits and evaluation reads `dev`, so nothing scored was ever seen by
+the teacher. Finished stages are skipped on rerun.
+
+This is a pipeline proof and a log generator, **not a result** - the corpus it
+produces is far too small to train on.
+
+### GRPO memory
+
+A GRPO group is `group_size` x (prompt + completion) tokens, and on BIRD the
+prompt alone runs to thousands of tokens. Two things made that fit in 24GB:
+
+- the group gradient accumulates in chunks of `grpo.micro_batch` rollouts
+  (default 1) instead of one activation graph over the whole group;
+- log-probabilities come from `cross_entropy` walked over the sequence in
+  512-position blocks. The natural `log_softmax(logits.float())` materialises a
+  `[batch, seq, vocab]` fp32 tensor - ~2.4GB per 4k-token sequence at Qwen's
+  152k vocabulary, and the transpose forces a second copy. That single line was
+  the difference between OOM and a 15GB peak.
+
+Both are exact: forward outputs are identical and gradients agree to 1e-8.
+
+---
+
+## 11c. Pilot run 1 — recorded results (2026-08-23)
+
+First end-to-end run on real local models: 7B teacher -> 3B student, one RTX
+4090, 4-bit throughout, ~1.9 h wall-clock. Logs in `outputs/pilot/`, assembled
+by [`06_report.py`](scripts/06_report.py).
+
+**Read the caveats in "What this run does not show" before quoting any number.**
+
+### Headline — the internalised 3B student vs. the four systems at the same 3B
+
+24 held-out dev questions (12 BIRD + 12 Spider), same backbone
+(`Qwen2.5-Coder-3B-Instruct`), same schema rendering, same executor, same
+scorer. 95% Wilson intervals.
+
+| Method | EX (%) | 95% CI | bird | spider | Tokens | Output | Latency | No SQL |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Single agent | 45.83 | 27.9-64.9 | 25.0 | 66.7 | 1 585 | 180 | 3.6 s | 0 |
+| DIN-SQL | 54.17 | 35.1-72.1 | 33.3 | 75.0 | 3 186 | 321 | 6.4 s | 0 |
+| **DAIL-SQL** | **62.50** | 42.7-78.8 | 41.7 | 83.3 | 4 697 | 349 | 7.1 s | 0 |
+| CHESS | 41.67 | 24.5-61.2 | 16.7 | 66.7 | 7 253 | 1 079 | 26.6 s | 0 |
+| CHASE-SQL | 50.00 | 31.4-68.6 | 33.3 | 66.7 | 6 744 | 653 | 13.0 s | 0 |
+| **LatentSQL student (ours)** | 54.17 | 35.1-72.1 | 33.3 | 75.0 | 2 097 | 675 | 24.1 s | 2 |
+
+The student ties DIN-SQL at 66% of its tokens and beats CHESS and CHASE-SQL at
+~30% of theirs; it loses to DAIL-SQL. Against the 7B teacher panel that produced
+its training data (26 710 tokens, 27.0 LLM calls per question) it answers in
+**2 097 tokens and 1 call - 7.9% of the teacher's tokens**.
+
+**Every interval overlaps every other.** At n = 24 this table cannot separate any
+two methods; it shows the pipeline produces sane numbers, nothing more.
+
+Per-question agreement is the sharper picture: of 24 questions, **6 were solved
+by all six methods and 7 by none**, so only 11 discriminate at all. The student
+solved **0 questions that no other method solved**, and lost 2 that DAIL-SQL got.
+It also emitted 2 unparseable outputs, the only method to do so.
+
+### Teacher
+
+`Qwen2.5-7B-Instruct` 4-bit, panel `[din_sql, dail_sql, chess, chase_sql]`,
+2 rounds, 81 train questions, 66.8 min, GPU peak 8.8 GB.
+
+| | n | EX | Consensus | Latency (mean/med/p90) | Tokens (mean/med/p90) | Calls |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 81 | 28.40% | 86.4% | 49.5 / 40.5 / 81.2 s | 26 710 / 23 148 / 48 759 | 27.0 |
+| bird | 42 | **54.76%** | 76.2% | 63.5 / 47.1 / 116.3 s | 30 550 / 25 748 / 56 896 | 30.8 |
+| spider | 39 | **0.00%** | 97.4% | 34.4 / 28.2 / 55.2 s | 22 574 / 19 388 / 34 661 | 22.8 |
+
+Spider's 0.00% is the loader bug described below, not a property of Spider.
+Filtering kept **19/81 (23.5%)**: 51 dropped incorrect, 11 no-consensus, 0 for
+any other reason - i.e. yield is bounded almost entirely by teacher accuracy.
+That is **~17 usable traces per GPU-hour** at this configuration.
+
+### Student training
+
+SFT: 19 traces, 14 steps, 35 s, 113k tokens, peak 8.9 GB, loss 0.63 -> 0.32.
+
+GRPO: 9 steps, 14.5 min, 50 773 tokens generated, 152 real SQL executions,
+peak 6.2 GB.
+
+| step | w_fmt | clip | reward | R_fmt | R_clip | gen_len |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.881 | 838 | 0.700 | 0.375 | 0.250 | 653 |
+| 3 | 0.644 | 712 | 0.529 | 0.562 | 0.000 | 671 |
+| 5 | 0.406 | 588 | 0.613 | 0.500 | 0.250 | 681 |
+| 7 | 0.169 | 462 | 0.640 | 0.312 | 0.500 | 796 |
+| 9 | 0.050 | 400 | 0.309 | 0.188 | 0.250 | 746 |
+
+The schedule ran correctly - `w_fmt` annealed 0.88 -> 0.05 and the clip 838 ->
+400 - but **generated length did not fall** (654 -> 746, no trend) and reward did
+not rise. The GRPO student scores identically to the SFT-only student
+(54.17%, 2 075 tokens). At 97 s/step, the several hundred steps this needs is
+~13.5 h, not 15 minutes.
+
+### What this run does *not* show
+
+1. **No internalisation happened.** 9 optimizer steps on 19 traces at lr 1e-6.
+   The mechanism is verified to run; it was not trained.
+2. **The corpus is BIRD-only.** The teacher ran before the Spider fix, so all 19
+   traces are BIRD. The student still scores 75% on Spider dev, which is
+   cross-benchmark transfer, but it is not the mixed corpus the config asks for.
+3. **n = 24 and 19 traces.** Nothing here is statistically meaningful.
+
+### Two bugs this run surfaced
+
+**Spider gold SQL was never loaded.** Canonical Spider `dev.json` stores the
+*parsed* query tree under `sql` and the query *string* under `query`; the field
+probe took `sql` first and stringified the dict, so every Spider gold was a
+Python repr that cannot execute and every Spider question scored wrong -
+silently. It showed up only as Spider reading 0.00% against BIRD's 54.76%, when
+Spider is the *easier* benchmark. Fixed in `_get`, which now skips containers;
+regression test in `tests/test_core.py`.
+
+**GRPO OOMed on a 24GB card**, three compounding causes:
+
+| Cause | Fix | Peak |
+|---|---|---:|
+| whole rollout group in one activation graph | accumulate per rollout (`grpo.micro_batch`) | 23.3 GB (OOM) -> 15.0 |
+| `log_softmax(logits.float())` = fp32 `[1, 4k, 152k]` | time-chunked `cross_entropy` | -> 13.6 |
+| **gradient checkpointing never wired into GRPO** | `gradient_checkpointing_enable()` + `enable_input_require_grads()` | -> **4.6** |
+
+All three are exact: forward outputs identical, gradients agree to 1e-8.
+
+---
+
+## 11d. Pilot run 2 — the Spider fix, and the first sign GRPO works
+
+Same pipeline, same seed, same 24 held-out questions; the only change upstream
+is that Spider gold SQL now loads correctly. `outputs/pilot2/`.
+
+| | run 1 | run 2 |
+|---|---:|---:|
+| teacher EX | 28.4% | **63.0%** |
+| traces kept | 19/81 (23.5%) | **46/81 (56.8%)** |
+| SFT final loss | 0.32 | **0.15** |
+| GRPO steps with a live gradient | 4/9 (44%) | **13/15 (87%)** |
+| SFT-only student | 54.17% | 41.67% |
+| **GRPO student** | 54.17% (Δ 0.0) | 50.00% (**Δ +8.3**) |
+
+**The result that matters: GRPO produced +8.3 EX in run 2, all of it on Spider
+(58.3 → 75.0).** That is the first evidence here that stage 2 does anything at
+all, and it appeared exactly when the gradient stopped being degenerate. In run
+1, with 44% dead steps, GRPO moved the weights by 6e-04 and changed nothing.
+
+The absolute number is still below run 1 because run 2's *SFT* is worse
+(41.67%), despite 2.4x the traces and half the loss - it fits the transcripts
+tightly and emits 993 output tokens against run 1's 653. Both runs sit inside
+each other's confidence intervals at n = 24.
+
+### Two failure modes the new diagnostics caught
+
+`grpo_log_steps.jsonl` now records `reward_std_mean` and `adv_nonzero_frac`.
+They exposed that a group can die from *either* end:
+
+| step | R_clip | adv_nonzero_frac | what happened |
+|---:|---:|---:|---|
+| 8 | 1.00 | **0.00** | every rollout correct *and* identically formatted - no spread |
+| 9 | 1.00 | **0.00** | fully saturated on every term |
+| 12 | 0.00 | 1.00 | every rollout wrong; rescued only by a weak R_fmt spread (std 0.05) |
+
+Run 1 died of all-wrong groups; run 2 also hits all-*correct* ones. Both give
+zero gradient. This exposes a real gap: **nothing in the reward distinguishes
+two correct rollouts of different lengths** - both score `R_clip = 1`, so GRPO
+cannot learn "be correct *and* shorter" from a saturated group, which is the
+entire internalisation objective. IMAD's length pressure only bites when the
+answer appears *late*; here the student emits the query early and keeps writing.
+
+### The student does not reliably close the debate
+
+Re-evaluating with `--max-new-tokens 3072` instead of 1024:
+
+| budget | EX | hit cap | reached `<\|consensus\|>` |
+|---|---:|---:|---:|
+| 1024 | 50.00% | 17/24 | 1/24 |
+| 3072 | 50.00% | 2/24 | 11/24 |
+
+Accuracy is *identical*. Truncation was not costing accuracy - a tempting
+hypothesis, tested and refuted (questions with short traces are simply the
+easier ones). What it does show is that even with ample room the student emits
+`<|consensus|>` on only 11 of 24 questions, so the fallback extractor is
+scraping a mid-debate query half the time. That is a format-adherence failure,
+not a budget failure.
 
 ---
 

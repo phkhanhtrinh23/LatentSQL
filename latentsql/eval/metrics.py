@@ -58,6 +58,8 @@ class EvalReport:
     #: difficulty; on a single-benchmark run it holds one entry.
     by_dataset: Dict[str, Dict[str, float]] = field(default_factory=dict)
     n_unparseable: int = 0
+    #: peak GPU memory and device seen while this method ran
+    resources: Dict[str, Any] = field(default_factory=dict)
     notes: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -132,12 +134,15 @@ def build_report(
     for bucket in by_ds.values():
         bucket["ex"] = round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0
 
+    from ..utils.telemetry import gpu_stats
+
     return EvalReport(
         method=method,
         dataset=dataset,
         n=n,
         ex=ex,
         ves=ves,
+        resources=gpu_stats(),
         avg_total_tokens=round(statistics.fmean(p.total_tokens for p in preds), 2),
         avg_completion_tokens=round(statistics.fmean(p.completion_tokens for p in preds), 2),
         avg_latency_s=round(statistics.fmean(p.latency_s for p in preds), 3),

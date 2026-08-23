@@ -112,6 +112,7 @@ def prepare_student(
         dtype=("bfloat16" if cfg.bf16 else "auto"),
         hub_dir=hub_dir,
         trainable=trainable,
+        quantization=getattr(cfg, "quantization", "none"),
     )
     if add_tag_tokens:
         added = bundle.tokenizer.add_special_tokens(
@@ -183,7 +184,22 @@ def train_sft(
         p = (s - warmup) / max(1, opt_steps - warmup)
         return cfg.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, p)))
 
+    from ..utils.telemetry import RunLog, gpu_stats, reset_gpu_peak, run_environment
+
+    steplog = None
+    if log_path:
+        steplog = RunLog(
+            os.path.splitext(log_path)[0] + "_steps.jsonl",
+            header=run_environment(
+                stage="sft", model=cfg.model_name_or_path, lora=cfg.lora,
+                quantization=getattr(cfg, "quantization", "none"),
+                n_examples=len(encoded), optimizer_steps=opt_steps,
+            ),
+        )
+    reset_gpu_peak()
+
     history: List[Dict[str, Any]] = []
+    tokens_seen = 0
     micro, opt_step, t0 = 0, 0, time.time()
     n_micro = max(1, int(steps_per_epoch * cfg.epochs))
     order: List[int] = []
@@ -209,6 +225,7 @@ def train_sft(
         loss = out.loss / cfg.grad_accum
         loss.backward()
         micro += 1
+        tokens_seen += int(batch.attention_mask.sum())
 
         if micro % cfg.grad_accum == 0:
             for g in optim.param_groups:
@@ -222,9 +239,13 @@ def train_sft(
                     "step": opt_step,
                     "loss": float(out.loss.detach().float()),
                     "lr": lr_at(opt_step),
+                    "tokens_seen": tokens_seen,
                     "elapsed_s": round(time.time() - t0, 1),
                 }
+                rec.update(gpu_stats())
                 history.append(rec)
+                if steplog:
+                    steplog.write({"record": "step", **rec})
                 print(f"[sft] {rec}", flush=True)
             if cfg.save_steps and opt_step % cfg.save_steps == 0:
                 save_student(bundle, cfg.output_dir)
@@ -232,12 +253,20 @@ def train_sft(
     save_student(bundle, cfg.output_dir)
     result = {
         "output_dir": cfg.output_dir,
+        "model": cfg.model_name_or_path,
+        "quantization": getattr(cfg, "quantization", "none"),
         "n_examples": len(encoded),
         "optimizer_steps": opt_step,
+        "tokens_seen": tokens_seen,
         "final_loss": history[-1]["loss"] if history else None,
         "elapsed_s": round(time.time() - t0, 1),
+        **gpu_stats(),
         "history": history,
     }
+    if steplog:
+        steplog.write({"record": "summary", **{k: v for k, v in result.items()
+                                               if k != "history"}})
+        steplog.close()
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
