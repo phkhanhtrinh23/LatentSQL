@@ -23,8 +23,11 @@ separable.
 | Eval split | 24 questions (12 BIRD + 12 Spider) from the **dev** splits |
 | Leakage | zero qid overlap between train and eval; DAIL shots drawn from train only |
 
-Two runs are recorded. **Run 1** predates the Spider loader fix and its training
-corpus is BIRD-only. **Run 2** is the corrected run and is the one to read.
+Three runs are recorded. **Run 1** predates the Spider loader fix and its
+training corpus is BIRD-only. **Run 2** is the corrected run and is the one to
+read for the headline comparison. **Run 3** (§5b) is a controlled ablation of
+the dense reward terms on a 1/3 BIRD + 2/3 Spider corpus; its eval set is a
+different draw, so its numbers are comparable within run 3 only.
 
 ---
 
@@ -233,6 +236,79 @@ Identical accuracy. Truncation was a tempting explanation — tested and refuted
 that even with ample room the student emits `<|consensus|>` on only 11 of 24
 questions, so the fallback extractor is scraping a mid-debate query about half
 the time. A **format-adherence** failure, not a budget one.
+
+---
+
+## 5b. Run 3 — does dense partial credit fix GRPO? (the reward ablation)
+
+Corpus **1/3 BIRD + 2/3 Spider** (30/60 train, 8/16 eval). Teacher and SFT run
+**once**; GRPO then runs **twice from the same SFT checkpoint**, differing only
+in `w_atomic` / `w_memory`, so the reward is the single changed variable.
+`outputs/pilot3/`.
+
+Teacher: 81 questions, 64.2% EX (BIRD 50.0%, Spider 71.7%), **48/81 kept
+(59.3%)**, 64 min, GPU peak 8.8 GB. Each GRPO arm: 24 steps, ~40 min, peak
+6.4 GB — and for the first time in the project **the anneal ran to completion**
+(`w_fmt` 0.96 → 0.05, clip 878 → 400).
+
+### The mechanism worked exactly as designed — and exactly as limited
+
+| group type | | ctrl (binary) | dense (atomic+memory) |
+|---|---|---:|---:|
+| **all-wrong** | count | 3 | 6 |
+| | **dead steps** | **1** | **0** |
+| | **mean `reward_std`** | **0.029** | **0.091** (**3.2x**) |
+| all-correct | count | 5 | 7 |
+| | dead steps | 2 | 3 |
+| | mean `reward_std` | 0.052 | 0.054 (**1.0x**) |
+
+**3.2x the gradient on failing groups, zero dead steps there; nothing whatsoever
+on saturated groups.** That is precisely the mechanism: the dense terms score
+only *wrong* rollouts, so they can spread a failing group and cannot spread a
+saturated one. On step 1 — the only true paired comparison, before the arms
+diverged — dense turned an *exactly dead* gradient (`std = 0.0000`,
+`adv_nonzero_frac = 0`) into a live one (`std = 0.0068`,
+`adv_nonzero_frac = 1`).
+
+### Accuracy
+
+| checkpoint | EX | bird | spider | out tok | latency |
+|---|---:|---:|---:|---:|---:|
+| **SFT-only** (shared start) | **66.67%** | 37.5 | 81.2 | 1 235 | 39.7 s |
+| GRPO ctrl (binary) | 58.33% | 25.0 | 75.0 | 1 275 | 41.6 s |
+| GRPO dense (atomic+memory) | 62.50% | 37.5 | 75.0 | 1 245 | 42.1 s |
+
+Baselines on the same 24 questions: DAIL-SQL 70.83%, DIN-SQL / CHESS /
+CHASE-SQL 62.50%, single agent 50.00%.
+
+**Dense beats binary by +4.17 points**, recovering all of the BIRD loss
+(25.0 → 37.5). **But both GRPO arms are worse than the SFT checkpoint they
+started from** (−8.33 and −4.17). Dense partial credit reduced the damage GRPO
+did; it did not make GRPO helpful.
+
+### Why, and what is actually missing
+
+This run had **7 all-correct groups against 6 all-wrong** — saturation was the
+*dominant* failure mode, and dense rewards are structurally incapable of
+addressing it. Generated length confirms nothing was internalised: 1 024 → 922
+across 24 fully-annealed steps, essentially flat.
+
+The missing piece is the one named in [METHOD.md §8.1b](METHOD.md): **no term
+distinguishes a 900-token correct rollout from a 300-token one.** Both score
+`R_clip = 1`, so on more than half the steps GRPO has nothing to optimise
+toward. Until a brevity term is added among correct rollouts, more GRPO steps
+cannot help.
+
+### Caveats
+
+- n = 24; **+4.17 points is a single question**. Directional evidence, not a
+  result.
+- The arms diverged after step 1 (the first update changes the policy), so only
+  step 1 is a matched comparison; everything else is an aggregate over
+  different sampled rollouts.
+- Run 3's eval set is a different draw from runs 1-2 (8/16 rather than 12/12),
+  so numbers are comparable *within* run 3 only. CHESS moved 41.67% → 62.50%
+  between draws, which is a fair measure of how much n = 24 swings.
 
 ---
 
