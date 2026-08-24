@@ -169,7 +169,18 @@ def main() -> int:
         print(f"[latent] rollouts run {cfg.latent.latent_steps} latent steps per role "
               f"over {cfg.latent.roles}; only the query is decoded")
 
-    trainer = GRPOTrainer(bundle, cfg.grpo, oracle, memory=memory, latent=latent)
+    spec = None
+    if getattr(cfg.grpo, "spec_decode", False):
+        from latentsql.distill.speculative import SpeculativeSampler, load_draft
+
+        draft = load_draft(cfg.grpo.spec_draft_model, hub_dir=cfg.paths.hf_hub,
+                           quantization=getattr(cfg.grpo, "quantization", "none"))
+        spec = SpeculativeSampler(bundle, draft, k=cfg.grpo.spec_k,
+                                  temperature=cfg.grpo.temperature)
+        print(f"[spec] draft={cfg.grpo.spec_draft_model} k={cfg.grpo.spec_k} "
+              f"- lossless: rollouts still follow the policy distribution")
+
+    trainer = GRPOTrainer(bundle, cfg.grpo, oracle, memory=memory, latent=latent, spec=spec)
     ref = load_reference(bundle)
     result = trainer.train(
         tasks, ref, log_path=os.path.join(cfg.grpo.output_dir, "grpo_log.json")

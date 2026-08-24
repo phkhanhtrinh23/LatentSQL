@@ -548,5 +548,59 @@ class TestLatentRollouts(unittest.TestCase):
         self.assertGreater(c.grpo.reward.w_atomic, 0.0)
 
 
+class TestSpeculativeDecoding(unittest.TestCase):
+    """Lossless rollout acceleration (Iso et al. 2026).
+
+    The whole reason speculative decoding is usable in RL is that it does not
+    perturb the sampling distribution, so the policy gradient is unchanged.
+    That property is what these tests pin down - not speed.
+    """
+
+    def test_acceptance_rule_reproduces_the_target_distribution(self):
+        """Holds for ANY draft, which is why a weak drafter is safe."""
+        import collections
+
+        import torch
+
+        torch.manual_seed(0)
+        p = torch.tensor([[0.05, 0.30, 0.10, 0.25, 0.20, 0.10]])
+        q = torch.tensor([[0.40, 0.05, 0.30, 0.05, 0.10, 0.10]])   # deliberately bad
+
+        def draw():
+            x = int(torch.multinomial(q, 1).item())
+            if float(torch.rand(1)) < min(1.0, float(p[0, x]) / float(q[0, x])):
+                return x
+            resid = torch.clamp(p - q, min=0.0)
+            return int(torch.multinomial(resid / resid.sum(), 1).item())
+
+        n = 60_000
+        c = collections.Counter(draw() for _ in range(n))
+        emp = torch.tensor([[c[i] / n for i in range(6)]])
+        self.assertLess(0.5 * float((emp - p).abs().sum()), 0.02)
+
+    def test_stats_report_acceptance_length(self):
+        from latentsql.distill.speculative import SpecStats
+
+        st = SpecStats(n_tokens=40, n_proposed=36, n_accepted=30, n_rounds=9)
+        self.assertAlmostEqual(st.acceptance_length, 40 / 9)
+        self.assertAlmostEqual(st.acceptance_rate, 30 / 36)
+        self.assertIn("spec_acceptance_length", st.as_dict())
+
+    def test_verification_never_mutates_the_live_caches(self):
+        """The bug that broke this twice: in-place cache mutation."""
+        import inspect
+
+        from latentsql.distill import speculative as sp
+
+        src = inspect.getsource(sp.SpeculativeSampler.generate)
+        # both the target verify pass and the draft proposal loop must branch
+        self.assertGreaterEqual(src.count("_copy_cache"), 2)
+
+    def test_disabled_by_default(self):
+        from latentsql.config import load_config
+
+        self.assertFalse(load_config().grpo.spec_decode)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

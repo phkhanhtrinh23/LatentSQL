@@ -257,6 +257,15 @@ class GRPOConfig:
     #: tokens by construction, so w_fmt/length annealing has nothing to do -
     #: set w_fmt_start = w_fmt_end = 0 and let the reward be accuracy alone.
     latent_rollouts: bool = False
+    #: lossless rollout acceleration (Iso et al. 2026). A draft model proposes
+    #: `spec_k` tokens, the policy verifies them in one pass, and the rejection
+    #: rule keeps the sampling distribution exactly the policy's - so the
+    #: gradient is unchanged. Speedup is bounded by the generation share of the
+    #: step, and a weak draft can be *slower* than plain decoding, so the
+    #: acceptance length is logged every step.
+    spec_decode: bool = False
+    spec_draft_model: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    spec_k: int = 4
     gradient_checkpointing: bool = True
     lora: bool = True
     reward: RewardConfig = field(default_factory=RewardConfig)

@@ -145,11 +145,14 @@ class GRPOTrainer:
         total_steps: Optional[int] = None,
         memory: Optional[Any] = None,
         latent: Optional[Any] = None,
+        spec: Optional[Any] = None,
     ):
         self.bundle = bundle
         #: when set, rollouts are sampled from a latent debate prefix instead of
         #: verbalised text, and the loss backpropagates through the latent steps
         self.latent = latent
+        #: SpeculativeSampler; lossless, so it changes throughput only
+        self.spec = spec
         self.cfg = cfg
         self.oracle = oracle
         self.schedule = RewardSchedule(cfg.reward, total_steps=total_steps or 100)
@@ -180,6 +183,25 @@ class GRPOTrainer:
 
         was_training = model.training
         model.eval()
+        if self.spec is not None:
+            prompt_ids = enc["input_ids"][0].tolist()
+            rollouts: List[Rollout] = []
+            with torch.no_grad():
+                for _ in range(max(1, self.cfg.group_size)):
+                    ids = self.spec.generate(
+                        prompt_ids, self.cfg.max_new_tokens,
+                        eos_token_id=tok.eos_token_id,
+                    )
+                    text = tok.decode(ids, skip_special_tokens=True)
+                    rb = self.reward_fn(text, ids, task.db_path, task.gold_sql, step)
+                    rollouts.append(Rollout(prompt_ids=prompt_ids, completion_ids=ids,
+                                            text=text, reward=rb))
+            if was_training:
+                model.train()
+            advs = group_advantages([r.reward.total for r in rollouts])
+            for r, a in zip(rollouts, advs):
+                r.advantage = a
+            return rollouts
         with torch.no_grad():
             gen = model.generate(
                 **enc,
@@ -227,6 +249,25 @@ class GRPOTrainer:
         rollouts: List[Rollout] = []
         with torch.no_grad():
             past0, attn0, logits0 = self.latent.build_prefix(task.system, task.prompt)
+            if self.spec is not None:
+                dp = tok(task.prompt, return_tensors="pt",
+                         add_special_tokens=False)["input_ids"][0].tolist()
+                for _ in range(max(1, self.cfg.group_size)):
+                    ids = self.spec.generate(
+                        [], self.cfg.max_new_tokens, eos_token_id=tok.eos_token_id,
+                        target_past=_clone_cache(past0), target_attn=attn0.clone(),
+                        target_first_logits=logits0.clone(), draft_prompt_ids=dp,
+                    )
+                    text = tok.decode(ids, skip_special_tokens=True)
+                    rb = self.reward_fn(text, ids, task.db_path, task.gold_sql, step)
+                    rollouts.append(Rollout(prompt_ids=[], completion_ids=ids,
+                                            text=text, reward=rb))
+                if was_training:
+                    model.train()
+                advs = group_advantages([r.reward.total for r in rollouts])
+                for r, a in zip(rollouts, advs):
+                    r.advantage = a
+                return rollouts
             for _ in range(max(1, self.cfg.group_size)):
                 past = _clone_cache(past0)
                 attn = attn0.clone()
@@ -474,6 +515,7 @@ class GRPOTrainer:
                         "gen_tokens_mean": _mean(batch_lens),
                         #: within-group reward spread; 0 => no learning signal
                         "reward_std_mean": _mean(batch_std),
+                        **(self.spec.stats.as_dict() if self.spec is not None else {}),
                         #: fraction of rollouts that actually contributed a
                         #: gradient this step
                         "adv_nonzero_frac": _mean(batch_live),
