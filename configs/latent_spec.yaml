@@ -87,7 +87,7 @@ grpo:
   latent_rollouts: true
   spec_decode: true          # lossless rollout acceleration (Iso et al. 2026)
   spec_draft_model: Qwen/Qwen2.5-Coder-0.5B-Instruct
-  spec_k: 4      # debate runs in continuous space; rollouts decode only SQL
+  spec_k: 3                  # Table 4: k=3 is the sweet spot; k>=5 was SLOWER than AR      # debate runs in continuous space; rollouts decode only SQL
   logging_steps: 1
   save_steps: 2        # short run: keep partial progress if it dies
   micro_batch: 1

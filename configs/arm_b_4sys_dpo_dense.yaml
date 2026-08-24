@@ -63,7 +63,7 @@ sft:
   lr: 1.0e-4
   batch_size: 1
   grad_accum: 4
-  max_seq_len: 3072
+  max_seq_len: 2048
   lora: true
   lora_r: 32
   lora_alpha: 64
@@ -88,7 +88,7 @@ grpo:
   latent_rollouts: true
   spec_decode: true          # lossless: rollouts still follow the policy exactly
   spec_draft_model: Qwen/Qwen2.5-Coder-0.5B-Instruct
-  spec_k: 4      # debate runs in continuous space; rollouts decode only SQL
+  spec_k: 3                  # Table 4: k=3 is the sweet spot; k>=5 was SLOWER than AR      # debate runs in continuous space; rollouts decode only SQL
   logging_steps: 1
   save_steps: 2        # short run: keep partial progress if it dies
   micro_batch: 1
@@ -128,5 +128,5 @@ dpo:
   lr: 5.0e-6
   epochs: 1.0
   grad_accum: 4
-  max_seq_len: 3072
+  max_seq_len: 2048
   round_one_only: true

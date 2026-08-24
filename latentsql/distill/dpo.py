@@ -114,10 +114,25 @@ def load_pairs(path: str) -> List[PreferencePair]:
     return [PreferencePair(**json.loads(l)) for l in open(path, encoding="utf-8") if l.strip()]
 
 
+#: sequence positions upcast to fp32 at once when scoring log-probabilities
+_LOGP_CHUNK = 512
+
+
 # --------------------------------------------------------------------------
 def _seq_logprob(model, tok, system: str, prompt: str, completion: str,
-                 device: str, max_len: int):
-    """Sum of log p(token) over the completion only, prompt masked out."""
+                 device: str, max_len: int, length_normalize: bool = True):
+    """Log p of the completion, prompt masked out.
+
+    ``length_normalize`` divides by the completion length. Vanilla DPO sums,
+    which is fine when both continuations come from the same policy and have
+    similar lengths. Ours do not: they come from *different pipelines* with
+    systematically different verbosity - measured on our pairs, DAIL-SQL turns
+    average 427 characters against CHESS's 824, and the chosen continuation is
+    the shorter one in 84% of pairs. A summed margin would therefore rank
+    "writes less" rather than "is right", and since DAIL-SQL happens to be both
+    the tersest and the most accurate panellist, that confound would look like
+    success. Normalising removes the length term.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -135,8 +150,24 @@ def _seq_logprob(model, tok, system: str, prompt: str, completion: str,
     out = model(input_ids=x, attention_mask=torch.ones_like(x))
     logits = out.logits[:, :-1, :]
     tgt = x[:, 1:]
-    lp = -F.cross_entropy(logits.transpose(1, 2).float(), tgt, reduction="none")
-    return lp[0, -n_comp:].sum()
+
+    # Upcasting the whole logits block to fp32 costs ~1.9GB at a 152k vocab and
+    # a 3k sequence, and DPO needs four of these per pair (policy and reference,
+    # chosen and rejected). Walk the time axis in blocks instead; autograd
+    # stitches them back together so the gradient is unchanged.
+    parts = []
+    for i in range(0, logits.shape[1], _LOGP_CHUNK):
+        parts.append(
+            -F.cross_entropy(
+                logits[:, i : i + _LOGP_CHUNK, :].transpose(1, 2).float(),
+                tgt[:, i : i + _LOGP_CHUNK],
+                reduction="none",
+            )
+        )
+    lp = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+    del out, logits
+    comp = lp[0, -n_comp:]
+    return comp.mean() if length_normalize else comp.sum()
 
 
 def train_dpo(
@@ -152,6 +183,12 @@ def train_dpo(
 
     tok, model = bundle.tokenizer, bundle.model
     device = bundle.device
+    # DPO is pure training - no KV cache is carried between calls - so
+    # checkpointing is free here (unlike the latent prefix, which needs cache)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=cfg.lr)
 
@@ -180,20 +217,22 @@ def train_dpo(
             if hasattr(model, "disable_adapter"):
                 with model.disable_adapter():
                     ref_w = _seq_logprob(model, tok, p.system, p.prompt, p.chosen,
-                                         device, cfg.max_seq_len)
+                                         device, cfg.max_seq_len,
+                                         cfg.length_normalize)
                     ref_l = _seq_logprob(model, tok, p.system, p.prompt, p.rejected,
-                                         device, cfg.max_seq_len)
+                                         device, cfg.max_seq_len,
+                                         cfg.length_normalize)
             else:
                 ref_w = ref_l = None
         if ref_w is None or ref_l is None:
             continue
 
-        pol_w = _seq_logprob(model, tok, p.system, p.prompt, p.chosen, device, cfg.max_seq_len)
-        pol_l = _seq_logprob(model, tok, p.system, p.prompt, p.rejected, device, cfg.max_seq_len)
+        pol_w = _seq_logprob(model, tok, p.system, p.prompt, p.chosen, device, cfg.max_seq_len, cfg.length_normalize)
+        pol_l = _seq_logprob(model, tok, p.system, p.prompt, p.rejected, device, cfg.max_seq_len, cfg.length_normalize)
         if pol_w is None or pol_l is None:
             continue
 
-        margin = (pol_w - ref_w) - (pol_l - ref_l)
+        margin = (pol_w - ref_w.detach()) - (pol_l - ref_l.detach())
         loss = -torch.nn.functional.logsigmoid(cfg.beta * margin)
         (loss / cfg.grad_accum).backward()
         n_acc += 1

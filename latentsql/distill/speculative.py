@@ -68,6 +68,19 @@ class SpecStats:
             "spec_seconds": round(self.seconds, 3),
         }
 
+    def take(self) -> "SpecStats":
+        """Return the stats accumulated since the last call, and reset.
+
+        Logging the cumulative average would hide drift: the draft is fixed
+        while GRPO moves the policy, so acceptance is expected to decay, and a
+        running mean smears that out.
+        """
+        out = SpecStats(self.n_tokens, self.n_proposed, self.n_accepted,
+                        self.n_rounds, self.seconds)
+        self.n_tokens = self.n_proposed = self.n_accepted = self.n_rounds = 0
+        self.seconds = 0.0
+        return out
+
     def merge(self, other: "SpecStats") -> None:
         self.n_tokens += other.n_tokens
         self.n_proposed += other.n_proposed

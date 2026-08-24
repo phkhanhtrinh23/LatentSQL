@@ -203,6 +203,11 @@ class DPOConfig:
     grad_accum: int = 4
     max_seq_len: int = 3072
     round_one_only: bool = True     # round-2 turns have already seen each other
+    #: divide the completion log-prob by its length. Our chosen/rejected pairs
+    #: come from different pipelines with different verbosity (DAIL-SQL turns
+    #: average 427 chars, CHESS 824) and the chosen one is shorter in 84% of
+    #: pairs, so a summed margin would rank terseness rather than correctness.
+    length_normalize: bool = True
     max_pairs_per_question: int = 4
     seed: int = 0
     logging_steps: int = 20
@@ -292,7 +297,10 @@ class GRPOConfig:
     #: acceptance length is logged every step.
     spec_decode: bool = False
     spec_draft_model: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-    spec_k: int = 4
+    #: Iso et al. Table 4: acceptance length rises with k but realized speedup
+    #: falls - k=3 was best in both their settings and k>=5 was *slower* than
+    #: plain autoregression. Longer drafts are a trap.
+    spec_k: int = 3
     gradient_checkpointing: bool = True
     lora: bool = True
     reward: RewardConfig = field(default_factory=RewardConfig)

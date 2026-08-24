@@ -515,7 +515,7 @@ class GRPOTrainer:
                         "gen_tokens_mean": _mean(batch_lens),
                         #: within-group reward spread; 0 => no learning signal
                         "reward_std_mean": _mean(batch_std),
-                        **(self.spec.stats.as_dict() if self.spec is not None else {}),
+                        **(self.spec.stats.take().as_dict() if self.spec is not None else {}),
                         #: fraction of rollouts that actually contributed a
                         #: gradient this step
                         "adv_nonzero_frac": _mean(batch_live),
