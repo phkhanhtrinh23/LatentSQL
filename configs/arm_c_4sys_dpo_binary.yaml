@@ -81,7 +81,9 @@ grpo:
   group_size: 4
   batch_prompts: 1
   grad_accum: 2
-  max_new_tokens: 2560        # must exceed len_start, else rollouts pin at the cap
+  max_new_tokens: 400         # decode budget is SQL only now (latent debate emits
+                               # 0 tokens); 2560 was sized for the old written-debate
+                               # regime and just held dead activations for backward
   kl_beta: 0.02
   bf16: true
   quantization: 4bit
