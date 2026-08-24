@@ -108,8 +108,8 @@ grpo:
 
 latent:
   enabled: false
-  latent_steps: 8
-  roles: [din_sql, dail_sql, chess, chase_sql, consensus]
+  latent_steps: 12
+  roles: [din_sql, dail_sql, chess, chase_sql, din_sql, dail_sql, chess, chase_sql, consensus]
   align: soft_embed
   share_working_memory: true
 

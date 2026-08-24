@@ -108,8 +108,8 @@ grpo:
 
 latent:
   enabled: false
-  latent_steps: 8
-  roles: [query_plan, query_plan, query_plan, consensus]   # CHESS's 3 candidates
+  latent_steps: 12
+  roles: [query_plan, query_plan, query_plan, query_plan, query_plan, query_plan, consensus]   # CHESS's 3 candidates
   align: soft_embed
   share_working_memory: true
 
