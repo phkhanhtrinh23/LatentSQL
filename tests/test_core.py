@@ -530,6 +530,23 @@ class TestLatentRollouts(unittest.TestCase):
         self.assertIn("grad", src)
         self.assertIn("enable_grad", src)
 
+    def test_latent_prefix_suspends_gradient_checkpointing(self):
+        """Checkpointing forces use_cache=False, which nulls the KV prefix.
+
+        The latent debate is built by carrying the cache from one role to the
+        next, so a null cache leaves the attention mask describing memory that
+        does not exist - it crashed GRPO with a shape mismatch while the
+        no-grad eval path worked fine, which is what made it hard to see.
+        """
+        import inspect
+
+        from latentsql.distill.latent import LatentReasoner
+
+        src = inspect.getsource(LatentReasoner.build_prefix)
+        self.assertIn("gradient_checkpointing_disable", src)
+        self.assertIn("gradient_checkpointing_enable", src)   # and restored
+        self.assertIn("finally", src)                         # even on error
+
     def test_latent_config_switch_defaults_off(self):
         from latentsql.config import load_config
 

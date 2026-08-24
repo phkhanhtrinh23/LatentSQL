@@ -201,8 +201,19 @@ class LatentReasoner:
         inputs_embeds = model.get_input_embeddings()(enc["input_ids"])
         past = None
 
+        # Gradient checkpointing forces use_cache=False, which returns a null
+        # past_key_values - and the latent prefix is built by carrying that
+        # cache from one role to the next, so the attention mask would then
+        # describe a cache that does not exist. Suspend it for this pass.
+        ckpt = bool(getattr(model, "is_gradient_checkpointing", False))
+        prev_use_cache = getattr(model.config, "use_cache", True)
+        if grad and ckpt:
+            model.gradient_checkpointing_disable()
+        model.config.use_cache = True
+
         ctx = torch.enable_grad() if grad else torch.no_grad()
-        with ctx:
+        try:
+          with ctx:
             for role in cfg.roles:
                 tag = T_CONSENSUS_OPEN if role == "consensus" else agent_tag(role) + "\n"
                 tag_embeds, past, attention_mask = self._append_text(tag, past, attention_mask)
@@ -222,6 +233,10 @@ class LatentReasoner:
                     )
             out = model(inputs_embeds=inputs_embeds, past_key_values=past,
                         attention_mask=attention_mask, use_cache=True)
+        finally:
+            if grad and ckpt:
+                model.gradient_checkpointing_enable()
+            model.config.use_cache = prev_use_cache
         return out.past_key_values, attention_mask, out.logits[:, -1, :]
 
     def generate(
