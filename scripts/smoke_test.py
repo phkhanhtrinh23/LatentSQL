@@ -541,6 +541,78 @@ def tier2(cfg, work: str, state: Dict[str, Any], model_path: str) -> None:
 
     _mem()
 
+    @check("per-role latent checkpointing matches the uncheckpointed gradient exactly")
+    def _ckpt_grad():
+        """The fix for the OOM that a 96-step (2-round x 4-agent) latent
+        debate causes when trained with GRPO: build_prefix(grad=True) holds
+        every latent step's activations for backward simultaneously unless
+        checkpointed. Checkpointing a KV-cache-carrying loop is only safe if
+        repeated invocation is idempotent - DynamicCache.crop() back to the
+        role's starting length makes it so, since it is a true no-op on the
+        first (real) call and undoes exactly the second (backward-recompute)
+        call's own append before it happens again. This test proves that
+        empirically: same model, same seed, same rollout, compare LoRA
+        gradients with and without the per-role checkpoint. They must match
+        bit for bit, not just approximately - any mismatch means the
+        recompute is seeing a different cache state than the original pass.
+        """
+        from latentsql.mas.trace import agent_tag as _tag, T_CONSENSUS_OPEN as _cons
+
+        def run_once(checkpoint_flag: bool):
+            bundle.model.zero_grad(set_to_none=True)
+            tok = bundle.tokenizer
+            chat = tok.apply_chat_template(
+                [{"role": "system", "content": records[0].system},
+                 {"role": "user", "content": records[0].prompt}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            enc = tok(chat, return_tensors="pt", add_special_tokens=False)
+            attn = enc["attention_mask"]
+            embeds = bundle.model.get_input_embeddings()(enc["input_ids"])
+            past = None
+            reasoner = LatentReasoner(bundle, cfg.latent)
+            with torch.enable_grad():
+                for role in cfg.latent.roles:
+                    tag = _cons if role == "consensus" else _tag(role) + "\n"
+                    tag_e, past, attn = reasoner._append_text(tag, past, attn)
+                    embeds = torch.cat([embeds, tag_e], dim=1) if past is None else tag_e
+                    if role == "consensus":
+                        break
+                    embeds, past, attn, _ = reasoner._latent_steps(
+                        embeds, past, attn, cfg.latent.latent_steps,
+                        checkpoint=checkpoint_flag,
+                    )
+                out = bundle.model(inputs_embeds=embeds, past_key_values=past,
+                                   attention_mask=attn, use_cache=True)
+            logp = torch.log_softmax(out.logits[:, -1, :].float(), dim=-1)
+            loss = -logp[0, min(200, logp.shape[-1] - 1)]
+            loss.backward()
+            grads = {n: p.grad.clone() for n, p in bundle.model.named_parameters()
+                    if p.requires_grad and p.grad is not None}
+            return grads, float(loss.detach())
+
+        # eval() disables LoRA dropout: this bundle was SFT-trained earlier in
+        # this same tier-2 run (lora_dropout=0.05 by default), so two SEPARATE
+        # stochastic forward passes would legitimately disagree regardless of
+        # whether checkpointing is correct - the thing under test here is
+        # checkpointing, not dropout, so the comparison needs it off.
+        was_training = bundle.model.training
+        bundle.model.eval()
+        cfg.latent.latent_steps = 3
+        cfg.latent.roles = ["divide_conquer", "query_plan", "consensus"]
+        g_plain, l_plain = run_once(checkpoint_flag=False)
+        g_ckpt, l_ckpt = run_once(checkpoint_flag=True)
+        bundle.model.train(was_training)
+        bundle.model.zero_grad(set_to_none=True)
+
+        assert abs(l_plain - l_ckpt) < 1e-4, (l_plain, l_ckpt)
+        assert set(g_plain) == set(g_ckpt) and len(g_plain) > 0
+        worst = max((g_plain[n] - g_ckpt[n]).abs().max().item() for n in g_plain)
+        assert worst < 1e-4, f"gradients diverge by {worst:.2e}"
+        return f"{len(g_plain)} grad tensors match to {worst:.1e} (loss {l_plain:.4f})"
+
+    _ckpt_grad()
+
     @check("latent-slot curriculum replaces agent blocks")
     def _curr():
         full = records[0].completion

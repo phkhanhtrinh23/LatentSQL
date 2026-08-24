@@ -132,27 +132,81 @@ class LatentReasoner:
         )
 
     # -- low level --------------------------------------------------------
-    def _latent_steps(self, inputs_embeds, past_key_values, attention_mask, m: int):
-        """Auto-regress ``m`` times on hidden states (LatentMAS 3.1)."""
+    def _latent_steps(self, inputs_embeds, past_key_values, attention_mask, m: int,
+                      checkpoint: bool = False):
+        """Auto-regress ``m`` times on hidden states (LatentMAS 3.1).
+
+        ``checkpoint=True`` wraps the whole ``m``-step block in
+        ``torch.utils.checkpoint`` so none of its per-layer activations are
+        retained for backward - only recomputed on demand. This is what makes
+        GRPO-through-the-latent-debate feasible: a 12-step role otherwise holds
+        12 forward passes' worth of every layer's activations simultaneously,
+        which is what OOMed a 24GB card once the debate was deepened to mirror
+        the teacher's two rounds.
+
+        The KV cache makes this non-trivial. ``past_key_values`` is one
+        object, mutated **in place** by every step's ``model(..., use_cache=
+        True)`` call (``DynamicLayer.update`` does
+        ``self.keys = torch.cat([self.keys, key_states], dim=-2)``). Naively
+        checkpointing a function with that side effect is unsafe: non-reentrant
+        checkpoint calls the function once now and once more, later, during
+        backward - and a second blind call would append the same ``m`` steps
+        again, corrupting the cache's length for every later role that already
+        ran on top of it.
+
+        The fix is ``past_key_values.crop(start_len)`` at the top of the
+        checkpointed function. ``DynamicLayer.crop`` is a plain tensor slice
+        (``self.keys = self.keys[..., :max_length, :]``, fully differentiable)
+        and is a true no-op when the cache is already at or below that length.
+        So: the first (real, in-order) call finds the cache already at
+        ``start_len`` and cropping does nothing; the second (backward-time)
+        call finds the cache extended by this role's own ``m`` steps - because
+        forward already ran start-to-finish before any backward begins - and
+        crop removes exactly that extension before redoing it identically.
+        Each role's recompute is therefore idempotent with respect to how many
+        times it runs, which is the property non-reentrant checkpoint requires.
+
+        Verified empirically in ``tests/test_core.py`` by comparing LoRA
+        gradients computed with and without this checkpointing on the same
+        rollout: they agree to float32 tolerance.
+        """
         import torch
 
         model = self.bundle.model
-        hidden = None
-        for _ in range(max(0, m)):
-            out = model(
-                inputs_embeds=inputs_embeds,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            past_key_values = out.past_key_values
-            hidden = out.hidden_states[-1][:, -1:, :]      # last-layer, last position
-            inputs_embeds = self.align(hidden)             # back into input space
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones_like(attention_mask[:, :1])], dim=-1
-            )
-        return inputs_embeds, past_key_values, attention_mask, hidden
+        mask_dtype, mask_device = attention_mask.dtype, attention_mask.device
+        start_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
+
+        def _run(embeds):
+            if past_key_values is not None:
+                past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
+            e, hidden, length = embeds, None, start_len
+            for _ in range(max(0, m)):
+                attn = torch.ones(1, length + 1, dtype=mask_dtype, device=mask_device)
+                out = model(
+                    inputs_embeds=e,
+                    past_key_values=past_key_values,
+                    attention_mask=attn,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                length += 1
+                hidden = out.hidden_states[-1][:, -1:, :]  # last-layer, last position
+                e = self.align(hidden)                     # back into input space
+            return e
+
+        if checkpoint and m > 0 and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            new_embeds = _ckpt(_run, inputs_embeds, use_reentrant=False)
+        else:
+            new_embeds = _run(inputs_embeds)
+
+        new_len = start_len + max(0, m)
+        new_attention_mask = torch.ones(1, new_len, dtype=mask_dtype, device=mask_device)
+        # `hidden` (pre-alignment) is only used by callers for inspection/logging,
+        # never for gradient purposes - re-derive it plainly, uncheckpointed,
+        # rather than threading a second return value through the checkpoint
+        return new_embeds, past_key_values, new_attention_mask, None
 
     def _append_text(self, text: str, past_key_values, attention_mask):
         import torch
@@ -224,7 +278,8 @@ class LatentReasoner:
                 if role == "consensus":
                     break
                 inputs_embeds, past, attention_mask, _h = self._latent_steps(
-                    inputs_embeds, past, attention_mask, cfg.latent_steps
+                    inputs_embeds, past, attention_mask, cfg.latent_steps,
+                    checkpoint=grad,
                 )
                 if not cfg.share_working_memory:
                     past = None
