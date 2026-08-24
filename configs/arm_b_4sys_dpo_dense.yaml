@@ -85,7 +85,10 @@ grpo:
   kl_beta: 0.02
   bf16: true
   quantization: 4bit
-  latent_rollouts: true      # debate runs in continuous space; rollouts decode only SQL
+  latent_rollouts: true
+  spec_decode: true          # lossless: rollouts still follow the policy exactly
+  spec_draft_model: Qwen/Qwen2.5-Coder-0.5B-Instruct
+  spec_k: 4      # debate runs in continuous space; rollouts decode only SQL
   logging_steps: 1
   save_steps: 2        # short run: keep partial progress if it dies
   micro_batch: 1
