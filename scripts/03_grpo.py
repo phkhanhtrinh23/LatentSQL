@@ -128,6 +128,12 @@ def main() -> int:
         bundle.model.config.use_cache = False
 
     banner("GRPO")
+    # the brevity reference is the generation budget: a rollout that uses the
+    # whole budget scores 0, one that answers immediately scores ~1
+    if getattr(cfg.grpo.reward, "w_brevity", 0.0) > 0 and \
+            not getattr(cfg.grpo.reward, "brevity_ref_tokens", 0):
+        cfg.grpo.reward.brevity_ref_tokens = cfg.grpo.max_new_tokens
+
     oracle = ExecutionOracle(timeout=cfg.mas.execution_timeout)
 
     # the memory bank is built from the *kept* teacher traces - transcripts

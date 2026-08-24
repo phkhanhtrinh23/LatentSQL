@@ -18,6 +18,7 @@ Multi-Agent Systems") layered on top.
 
 | Path | What it is |
 |---|---|
+| [COMPARISON.md](COMPARISON.md) | **LatentSQL vs. FINER-SQL** — what is actually different, what we borrowed, and what we had to change |
 | [RESULTS.md](RESULTS.md) | **Recorded results** — accuracy, cost, GPU/wall-clock, and worked examples of what internalisation fixed |
 | [METHOD.md](METHOD.md) | **The method in full detail** — the teacher panel, the trace format, both training stages, the latent layer, the evaluation protocol, and the measured drawbacks and failure modes |
 | [latentsql/mas/](latentsql/mas/) | The teacher: agents, prompts, debate orchestration, trace format, and standalone re-implementations of the four published systems |

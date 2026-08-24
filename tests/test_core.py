@@ -469,5 +469,48 @@ class TestDenseRewards(unittest.TestCase):
         self.assertGreater(wrong.r_atomic, 0.0)   # graded partial credit
 
 
+class TestBrevityReward(unittest.TestCase):
+    """Breaks the saturated-group tie GRPO otherwise cannot learn from."""
+
+    GOLD = "SELECT COUNT(*) FROM t"
+
+    def _reward(self, correct, n_tokens, w_brevity=0.5):
+        from latentsql.config import RewardConfig
+        from latentsql.distill.rewards import DebateReward, ExecutionOracle, RewardSchedule
+
+        class _O(ExecutionOracle):
+            def __init__(self, v):
+                super().__init__(timeout=1.0)
+                self.v = v
+
+            def is_correct(self, *a):
+                return self.v
+
+            def executes(self, *a):
+                return True
+
+        cfg = RewardConfig()
+        cfg.w_brevity = w_brevity
+        cfg.brevity_ref_tokens = 1024
+        text = f"<|consensus|>\n```sql\n{self.GOLD}\n```\n<|/consensus|>"
+        return DebateReward(cfg, _O(correct), RewardSchedule(cfg, total_steps=10),
+                            decode=lambda x: text)(text, list(range(n_tokens)),
+                                                   "", self.GOLD, 0)
+
+    def test_shorter_correct_rollout_scores_higher(self):
+        short = self._reward(True, 200)
+        long = self._reward(True, 900)
+        self.assertEqual(short.r_clip, long.r_clip)      # both fully correct
+        self.assertGreater(short.total, long.total)      # but not equally rewarded
+
+    def test_wrong_rollouts_earn_no_brevity_credit(self):
+        """Otherwise the model learns to answer briefly and wrongly."""
+        self.assertEqual(self._reward(False, 50).r_brevity, 0.0)
+        self.assertGreater(self._reward(True, 50).r_brevity, 0.0)
+
+    def test_disabled_by_default(self):
+        self.assertEqual(self._reward(True, 200, w_brevity=0.0).r_brevity, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

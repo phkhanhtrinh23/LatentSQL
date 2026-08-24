@@ -136,6 +136,7 @@ class RewardBreakdown:
     r_tag_order: float = 0.0
     r_atomic: float = 0.0
     r_memory: float = 0.0
+    r_brevity: float = 0.0
     w_fmt: float = 0.0
     length_limit: int = 0
     n_tokens: int = 0
@@ -220,6 +221,17 @@ class DebateReward:
         full_sql = extract_final_sql(text)
         r_exec = 1.0 if (clipped_sql and self.oracle.executes(db_path, clipped_sql)) else 0.0
 
+        # --- brevity, awarded ONLY to CORRECT rollouts ------------------------
+        # Mirror of the dense terms below. A saturated group (every rollout
+        # correct) otherwise has identical rewards and therefore no gradient,
+        # so GRPO can never learn "correct AND shorter" - the objective of
+        # internalisation. Scoring 1 - n_tokens/ref among correct rollouts
+        # makes a terse right answer beat a verbose right answer.
+        r_brevity = 0.0
+        if r_clip >= 1.0 and float(getattr(self.cfg, "w_brevity", 0.0)) > 0:
+            ref = int(getattr(self.cfg, "brevity_ref_tokens", 0)) or max(1, limit * 2)
+            r_brevity = max(0.0, 1.0 - float(n_tokens) / float(ref))
+
         # --- dense partial credit, awarded ONLY to wrong rollouts -------------
         # A correct rollout already earns full credit; letting it also earn
         # similarity credit would let a verbose-but-right answer outscore a
@@ -245,11 +257,13 @@ class DebateReward:
             + self.cfg.w_tag_order * r_order
             + float(getattr(self.cfg, "w_atomic", 0.0)) * r_atomic
             + w_mem * r_memory
+            + float(getattr(self.cfg, "w_brevity", 0.0)) * r_brevity
         )
         return RewardBreakdown(
             total=total,
             r_atomic=r_atomic,
             r_memory=r_memory,
+            r_brevity=r_brevity,
             r_fmt=r_fmt,
             r_clip=r_clip,
             r_exec_ok=r_exec,

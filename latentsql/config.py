@@ -204,6 +204,16 @@ class RewardConfig:
     # group always carries signal. Set both to 0 to recover pure IMAD.
     w_atomic: float = 0.0           # atomic-SQL-op overlap with gold
     w_memory: float = 0.0           # similarity to verified reasoning traces
+    # --- brevity among CORRECT rollouts ------------------------------------
+    # R(y;l) is 1 for a correct rollout whatever its length, so a group in which
+    # every rollout is right has zero reward variance and GRPO learns nothing -
+    # including nothing about being shorter, which is the entire point of
+    # internalisation. This term breaks that tie: among correct rollouts, fewer
+    # tokens scores higher. It is the mirror of w_atomic/w_memory, which only
+    # ever score *wrong* rollouts.
+    w_brevity: float = 0.0
+    #: token count that scores 0 brevity. 0 => filled in from grpo.max_new_tokens.
+    brevity_ref_tokens: int = 0
     #: the memory term rewards *producing* trace-like reasoning, which fights
     #: the length anneal. Annealing it on w_fmt's schedule lets it guide early
     #: and fade as verbalisation stops paying. The atomic term scores the query,
