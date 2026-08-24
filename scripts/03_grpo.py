@@ -161,7 +161,15 @@ def main() -> int:
         else:
             print(f"[memory] w_memory > 0 but {trace_path} not found; term disabled")
 
-    trainer = GRPOTrainer(bundle, cfg.grpo, oracle, memory=memory)
+    latent = None
+    if getattr(cfg.grpo, "latent_rollouts", False):
+        from latentsql.distill.latent import LatentReasoner
+
+        latent = LatentReasoner(bundle, cfg.latent)
+        print(f"[latent] rollouts run {cfg.latent.latent_steps} latent steps per role "
+              f"over {cfg.latent.roles}; only the query is decoded")
+
+    trainer = GRPOTrainer(bundle, cfg.grpo, oracle, memory=memory, latent=latent)
     ref = load_reference(bundle)
     result = trainer.train(
         tasks, ref, log_path=os.path.join(cfg.grpo.output_dir, "grpo_log.json")

@@ -126,6 +126,16 @@ def _seq_logprobs(model, input_ids, attention_mask, completion_start: int):
     return (token_logp * mask).sum(dim=-1), token_logp, mask
 
 
+def _clone_cache(past):
+    """Copy a KV cache so k rollouts can branch from one latent prefix."""
+    try:
+        import copy
+
+        return copy.deepcopy(past)
+    except Exception:
+        return past
+
+
 class GRPOTrainer:
     def __init__(
         self,
@@ -134,8 +144,12 @@ class GRPOTrainer:
         oracle: ExecutionOracle,
         total_steps: Optional[int] = None,
         memory: Optional[Any] = None,
+        latent: Optional[Any] = None,
     ):
         self.bundle = bundle
+        #: when set, rollouts are sampled from a latent debate prefix instead of
+        #: verbalised text, and the loss backpropagates through the latent steps
+        self.latent = latent
         self.cfg = cfg
         self.oracle = oracle
         self.schedule = RewardSchedule(cfg.reward, total_steps=total_steps or 100)
@@ -151,6 +165,8 @@ class GRPOTrainer:
 
     # -- rollouts ---------------------------------------------------------
     def sample_group(self, task: GRPOTask, step: int) -> List[Rollout]:
+        if self.latent is not None:
+            return self._sample_group_latent(task, step)
         import torch
 
         tok, model = self.bundle.tokenizer, self.bundle.model
@@ -193,6 +209,95 @@ class GRPOTrainer:
         for r, a in zip(rollouts, advs):
             r.advantage = a
         return rollouts
+
+    # -- latent rollouts --------------------------------------------------
+    def _sample_group_latent(self, task: GRPOTask, step: int) -> List[Rollout]:
+        """Sample k completions that follow a *latent* debate, not a written one.
+
+        The roles run as latent steps (zero tokens emitted); only the query is
+        decoded. So a rollout's completion is just the SQL, which is why the
+        length clip and the format reward have nothing left to do here - the
+        debate costs no tokens by construction.
+        """
+        import torch
+
+        tok, model = self.bundle.tokenizer, self.bundle.model
+        was_training = model.training
+        model.eval()
+        rollouts: List[Rollout] = []
+        with torch.no_grad():
+            past0, attn0, logits0 = self.latent.build_prefix(task.system, task.prompt)
+            for _ in range(max(1, self.cfg.group_size)):
+                past = _clone_cache(past0)
+                attn = attn0.clone()
+                logits = logits0.clone()
+                ids: List[int] = []
+                for _t in range(self.cfg.max_new_tokens):
+                    if self.cfg.temperature and self.cfg.temperature > 0:
+                        probs = torch.softmax(logits.float() / self.cfg.temperature, dim=-1)
+                        nxt = int(torch.multinomial(probs, 1).item())
+                    else:
+                        nxt = int(logits.argmax(-1).item())
+                    if nxt == tok.eos_token_id:
+                        break
+                    ids.append(nxt)
+                    step_ids = torch.tensor([[nxt]], device=self.bundle.device)
+                    attn = torch.cat(
+                        [attn, torch.ones(1, 1, dtype=attn.dtype, device=attn.device)], dim=-1
+                    )
+                    out = model(input_ids=step_ids, past_key_values=past,
+                                attention_mask=attn, use_cache=True)
+                    past, logits = out.past_key_values, out.logits[:, -1, :]
+                text = tok.decode(ids, skip_special_tokens=True)
+                rb = self.reward_fn(text, ids, task.db_path, task.gold_sql, step)
+                rollouts.append(Rollout(prompt_ids=[], completion_ids=ids,
+                                        text=text, reward=rb))
+        if was_training:
+            model.train()
+        advs = group_advantages([r.reward.total for r in rollouts])
+        for r, a in zip(rollouts, advs):
+            r.advantage = a
+        return rollouts
+
+    def _loss_for_latent(self, rollouts: Sequence[Rollout], ref_model, scale: float):
+        """GRPO loss whose gradient flows through the latent debate steps."""
+        import torch
+        import torch.nn.functional as F
+
+        active = [r for r in rollouts if abs(r.advantage) > 1e-8 and r.completion_ids]
+        if not active:
+            return None
+        task = self._cur_task
+        denom = float(max(1, sum(len(r.completion_ids) for r in active)))
+        total = 0.0
+
+        for r in active:
+            # rebuild the latent prefix WITH grad: this is the path the policy
+            # is actually optimised through
+            past, attn, first_logits = self.latent.build_prefix(
+                task.system, task.prompt, grad=True
+            )
+            ids = torch.tensor([r.completion_ids], device=self.bundle.device)
+            lp = [F.log_softmax(first_logits.float(), dim=-1)[0, r.completion_ids[0]]]
+            if len(r.completion_ids) > 1:
+                attn2 = torch.cat(
+                    [attn, torch.ones(1, ids.shape[1] - 1, dtype=attn.dtype,
+                                      device=attn.device)], dim=-1
+                )
+                out = self.bundle.model(input_ids=ids[:, :-1], past_key_values=past,
+                                        attention_mask=attn2, use_cache=False)
+                logp = F.log_softmax(out.logits.float(), dim=-1)
+                tgt = ids[:, 1:]
+                lp.append(logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1).sum())
+            token_logp = torch.stack([x.reshape(()) if x.dim() == 0 else x.sum()
+                                      for x in lp]).sum()
+            loss = -(r.advantage * token_logp) / denom
+            (loss * scale).backward()
+            total += float(loss.detach())
+            del past, attn, first_logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return total
 
     # -- loss -------------------------------------------------------------
     def _loss_for(self, rollouts: Sequence[Rollout], ref_model, scale: float = 1.0) -> Any:
@@ -326,6 +431,7 @@ class GRPOTrainer:
             batch_rewards, batch_lens, batch_fmt, batch_clip = [], [], [], []
             batch_std, batch_live = [], []
             for ti in take:
+                self._cur_task = tasks[ti]
                 rollouts = self.sample_group(tasks[ti], opt_step)
                 # A group whose rewards are all equal produces all-zero
                 # advantages and therefore NO gradient at all. Tracking how
@@ -346,7 +452,10 @@ class GRPOTrainer:
 
                 # the loss backwards chunk by chunk inside _loss_for, so a
                 # long BIRD group never has to fit in memory all at once
-                self._loss_for(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
+                if self.latent is not None:
+                    self._loss_for_latent(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
+                else:
+                    self._loss_for(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
             micro += 1
 
             if micro % cfg.grad_accum == 0:

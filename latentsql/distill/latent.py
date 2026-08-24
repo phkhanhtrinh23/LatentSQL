@@ -169,6 +169,61 @@ class LatentReasoner:
         return embeds, past_key_values, attention_mask
 
     # -- public -----------------------------------------------------------
+    def build_prefix(self, system: str, prompt: str, grad: bool = False):
+        """Run the role tags and their latent steps; return the KV prefix.
+
+        This is the whole "debate in continuous space" step: for each role we
+        append its tag, then auto-regress ``latent_steps`` times on hidden
+        states **emitting no tokens**, keeping the KV cache so the next role
+        sees the predecessor's actual representations. What comes back is the
+        state the model is in immediately after ``<|consensus|>`` - i.e. ready
+        to decode the query and nothing else.
+
+        ``grad=True`` keeps the graph, so GRPO can backpropagate *through* the
+        latent steps into the policy. That is what makes this trained rather
+        than training-free: LatentMAS applies these mechanisms at inference to
+        a frozen model, and we optimise in the same regime we infer in.
+
+        Returns ``(past_key_values, attention_mask, next_token_logits)`` where
+        the logits predict the first decoded token.
+        """
+        import torch
+
+        tok, model = self.bundle.tokenizer, self.bundle.model
+        cfg = self.cfg
+        chat = render_chat(
+            tok,
+            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+        )
+        enc = tok(chat, return_tensors="pt", add_special_tokens=False).to(self.bundle.device)
+        attention_mask = enc["attention_mask"]
+        inputs_embeds = model.get_input_embeddings()(enc["input_ids"])
+        past = None
+
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        with ctx:
+            for role in cfg.roles:
+                tag = T_CONSENSUS_OPEN if role == "consensus" else agent_tag(role) + "\n"
+                tag_embeds, past, attention_mask = self._append_text(tag, past, attention_mask)
+                inputs_embeds = (
+                    torch.cat([inputs_embeds, tag_embeds], dim=1)
+                    if past is None else tag_embeds
+                )
+                if role == "consensus":
+                    break
+                inputs_embeds, past, attention_mask, _h = self._latent_steps(
+                    inputs_embeds, past, attention_mask, cfg.latent_steps
+                )
+                if not cfg.share_working_memory:
+                    past = None
+                    attention_mask = torch.ones(
+                        1, 1, dtype=attention_mask.dtype, device=attention_mask.device
+                    )
+            out = model(inputs_embeds=inputs_embeds, past_key_values=past,
+                        attention_mask=attention_mask, use_cache=True)
+        return out.past_key_values, attention_mask, out.logits[:, -1, :]
+
     def generate(
         self,
         system: str,

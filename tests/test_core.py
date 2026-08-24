@@ -512,5 +512,41 @@ class TestBrevityReward(unittest.TestCase):
         self.assertEqual(self._reward(True, 200, w_brevity=0.0).r_brevity, 0.0)
 
 
+class TestLatentRollouts(unittest.TestCase):
+    """GRPO in the latent regime: the debate costs no tokens, so nothing is clipped."""
+
+    def test_trainer_accepts_a_latent_reasoner(self):
+        from latentsql.distill.grpo import GRPOTrainer
+
+        self.assertTrue(hasattr(GRPOTrainer, "_sample_group_latent"))
+        self.assertTrue(hasattr(GRPOTrainer, "_loss_for_latent"))
+
+    def test_latent_prefix_is_grad_capable(self):
+        """Without this, GRPO cannot optimise the regime it infers in."""
+        from latentsql.distill.latent import LatentReasoner
+        import inspect
+
+        src = inspect.getsource(LatentReasoner.build_prefix)
+        self.assertIn("grad", src)
+        self.assertIn("enable_grad", src)
+
+    def test_latent_config_switch_defaults_off(self):
+        from latentsql.config import load_config
+
+        self.assertFalse(load_config().grpo.latent_rollouts)
+
+    def test_latent_regime_disables_the_length_pressure(self):
+        """w_fmt and the clip have nothing to act on when no debate is emitted."""
+        from latentsql.config import load_config
+
+        c = load_config("configs/latent_imad.yaml")
+        self.assertTrue(c.grpo.latent_rollouts)
+        self.assertEqual(c.grpo.reward.w_fmt_start, 0.0)
+        self.assertEqual(c.grpo.reward.w_fmt_end, 0.0)
+        self.assertEqual(c.grpo.reward.len_start, c.grpo.reward.len_end)
+        # accuracy-shaping terms stay on - they are the only signal left
+        self.assertGreater(c.grpo.reward.w_atomic, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

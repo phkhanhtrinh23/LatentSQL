@@ -252,6 +252,11 @@ class GRPOConfig:
     #: gradient. 1 keeps peak memory flat in group_size; raise it only if the
     #: prompts are short.
     micro_batch: int = 1
+    #: sample rollouts from a LatentMAS debate prefix instead of written text,
+    #: and backpropagate through the latent steps. The debate then costs zero
+    #: tokens by construction, so w_fmt/length annealing has nothing to do -
+    #: set w_fmt_start = w_fmt_end = 0 and let the reward be accuracy alone.
+    latent_rollouts: bool = False
     gradient_checkpointing: bool = True
     lora: bool = True
     reward: RewardConfig = field(default_factory=RewardConfig)
