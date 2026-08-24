@@ -142,6 +142,10 @@ class TraceConfig:
     require_consensus: bool = True   # IMAD 2.1: drop debates with no consensus
     require_correct: bool = True     # keep only traces whose final SQL matches gold
     require_execution: bool = True   # drop traces whose final SQL errors out
+    #: when the selector picks a wrong candidate but another panellist was
+    #: right, keep the debate and promote that panellist's query. Recovers the
+    #: ~19% of questions where a correct answer existed and was discarded.
+    rescue_correct_agent: bool = False
     max_trace_chars: int = 12000
     dedup: bool = True
     min_agents_agree: int = 1
@@ -179,6 +183,29 @@ class SFTConfig:
     seed: int = 0
     logging_steps: int = 5
     save_steps: int = 200
+    device: str = "auto"
+
+
+@dataclass
+class DPOConfig:
+    """Stage 1.5 - preference optimisation on the teacher's failures.
+
+    SFT can only raise the likelihood of debates that went right; DPO optimises
+    a margin, so a wrong panellist's turn is pushed *down*. Pairs are free from
+    the panel: same question, one system correct and another wrong.
+    """
+
+    model_name_or_path: str = "outputs/sft"
+    output_dir: str = "outputs/dpo"
+    beta: float = 0.1               # KL strength; the standard DPO default
+    lr: float = 5.0e-6
+    epochs: float = 1.0
+    grad_accum: int = 4
+    max_seq_len: int = 3072
+    round_one_only: bool = True     # round-2 turns have already seen each other
+    max_pairs_per_question: int = 4
+    seed: int = 0
+    logging_steps: int = 20
     device: str = "auto"
 
 
@@ -339,6 +366,7 @@ class Config:
     mas: MASConfig = field(default_factory=MASConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
+    dpo: DPOConfig = field(default_factory=DPOConfig)
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     latent: LatentConfig = field(default_factory=LatentConfig)
     steering: SteeringConfig = field(default_factory=SteeringConfig)

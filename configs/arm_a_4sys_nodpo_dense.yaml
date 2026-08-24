@@ -1,0 +1,129 @@
+# PILOT: the whole pipeline end to end on real local models, sized for ~1.5h on
+# one RTX 4090. Small n - this proves the pipeline and produces logs, it is not
+# a result. Stages run as separate processes so only one model is resident.
+#
+#   bash scripts/run_pilot.sh
+#
+# 4-bit throughout: measured *faster* than bf16 for single-stream decode on this
+# card (7B: 37.6 vs 49.6 s/question) because NF4 quarters the weight traffic per
+# token, and it drops the 7B teacher from 15.7GB to 5.3GB.
+
+paths:
+  bird_root: /mnt/win_d/data/sft_data_collections/bird
+  spider_root: /mnt/win_d/data/sft_data_collections/spider
+  hf_hub: /mnt/win_d/hub
+  output_dir: outputs/arm_a
+  cache_dir: outputs/arm_a/cache
+
+mix:
+  bird: 30
+  spider: 60
+  # splits follow the caller: 01_build_traces reads train, 04_eval reads dev,
+  # so nothing evaluated was ever seen by the teacher
+  shuffle: true
+
+llm:
+  backend: hf
+  local_only: true
+  model: Qwen/Qwen2.5-7B-Instruct     # teacher
+  model_fallbacks: [Qwen/Qwen2.5-7B-Instruct]
+  quantization: 4bit
+  temperature: 0.7
+  max_tokens: 1024
+  device: auto
+  dtype: auto
+
+mas:
+  agents: [query_plan]          # CHESS Candidate Generator
+  rounds: 2
+  candidates_per_agent: 3       # CHESS generates 3 candidates
+  use_value_retrieval: true
+  use_schema_selector: true
+  use_classifier: true
+  use_fixer: true
+  max_fix_attempts: 2
+  selector: unit_test
+  n_unit_tests: 3
+  dail_shots: 5
+  execution_timeout: 30.0
+  schema_keep_all_below_columns: 40
+
+trace:
+  rescue_correct_agent: true    # keep a debate when ANY panellist was right
+  require_consensus: true
+  require_correct: true
+  require_execution: true
+  max_trace_chars: 12000
+  dedup: true
+
+sft:
+  model_name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct   # student
+  output_dir: outputs/arm_a/sft
+  epochs: 3
+  lr: 1.0e-4
+  batch_size: 1
+  grad_accum: 4
+  max_seq_len: 3072
+  lora: true
+  lora_r: 32
+  lora_alpha: 64
+  bf16: true
+  quantization: 4bit          # QLoRA
+  gradient_checkpointing: true
+  train_on_full_trace: true
+  logging_steps: 2
+
+grpo:
+  model_name_or_path: outputs/arm_a/sft
+  output_dir: outputs/arm_a/grpo
+  epochs: 8
+  lr: 1.0e-6
+  group_size: 4
+  batch_prompts: 1
+  grad_accum: 2
+  max_new_tokens: 2560        # must exceed len_start, else rollouts pin at the cap
+  kl_beta: 0.02
+  bf16: true
+  quantization: 4bit
+  latent_rollouts: true      # debate runs in continuous space; rollouts decode only SQL
+  logging_steps: 1
+  save_steps: 2        # short run: keep partial progress if it dies
+  micro_batch: 1
+  reward:
+    w_fmt_start: 0.0          # nothing to verbalise, so no format pressure
+    w_fmt_end: 0.0
+    w_clip: 1.0
+    len_start: 2560           # inert: completions are SQL only
+    len_end: 2560             # no clip - continuous reasoning already costs 0 tokens
+    schedule: linear
+    w_exec_ok: 0.1
+    w_tag_order: 0.1
+    # FINER-SQL dense partial credit, awarded only to WRONG rollouts so a
+    # near-miss outscores a badly-wrong one and the group keeps its variance
+    w_atomic: 0.5
+    w_memory: 0.3
+
+latent:
+  enabled: false
+  latent_steps: 8
+  roles: [din_sql, dail_sql, chess, chase_sql, consensus]
+  align: soft_embed
+  share_working_memory: true
+
+eval:
+  dataset: mix
+  n_samples: 24
+  max_new_tokens: 1024
+  temperature: 0.0
+  report_ves: false           # VES needs repeat timing runs; out of pilot budget
+
+seed: 0
+
+dpo:
+  output_dir: outputs/arm_a/dpo
+  beta: 0.1
+  lr: 5.0e-6
+  epochs: 1.0
+  grad_accum: 4
+  max_seq_len: 3072
+  round_one_only: true

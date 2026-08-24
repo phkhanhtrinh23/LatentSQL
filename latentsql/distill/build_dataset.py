@@ -52,6 +52,8 @@ class FilterStats:
     exec_failed: int = 0
     too_long: int = 0
     duplicate: int = 0
+    #: debates saved by promoting a correct panellist over the selector's pick
+    rescued: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return self.__dict__.copy()
@@ -61,7 +63,8 @@ class FilterStats:
             f"{self.kept}/{self.total} traces kept "
             f"(dropped: no_consensus={self.no_consensus}, incorrect={self.incorrect}, "
             f"no_sql={self.no_sql}, exec_failed={self.exec_failed}, "
-            f"too_long={self.too_long}, duplicate={self.duplicate})"
+            f"too_long={self.too_long}, duplicate={self.duplicate}; "
+            f"rescued={self.rescued})"
         )
 
 
@@ -79,6 +82,21 @@ def build_sft_records(
         if not tr.consensus_sql:
             stats.no_sql += 1
             continue
+        # A panellist is often right while the selector picks someone else. On
+        # run-3's traces that threw away a correct answer on 19% of all
+        # questions. ``rescue_correct_agent`` keeps those debates by promoting
+        # the correct panellist's query to the consensus, which lifts yield
+        # ~40% at zero extra teacher compute. The trace still shows the real
+        # debate; only the final block changes.
+        if getattr(cfg, "rescue_correct_agent", False) and tr.correct is False:
+            winner = next((t for t in tr.turns if t.correct and t.sql), None)
+            if winner is not None:
+                tr.consensus_sql = winner.sql
+                tr.correct = True
+                tr.consensus_reached = True
+                tr.meta["rescued_from"] = winner.agent
+                stats.rescued += 1
+
         if cfg.require_consensus and not tr.consensus_reached:
             stats.no_consensus += 1
             continue
