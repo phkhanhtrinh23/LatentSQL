@@ -4,8 +4,99 @@ Everything here comes from the JSONL logs under `outputs/`, assembled by
 [`scripts/06_report.py`](scripts/06_report.py). Nothing is estimated.
 
 **Read [§6 What these numbers do not show](#6-what-these-numbers-do-not-show)
-before quoting anything.** At n = 24 no two methods here are statistically
-separable.
+before quoting anything.**
+
+---
+
+# 0. What success looks like — the two tests that matter
+
+Everything in this project reduces to two questions with two *different*
+reference points. Conflating them is the single easiest way to misread these
+results, so they are stated first.
+
+## 0.1 Test A — did internalisation actually happen? *(vs. the SFT student)*
+
+> **EX(GRPO) ≈ EX(SFT), while output tokens collapse.**
+
+The reference is **the SFT checkpoint that GRPO started from** — nothing else.
+This is IMAD's mechanism test, and it is a test of *compression*, not of
+accuracy.
+
+**GRPO is not supposed to beat SFT.** Stage 2 does not add capability; it
+removes the need to write the debate down. Stage 1 has already installed
+whatever the model knows. So:
+
+| outcome | verdict |
+|---|---|
+| EX holds, output tokens **collapse** | **success — the debate was internalised** |
+| EX holds, tokens **flat** | failure — nothing was internalised (**every run so far**) |
+| EX **falls**, tokens collapse | failure — compression destroyed the capability |
+| EX **rises** | a bonus, not the claim |
+
+The measurable is **output tokens**, not total tokens. Total tokens are
+dominated by the *prompt*; latency and the internalisation claim both track
+what the model *generates*.
+
+**Status: never achieved.** Across runs 1-3 with fully annealed schedules,
+generated length went **1 024 → 922**. Flat. The SFT student emits ~1 242-1 955
+output tokens and still writes the entire four-agent transcript, tag by tag
+(100% of generations emit `<|schema_link|>`, `<|round 1|>`, `<|agent din_sql|>`).
+
+## 0.2 Test B — is the thesis true? *(vs. the explicit MAS at the same size)*
+
+> **EX(student, 3B) ≥ EX(CHESS, 3B) at a fraction of the output tokens.**
+
+The reference is the **explicit multi-agent system running on the same 3B
+backbone** — *not* the 7B teacher. Beating a 3B baseline with a 3B student is a
+claim about the **method**; beating a 7B one would be a claim about **model
+size**, which is a different and much less interesting statement.
+
+Measured target, n = 90 (§2.3):
+
+| reference | EX | output tokens |
+|---|---:|---:|
+| **CHESS @ 3B — the bar to clear** | **48.89%** | **1 009** |
+| ours, SFT-only @ 3B | 52.22% | 1 242 |
+
+So the SFT student already clears CHESS on accuracy (+3.3) — but **loses on
+output tokens** (1 242 vs 1 009), which is the half of the claim that matters.
+The thesis needs *both*.
+
+## 0.3 What is explicitly **not** the target
+
+**GRPO > the 7B teacher.** A 3B student does not beat the 7B system that taught
+it; the teacher is the ceiling, not the bar. Teacher EX was 64.2% (run 3). Any
+framing that compares our 3B student to the 7B teacher and calls the gap a
+failure has misunderstood the experiment.
+
+**GRPO > SFT.** See 0.1 — stage 2 trades tokens for nothing, ideally. An
+accuracy gain there is welcome noise, not evidence.
+
+## 0.4 Scoreboard
+
+| | test | reference | target | status |
+|---|---|---|---|---|
+| **A** | internalisation | SFT student | EX holds, **output tokens collapse** | ❌ tokens never moved (1 024 → 922) |
+| **B** | the thesis | CHESS @ 3B (48.89%) | **≥ 48.89% at fewer output tokens** | ⚠️ accuracy yes (52.22%), tokens no (1 242 vs 1 009) |
+
+**Neither test has been passed.** Test A has never moved; test B is half-passed
+on the accuracy axis and failing on the cost axis — and the cost axis is the
+entire contribution.
+
+### Why A has never passed — three causes, all now fixed
+
+1. **The clip started below the trace length.** IMAD anneals `l` 2000 → 500,
+   starting *above* the natural output so early rollouts are unpenalised and
+   pressure builds. We ran `l` **900 → 400** against a ~1 950-token trace, so the
+   clip bit from step 1 and the curriculum ran backwards.
+2. **`max_new_tokens` (1 024) was below `l_start`.** Rollouts truncated at the
+   cap, so on **16 of 24 steps every rollout had identical length** — nothing to
+   reward for being shorter.
+3. **24 GRPO steps.** IMAD-scale internalisation is hundreds.
+
+The CHESS-only run now in flight uses `l` **2 400 → 500**, `max_new_tokens`
+**2 560**, and **~192 GRPO steps** (~5.2 h) — the first configuration in this
+project that can actually test Test A.
 
 ---
 
@@ -83,6 +174,52 @@ with exact McNemar p = 0.625 and p = 0.500. Binary GRPO has **no detectable
 effect on accuracy at this scale**. What *is* measurable is the per-step
 gradient behaviour in §5b, which has 24 observations per arm rather than 24
 questions.
+
+### 2.3 The n = 90 evaluation — larger sample, real intervals
+
+Runs 1-3 evaluated on n = 24 (±19-point intervals, nothing separable). This is
+the same protocol on **n = 90** (30 BIRD + 60 Spider, dev splits), 95% Wilson
+intervals, all methods on the same `Qwen2.5-Coder-3B-Instruct`.
+
+| Method | EX (%) | 95% CI | bird | spider | Total tok | **Output tok** | Latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **DAIL-SQL** | **60.00** | 49.7-69.5 | 30.0 | 75.0 | 4 369 | 326 | 6.0 s |
+| CHASE-SQL | 57.78 | 47.5-67.5 | 26.7 | 73.3 | 5 817 | 599 | 13.1 s |
+| **ours, SFT-only** | **52.22** | 42.0-62.2 | 23.3 | 66.7 | **2 561** | **1 242** | 40.8 s |
+| **CHESS  ← Test B bar** | **48.89** | 38.8-59.0 | 30.0 | 58.3 | 6 622 | **1 009** | 20.2 s |
+| DIN-SQL | 45.56 | 35.7-55.8 | 20.0 | 58.3 | 3 026 | 333 | 6.3 s |
+| Single agent | 45.56 | 35.7-55.8 | 20.0 | 58.3 | 1 476 | 172 | 3.1 s |
+
+Three things this larger sample establishes that n = 24 could not:
+
+1. **Our student clears CHESS on accuracy but not on output tokens** — the exact
+   split described in §0.2. It uses the **lowest total tokens of any multi-call
+   method** (2 561) and the **highest output tokens on the table** (1 242).
+   Prompt-side cost won, generation-side cost lost.
+2. **DIN-SQL buys nothing over a plain single-agent prompt** — identical 45.56%
+   for 2x the tokens. 74 of 90 predictions differ; the errors cancel exactly.
+3. **DAIL-SQL leads at the second-lowest token cost.** CHESS spends 1.5x
+   DAIL's tokens for 11 points less accuracy.
+
+### 2.4 The teacher panel does not earn its cost
+
+Measured on run 3's 81 traces: "at least one panellist correct" is the ceiling
+on trace yield, and cost is LLM calls per question.
+
+| panel | >=1 correct | ~calls |
+|---|---:|---:|
+| **DAIL-SQL alone** | **81.5%** | **4** |
+| CHASE-SQL alone | 69.1% | 11 |
+| CHESS alone | 59.3% | 8 |
+| DAIL + any one other | 82.7% | 9-15 |
+| all four | 82.7% | 28 |
+
+**The four-system panel buys +1.2 points over DAIL-SQL alone for 7x the
+compute** — one question in 81. The panel is also largely redundant: four
+panellists produce four *distinct* queries only 6% of the time, and two or
+fewer 37% of the time.
+
+This is why the current run uses **one teacher system, not four**.
 
 ---
 
