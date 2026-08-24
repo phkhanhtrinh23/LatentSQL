@@ -10,8 +10,19 @@ adjacent axes. The specific composition appears unoccupied — but the novelty i
 a composition, not a new primitive, and §5 is honest about what that means for
 a thesis defence.
 
-*Search performed 22 Aug 2026. Method in §7. This is a literature search, not a
-proof of absence — see §6 for what it could not rule out.*
+**Specifically on latent reasoning for Text-to-SQL** (re-asked and
+re-searched 24 Aug 2026, ~30 queries total across both passes): no published
+paper does continuous/activation-space reasoning — single-model or
+multi-agent — for SQL *generation*. The closest thing found, LatentRefusal
+(§2.6b), reads hidden states for a binary refusal *decision*, not generation.
+See §2.8 for the full second-pass account, including five more multi-agent
+latent-collaboration papers (the LatentMAS family has grown since Aug 2026)
+and four single-model latent/implicit-reasoning papers, none of which
+evaluates SQL.
+
+*First pass 22 Aug 2026, adversarial second pass 24 Aug 2026. Method in §7.
+This is a literature search, not a proof of absence — see §6 for what it
+could not rule out.*
 
 ---
 
@@ -206,13 +217,81 @@ below Arctic-Text2SQL-R1-7B has not made the case. Arctic in particular is
 awkward for us: it reaches 68.9% with *only* an execution-correctness reward and
 no debate at all, which is close to our GRPO stage minus the whole teacher.
 
-### 2.8 Latent-reasoning background (none Text-to-SQL)
+### 2.8 Latent-reasoning background (none Text-to-SQL) — re-verified 24 Aug 2026, deeper pass
 
 [COCONUT](https://arxiv.org/abs/2412.06769) (hidden state fed back as next input
 embedding), CODI (self-distillation into continuous space), SoftCoT, CoLaR,
 iCoT. Our `latent_slot_curriculum` is COCONUT-style and is credited as such.
-A survey sweep of the [Awesome-Latent-CoT](https://github.com/EIT-NLP/Awesome-Latent-CoT)
-list surfaced no Text-to-SQL entry.
+The original survey sweep of the [Awesome-Latent-CoT](https://github.com/EIT-NLP/Awesome-Latent-CoT)
+list found no Text-to-SQL entry (22 Aug 2026).
+
+**A second, deliberately adversarial pass (24 Aug 2026, ~20 additional queries,
+~14 papers fetched and read past the abstract) found no reason to revise that
+conclusion — if anything it strengthens it,** because the pass specifically
+targeted the two ways a paper could be missed by the first sweep: (a) it is
+*about latent multi-agent collaboration* rather than latent CoT generally, or
+(b) it is *very recent* and not yet well-indexed.
+
+**(a) The LatentMAS family has grown since Aug 2026, and every new entrant was
+checked for SQL by reading its actual benchmark list, not its abstract — none
+has one.** [RecursiveMAS](https://arxiv.org/abs/2604.25917) (May 2026) casts a
+whole heterogeneous multi-agent system as one latent recursive computation
+(closing an inner/outer KV-cache loop across agents and rounds), +8.3% accuracy
+and 34.6-75.6% fewer tokens — evaluated on MATH500, AIME2025, AIME2026,
+GPQA-Diamond, MedQA, LiveCodeBench-v6, MBPP+, HotpotQA, Bamboogle. No SQL.
+[Interlat / "Enabling Agents to Communicate Entirely in Latent Space"](https://arxiv.org/abs/2511.09149)
+(ACL 2026) transmits last-layer hidden states directly between agents (up to
+24× faster than NL communication) — evaluated on ALFWorld and MATH only.
+[Cache Merging as a Convergent Replicated State for Multi-Agent Latent
+Reasoning](https://arxiv.org/abs/2607.01308) (Jul 2026) fixes a correctness bug
+in how multiple agents' KV-caches get concatenated (order-dependence), verified
+on Qwen3-1.7B/4B — no task benchmark with SQL. Also checked and confirmed no
+SQL: ["Beyond tokens": a unified framework for latent communication](https://arxiv.org/abs/2606.05711)
+and ["Do Latent Channels Actually Communicate?"](https://arxiv.org/abs/2607.26773)
+(the latter runs GSM8K/ARC-C/MATH-500). None of these five papers evaluates
+Text-to-SQL, and none distils a *published, named* multi-agent Text-to-SQL
+system (DIN-SQL/DAIL-SQL/CHESS/CHASE-SQL or otherwise) — they compose generic
+agent roles, same as LatentMAS itself.
+
+**(b) Single-model latent/implicit-reasoning papers, checked the same way:**
+[SemCoT](https://arxiv.org/abs/2510.24940) (genuine continuous-vector implicit
+tokens, contrastively aligned to explicit reasoning) — no SQL benchmark found.
+[CoLT: Chain of Latent Tool Calls](https://arxiv.org/abs/2602.04246) — hidden
+states trigger an external "unpacker" model per reasoning step, which is
+architecturally the nearest thing to "SQL execution as a latent tool call" we
+found anywhere — but its four benchmarks are all mathematical, SQL is not one
+of its tools, and the base model still reasons in explicit tokens outside the
+tool calls. [Dropout-GRPO](https://arxiv.org/abs/2606.10184) (Jun 2026) is the
+closest **methodological** neighbor to our own stage-2 training design: it
+combines GRPO with a COCONUT-style continuous-latent-reasoning policy,
+addressing exactly the variance/exploration problem latent rollouts create for
+group-relative RL. Evaluated on GSM8K only (27.29% → 29.01% pass@1 over a
+Coconut baseline) — no SQL, and not a multi-agent or distillation method — but
+worth citing for the GRPO-through-latent-space mechanics regardless of the
+Text-to-SQL question. [A Survey on Latent Reasoning](https://arxiv.org/abs/2507.06203)
+was also checked directly for its taxonomy of application domains: no
+Text-to-SQL or database-query category appears anywhere in it.
+
+**Confirmed false positives (colloquial "latent", not a real candidate) — read
+past the abstract specifically to rule out an overloaded keyword hit:**
+APEX-SQL uses "latent reasoning potential" as a figure of speech for untapped
+test-time-compute headroom, not a mechanism; a Text-to-Python-vs-SQL benchmarking
+paper's "latent domain knowledge" means unstated context, not hidden
+activations; [YORO](https://arxiv.org/abs/2409.12172) "internalizes database
+knowledge" by fine-tuning the schema into the model's *parametric* weights so
+it need not be re-encoded per question — internalizing *content*, not a
+reasoning *process*, and there is no debate, no transcript, no latent thought
+step at inference.
+
+**Net effect on the claim:** no work found, at any distance, does latent
+reasoning *of any kind* — single-model or multi-agent — for Text-to-SQL
+*generation*. LatentRefusal (§2.6b) remains the only paper touching both
+"latent" and "Text-to-SQL" that survives a full read, and it is a
+classification gate, not a generator. C1-C6 in combination (a fused,
+*named* multi-agent Text-to-SQL system, distilled and internalised via
+SFT+GRPO, into latent reasoning) has no known prior instance in either the
+Text-to-SQL literature or the latent-reasoning literature, checked from both
+directions.
 
 ---
 
@@ -315,11 +394,14 @@ Ranked by how well each would survive a hostile reviewer.
   intro are clear enough to place it (single-teacher synthetic-data KD on
   WikiSQL, explicit reasoning), but its details are taken on the abstract's word.
 
-**Recommended follow-ups before submission:** a Semantic Scholar / Google
-Scholar *citation-graph* sweep forward from IMAD and LatentMAS (anyone citing
-both is the highest-risk collision); an arXiv full-text search for
-`"text-to-SQL" AND ("latent reasoning" OR "internalize")`; and a re-run of this
-search one week before the deadline.
+**Recommended follow-ups before submission:** a re-run of this search one week
+before the deadline, and periodic re-checks of the LatentMAS-family papers in
+§2.8 in case a future revision adds a Text-to-SQL benchmark. The
+citation-graph sweep and the `"text-to-SQL" AND latent-reasoning` full-text
+search recommended after the first pass were both carried out on 24 Aug 2026
+(§2.8, §7) and did not surface a hit; Semantic Scholar's own "cited by" UI
+would not render through automated fetch, so that specific citation list is
+still unverified and worth a manual check nearer submission.
 
 ---
 
@@ -347,6 +429,45 @@ rather than a summary. LatentRefusal (2601.10398) was supplied directly by the
 user on 24 Aug 2026, downloaded and read in full (9 pages) rather than found
 by search - added to §2.6b.
 
+**Second pass, 24 Aug 2026** — user asked directly "are there no papers
+studying latent reasoning for Text-to-SQL?" after LatentRefusal surfaced;
+treated as a request to stress-test §2.8 rather than accept the first pass's
+conclusion. ~20 further queries (web search + direct arXiv/paper fetches, not
+abstracts alone):
+
+13. `latent reasoning text-to-SQL continuous chain-of-thought SQL generation`
+14. `"text-to-SQL" implicit reasoning hidden state SQL generation arxiv 2026`
+15. `continuous chain of thought SQL generation database query arxiv`
+16. `"text2sql" latent multi-agent debate internalize KV cache`
+17. `"Cache Merging" "Multi-Agent Latent Reasoning" arxiv 2607.01308`
+18. `Interlat inter-agent latent message adapter hidden states benchmark`
+19. `RecursiveMAS recursive latent computation heterogeneous multi-agent system`
+20. `looped transformer recurrent depth reasoning SQL generation text-to-SQL`
+21. `arxiv 2026 semantic parsing latent reasoning continuous thought logical form generation`
+22. `knowledge graph question answering KGQA latent reasoning continuous space query generation`
+23. `API call generation latent reasoning continuous space tool use internalize`
+24. `site:arxiv.org "text-to-SQL" "latent" 2026`
+25. `"internalize" OR "internalized" multi-agent Text-to-SQL debate distillation SQL 2026`
+26. `soft thought SQL query generation continuous embedding agent collaboration database`
+27. `activation steering text-to-SQL agent subspace SQL generation interpretability`
+28. `Arctic-Text2SQL-R1 OR OmniSQL OR "SLM-SQL" related work "latent reasoning" OR "continuous chain-of-thought" OR COCONUT`
+29. `"implicit reasoning" text-to-SQL fewer tokens compress chain of thought 2026`
+30. `arxiv.org full text search text-to-SQL "latent reasoning" OR "continuous reasoning"`
+31. `YORO "You Only Read Once" internalize database knowledge text-to-SQL mechanism fine-tuning`
+
+Papers fetched and read past the abstract (benchmark list and mechanism
+checked directly against the paper text, not inferred from a search snippet):
+RecursiveMAS (2604.25917), Interlat/ACL2026 (2511.09149), Cache Merging
+(2607.01308), "Beyond tokens" (2606.05711), "Do Latent Channels Actually
+Communicate?" (2607.26773), Loop-Think-Generalize (2604.07822), SemCoT
+(2510.24940), CoLT (2602.04246), Dropout-GRPO (2606.10184), A Survey on Latent
+Reasoning (2507.06203), APEX-SQL (2602.16720), the Text-to-Python-vs-SQL paper
+(2601.15728), YORO (2409.12172), and N-rep/"Cheaper Better Faster Stronger"
+(2505.14174) — the latter four specifically to rule out colloquial "latent"
+keyword hits before excluding them. Semantic Scholar's citation list for
+LatentMAS and for IMAD would not render through automated fetch (JS-rendered
+UI); that specific citation-graph check remains open, see §6.
+
 ---
 
 ## Sources
@@ -362,6 +483,16 @@ by search - added to §2.6b.
 - [SLM-SQL: An Exploration of Small Language Models for Text-to-SQL — arXiv:2507.22478](https://arxiv.org/html/2507.22478v1)
 - [LatentRefusal: Latent-Signal Refusal for Unanswerable Text-to-SQL Queries — arXiv:2601.10398](https://arxiv.org/pdf/2601.10398v2)
 - [Training Large Language Models to Reason in a Continuous Latent Space (COCONUT) — arXiv:2412.06769](https://arxiv.org/abs/2412.06769)
+- [A Survey on Latent Reasoning — arXiv:2507.06203](https://arxiv.org/abs/2507.06203)
+- [Recursive Multi-Agent Systems (RecursiveMAS) — arXiv:2604.25917](https://arxiv.org/abs/2604.25917)
+- [Enabling Agents to Communicate Entirely in Latent Space (Interlat) — ACL 2026 · arXiv:2511.09149](https://arxiv.org/abs/2511.09149)
+- [Cache Merging as a Convergent Replicated State for Multi-Agent Latent Reasoning — arXiv:2607.01308](https://arxiv.org/abs/2607.01308)
+- [Beyond tokens: a unified framework for latent communication in LLM-based multi-agent systems — arXiv:2606.05711](https://arxiv.org/abs/2606.05711)
+- [Do Latent Channels Actually Communicate? A Causal Audit of Latent Multi-Agent LLM Communication — arXiv:2607.26773](https://arxiv.org/abs/2607.26773)
+- [SemCoT: Accelerating Chain-of-Thought Reasoning through Semantically-Aligned Implicit Tokens — arXiv:2510.24940](https://arxiv.org/abs/2510.24940)
+- [CoLT: Reasoning with Chain of Latent Tool Calls — arXiv:2602.04246](https://arxiv.org/abs/2602.04246)
+- [Dropout-GRPO: Variational Stochasticity for Continuous Latent Reasoning — arXiv:2606.10184](https://arxiv.org/abs/2606.10184)
+- [You Only Read Once (YORO): Learning to Internalize Database Knowledge for Text-to-SQL — NAACL 2025 · arXiv:2409.12172](https://arxiv.org/abs/2409.12172)
 - [Awesome-Latent-CoT reading list](https://github.com/EIT-NLP/Awesome-Latent-CoT)
 - [NL2SQL Handbook](https://github.com/HKUSTDial/NL2SQL_Handbook)
 - [BAPPA: Benchmarking Agents, Plans, and Pipelines for Automated Text-to-SQL Generation — arXiv:2511.04153](https://arxiv.org/html/2511.04153)
