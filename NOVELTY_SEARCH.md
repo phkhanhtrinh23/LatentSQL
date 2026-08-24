@@ -132,6 +132,64 @@ models** at inference; it is not a distillation method at all. Applying its two
 mechanisms *inside a single internalised student* is not something the paper
 does or claims.
 
+### 2.6b LatentRefusal — convergent evidence for "read hidden states, not tokens", from an adjacent Text-to-SQL problem
+[arXiv:2601.10398v2](https://arxiv.org/pdf/2601.10398v2) (Ren, Hu, Lu, Huang; Fudan University, with Duan; Penn State Abington. Jan 2026)
+
+Not a competitor to our claim - a **refusal gate**, not a generator. Given a
+question + schema, it predicts *answerability* (should the system refuse
+before producing any SQL at all) from a single frozen intermediate-layer
+hidden state, via a small trained probe: the Tri-Residual Gated Encoder
+(TRGE) - a 4-layer, 19M-parameter (<0.3% of an 8B backbone) Transformer-style
+probe whose distinguishing feature is a third, SwiGLU-gated residual branch
+that suppresses schema-token noise and amplifies the sparse tokens that carry
+a question/schema mismatch. The base LLM (Qwen3-8B, Llama-3.1-8B) is entirely
+frozen; only the probe is trained, on ~300 labelled examples, in ~10 minutes
+on one A100. Result: 88.5% avg F1 across four answerability benchmarks
+(TriageSQL, AMBROSIA, SQuAD 2.0, MD-Enterprise), beating both output-sampling
+uncertainty methods (Semantic Entropy, Self-evaluation) and other
+internal-state probes (CCS, Eigenscore, HaloScope, SAPLMA, TSV) - at **2ms**
+probe overhead versus Semantic Entropy's 740ms (13.7x). Ablations: removing
+the SwiGLU gate costs -4.1 F1 (MLP) to -16.7 F1 (linear probe); the best
+signal sits at layer -16 of the backbone (middle-to-late), not the final
+layer; probe depth peaks at 4 layers with diminishing returns beyond.
+
+**Why it doesn't compete, and what it is worth to us anyway.** None of C1-C4
+or C7 apply: single frozen LLM, no MAS teacher, no distilled transcript, no
+RL/internalisation of anything, no execution reward, no agent personas. It
+solves a different problem (safety gating for genuinely unanswerable/ambiguous
+queries) on different benchmarks, and BIRD/Spider are not built to be
+ambiguous, so it is not a target we need to beat. But it is independent
+empirical support, in the *same problem domain*, for the premise our entire
+latent-rollout mechanism rests on: that a transformer's intermediate hidden
+states carry decision-relevant signal *before* any token is decoded, and that
+a single forward pass without decoding is enough to extract it. We use that
+premise for generation (`LatentReasoner`); they use it for a binary gate. Two
+things are directly actionable for us:
+
+1. **Layer choice.** Their signal peaks at layer -16 of ~32, i.e.
+   middle-to-late but not final. Our `steering.layer` defaults to `-8`
+   (IMAD's config, tuned for arithmetic, not SQL) - worth an ablation on our
+   own agent-subspace extraction now that a second, independent Text-to-SQL
+   result points away from the very last layers.
+2. **A learned, gated aligner.** `LatentReasoner.align()` currently maps a
+   role's hidden state back into embedding space with a *fixed, untrained*
+   `soft_embed` transform. TRGE's central result is that a small
+   input-conditioned SwiGLU gate substantially outperforms both a linear
+   probe and a vanilla MLP at exactly this kind of task - extracting a sparse,
+   task-relevant signal from a hidden state that is otherwise dominated by
+   irrelevant (there: schema; here: prompt) content. A trained gated aligner
+   in place of the fixed `soft_embed` map is a concrete, cheap experiment: it
+   targets precisely the risk LatentMAS §3.1 flags for raw hidden-state
+   reuse (out-of-distribution drift), by *learning* what to keep rather than
+   relying on a fixed projection.
+
+Also worth naming as a possible later extension, not a gap we need to close
+now: a LatentRefusal-style gate sitting on top of our internalised student -
+refuse before decoding when the latent debate itself shows internal
+disagreement - would be a natural safety layer, since BIRD/Spider gold labels
+already carry a `difficulty` field that could stand in for an answerability
+signal in a pilot.
+
 ### 2.7 The SLM Text-to-SQL performance bar (not competing methods, but the numbers to beat)
 
 | System | Size | BIRD dev EX | Approach |
@@ -170,8 +228,12 @@ list surfaced no Text-to-SQL entry.
 | IMAD | ❌ | ✅ | ✅ | ❌ | ✅ | ◐ | ✅ |
 | LatentMAS | ❌ | ❌ | ❌ | ❌ | ◐ | ✅ | ❌ |
 | Arctic-Text2SQL-R1 | ❌ | ❌ | ◐ | ✅ | ✅ | ❌ | ❌ |
+| LatentRefusal | ❌ | ❌ | ❌ | ❌ | ◐ | ✅ | ❌ |
 
 ◐ = partial / different mechanism. Max overlap by any single work: **3 full + 2 partial**.
+LatentRefusal's C6 tick is a different *use* of the latent channel (a refusal
+classifier, not generation) - it does not compete with C1-C4 or C7 at all, and
+is included for completeness rather than as a threat to novelty (see §2.6b).
 
 ---
 
@@ -281,7 +343,9 @@ Searches issued 22 Aug 2026 (all English, US region):
 Full PDFs retrieved and read for: MATS (2512.18622), Struct-SQL (2512.17053),
 SQuaD-SQL (2607.08161), MAD-OPD (2605.01347), plus the six papers already in
 [pdfs/](pdfs/). LatentMAS's benchmark list was verified against the paper text
-rather than a summary.
+rather than a summary. LatentRefusal (2601.10398) was supplied directly by the
+user on 24 Aug 2026, downloaded and read in full (9 pages) rather than found
+by search - added to §2.6b.
 
 ---
 
@@ -296,6 +360,7 @@ rather than a summary.
 - [SQuaD-SQL: Efficient Text-to-SQL with Small Language Models via LLM-Guided Knowledge Distillation — arXiv:2607.08161](https://arxiv.org/pdf/2607.08161)
 - [Arctic-Text2SQL-R1: Simple Rewards, Strong Reasoning in Text-to-SQL — arXiv:2505.20315](https://arxiv.org/pdf/2505.20315) · [Snowflake blog](https://www.snowflake.com/en/blog/engineering/arctic-text2sql-r1-sql-generation-benchmark/)
 - [SLM-SQL: An Exploration of Small Language Models for Text-to-SQL — arXiv:2507.22478](https://arxiv.org/html/2507.22478v1)
+- [LatentRefusal: Latent-Signal Refusal for Unanswerable Text-to-SQL Queries — arXiv:2601.10398](https://arxiv.org/pdf/2601.10398v2)
 - [Training Large Language Models to Reason in a Continuous Latent Space (COCONUT) — arXiv:2412.06769](https://arxiv.org/abs/2412.06769)
 - [Awesome-Latent-CoT reading list](https://github.com/EIT-NLP/Awesome-Latent-CoT)
 - [NL2SQL Handbook](https://github.com/HKUSTDial/NL2SQL_Handbook)

@@ -8,7 +8,7 @@
 #   D  CHESS,    +DPO,    dense    <- D vs B : do many systems help
 set -u
 cd /home/trinh/Dropbox/thesis/latent_agent_text2sql
-export PYTORCH_ALLOC_CONF=expandable_segments:True LATENTSQL_GPU_FRACTION=0.5 LATENTSQL_CPU_THREADS=6
+export PYTORCH_ALLOC_CONF=expandable_segments:True LATENTSQL_GPU_FRACTION=0.75 LATENTSQL_CPU_THREADS=6
 L=outputs/arms.log
 stage(){ echo "=== [$(date +%H:%M:%S)] $* ===" | tee -a $L; }
 while pgrep -f "rerun_latent.sh|03_grpo.py|04_eval.py" >/dev/null; do sleep 60; done
