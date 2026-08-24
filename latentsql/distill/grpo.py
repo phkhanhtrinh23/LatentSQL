@@ -309,6 +309,30 @@ class GRPOTrainer:
         if not active:
             return None
         task = self._cur_task
+
+        # The whole computation - latent prefix AND the completion forward that
+        # consumes its cache - has to run uncheckpointed. Checkpointing forces
+        # use_cache=False, so the cache the prefix returns is ignored and the
+        # attention mask then describes memory that is not there. Suspending it
+        # only inside build_prefix is not enough: the completion forward runs
+        # after it returns.
+        model = self.bundle.model
+        ckpt = bool(getattr(model, "is_gradient_checkpointing", False))
+        prev_use_cache = getattr(model.config, "use_cache", True)
+        if ckpt:
+            model.gradient_checkpointing_disable()
+        model.config.use_cache = True
+        try:
+            return self._latent_loss_inner(active, task, scale)
+        finally:
+            if ckpt:
+                model.gradient_checkpointing_enable()
+            model.config.use_cache = prev_use_cache
+
+    def _latent_loss_inner(self, active, task, scale: float):
+        import torch
+        import torch.nn.functional as F
+
         denom = float(max(1, sum(len(r.completion_ids) for r in active)))
         total = 0.0
 
