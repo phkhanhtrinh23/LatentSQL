@@ -343,7 +343,8 @@ class GRPOTrainer:
                 task.system, task.prompt, grad=True
             )
             ids = torch.tensor([r.completion_ids], device=self.bundle.device)
-            lp = [F.log_softmax(first_logits.float(), dim=-1)[0, r.completion_ids[0]]]
+            first_lp = F.log_softmax(first_logits.float(), dim=-1)[0, r.completion_ids[0]]
+            terms = [first_lp]
             if len(r.completion_ids) > 1:
                 attn2 = torch.cat(
                     [attn, torch.ones(1, ids.shape[1] - 1, dtype=attn.dtype,
@@ -351,11 +352,22 @@ class GRPOTrainer:
                 )
                 out = self.bundle.model(input_ids=ids[:, :-1], past_key_values=past,
                                         attention_mask=attn2, use_cache=False)
-                logp = F.log_softmax(out.logits.float(), dim=-1)
-                tgt = ids[:, 1:]
-                lp.append(logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1).sum())
+                logits, tgt = out.logits, ids[:, 1:]
+                # Upcasting the whole completion to fp32 in one shot is what
+                # OOMs here: [1, ~2560, 152936] fp32 is ~1.6GB, on top of the
+                # 96 uncheckpointed latent steps already holding activations
+                # for backward. Chunk over sequence positions, same pattern as
+                # _loss_for and dpo.py's _seq_logprob - autograd stitches the
+                # blocks back together, so the gradient is unchanged.
+                parts = []
+                for i in range(0, logits.shape[1], _LOGP_CHUNK):
+                    block = F.log_softmax(logits[:, i : i + _LOGP_CHUNK, :].float(), dim=-1)
+                    tb = tgt[:, i : i + _LOGP_CHUNK]
+                    parts.append(block.gather(-1, tb.unsqueeze(-1)).squeeze(-1))
+                terms.append(torch.cat(parts, dim=1).sum())
+                del out, logits
             token_logp = torch.stack([x.reshape(()) if x.dim() == 0 else x.sum()
-                                      for x in lp]).sum()
+                                      for x in terms]).sum()
             loss = -(r.advantage * token_logp) / denom
             (loss * scale).backward()
             total += float(loss.detach())
