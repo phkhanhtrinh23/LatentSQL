@@ -352,15 +352,15 @@ The missing piece is the one named in [METHOD.md §8.1b](METHOD.md): **no term d
 
 ## 5c. Run 4 (live, in progress) — the four-arm factorial after the Option A fix
 
-**Status as of 2026-08-27 00:29 AEST: arm A's GRPO stage is mid-flight (step ~25-30 of a planned 252, ~90 min in). Nothing below is final — no arm has reached eval yet — but two findings are already solid enough to record.**
+**Status as of 2026-08-27, arm A complete, arm B in progress: arm A's GRPO stage ran to its 2-hour timeout at 35 of the planned 252 steps and has now handed off to arm B (DPO-initialized). Nothing below is final for the factorial as a whole — no arm has reached eval yet — but arm A's window is now a closed, complete observation, not a mid-flight one, and it is a clean negative result worth recording precisely.**
 
-### The good news: Option A held under real load
+### The good news: Option A held under real load, for the full 2-hour window
 
-Every previous attempt at GRPO through the latent debate died from OOM within the first few steps (see the saga in §6 and the commit history). This is the first run where that has not happened: **25+ consecutive optimizer steps, ~85 minutes, GPU peak 9.32 GB**, comfortably inside the 17.63 GB cap (`LATENTSQL_GPU_FRACTION=0.75`, i.e. 18/24 GB). The per-role gradient checkpointing fix (`d4b1b18`) is holding at real scale, not just in the unit test. Speculative decoding is also confirmed live: mean accepted length 2.2-2.8 of a max-3 draft (`spec_acceptance_length`), acceptance rate 40-56%, ~180-210s per step of which most is the 4 rollouts' generation.
+Every previous attempt at GRPO through the latent debate died from OOM within the first few steps (see the saga in §6 and the commit history). Arm A's full 2-hour window ran clean: **35 consecutive optimizer steps, ~7,144 s elapsed, GPU peak 15.52 GB**, still inside the 17.63 GB cap (`LATENTSQL_GPU_FRACTION=0.75`, i.e. 18/24 GB) — the peak rose from ~9.3 GB to ~15.5 GB exactly at the one step that produced a real gradient (step 33, see below), consistent with the backward pass only fully engaging when there is a non-zero loss to propagate. The per-role gradient checkpointing fix (`d4b1b18`) held for the entire capped window, not just a handful of steps. Speculative decoding also ran cleanly start to finish: mean accepted length 2.2-2.8 of a max-3 draft, acceptance rate 40-56%, ~180-210 s per step.
 
-### The finding that needs attention before trusting any arm's accuracy
+### Arm A's complete result: 34 of 35 steps were exactly dead, and execution correctness never once left zero
 
-**Every one of the first 25 logged steps has `adv_nonzero_frac: 0.0` and `reward_std_mean: 0.0`.** By the zero-variance proof in [PROOFS.md](PROOFS.md) §1.4, that means the GRPO gradient has been the **exact zero vector on every single step so far** — not small, exactly zero. `r_clip_mean` (execution correctness) is also pinned at `0.0` on every step: every sampled rollout in every group of 4, for 25 steps straight, produced SQL that failed to execute-match the gold query. `r_fmt_mean` fluctuates (0.0-0.19), so the model is differentiating on *format*, but never once on *correctness*.
+**34 of the 35 logged steps have `adv_nonzero_frac: 0.0` and `reward_std_mean: 0.0`.** By the zero-variance proof in [PROOFS.md](PROOFS.md) §1.4, that means the GRPO gradient was the **exact zero vector on 34 of 35 steps** — not small, exactly zero. The single exception, step 33, had `reward_std_mean: 0.0433` and `adv_nonzero_frac: 1.0` — but even there, `r_clip_mean` (execution correctness) was still `0.0`; the entire live signal on that one step came from `r_fmt_mean` (format) spread among the 4 rollouts, not from any rollout actually producing correct SQL. **Across all 35 steps × 4 rollouts = 140 sampled completions, `r_clip_mean` never once left `0.0`.** Not one sampled SQL query, at any point in arm A's GRPO stage, executed to match the gold answer. `r_fmt_mean` fluctuates (0.0-0.19) throughout, so the only thing GRPO ever had to learn from in this window was formatting, never correctness.
 
 **Root cause, verified against the actual training data, not just suspected:** the SFT completion target is the full tagged text transcript — `<|schema_link|>...<|round 1|>...<|agent din_sql|>...` — generated from the *plain* prompt with no latent prefix at all (confirmed by inspecting `outputs/arm_a/traces/sft.jsonl` directly). GRPO's latent sampler (`_sample_group_latent` in `grpo.py`) does something the SFT/DPO stages never once demonstrated: it runs the prompt through 12 latent steps per role across 9 roles (`build_prefix`), then asks the model to emit **only a bare SQL query** continuing from that latent-primed KV cache — no tags, no debate scaffolding, a completion shape the checkpoint has never seen conditioned this way. GRPO is effectively evaluating the student zero-shot on a conditioning distribution SFT and DPO never trained it on, which is a plausible and sufficient explanation for 100% execution failure over the first 85 minutes: there has been no stage in this pipeline yet that teaches the model to produce a good SQL completion *specifically after a latent-only prefix*.
 
@@ -370,12 +370,12 @@ This does not mean the run is broken or should be killed — GRPO's own reward s
 
 | component | status | evidence |
 |---|---|---|
-| Option A checkpointing at scale | ✅ | 25+ steps, no OOM, GPU peak 9.32 GB (cap 17.63 GB) |
-| Speculative decoding, live | ✅ | acceptance rate 40-56%, mean accepted length 2.2-2.8/3 |
-| VRAM safety cap | ✅ | never exceeded 9.32 GB of the 17.63 GB (18/24 GB) limit |
-| GRPO learning signal (arm A, steps 1-25) | ❌ | zero reward variance, zero gradient, every step so far |
+| Option A checkpointing at scale | ✅ | 35/35 steps, no OOM, full 2h window, GPU peak 15.52 GB (cap 17.63 GB) |
+| Speculative decoding, live | ✅ | acceptance rate 40-56%, mean accepted length 2.2-2.8/3, all 35 steps |
+| VRAM safety cap | ✅ | never exceeded 15.52 GB of the 17.63 GB (18/24 GB) limit |
+| GRPO learning signal (arm A, complete) | ❌ | 34/35 steps exactly dead; `r_clip_mean = 0.0` on all 35 — 0% execution correctness the entire window |
 
-I will update this section again once an arm actually reaches eval, or if the reward signal turns live later in the run.
+Arm A's resulting `outputs/arm_a/grpo` checkpoint is, by the proof in PROOFS.md §1.4, essentially the SFT checkpoint plus one real update out of 35 — that single update was driven by formatting, not correctness. Whatever eval eventually reports for arm A should be read as **very close to the no-DPO SFT starting point**, not as evidence GRPO learned anything about SQL correctness in this arm. Arm B (DPO-initialized) is now running; I will update this section again once it completes its window, once any arm reaches eval, or if the reward signal turns live somewhere else in the run.
 
 ---
 
