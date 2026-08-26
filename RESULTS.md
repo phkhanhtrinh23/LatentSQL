@@ -375,7 +375,11 @@ This does not mean the run is broken or should be killed — GRPO's own reward s
 | VRAM safety cap | ✅ | never exceeded 15.52 GB of the 17.63 GB (18/24 GB) limit |
 | GRPO learning signal (arm A, complete) | ❌ | 34/35 steps exactly dead; `r_clip_mean = 0.0` on all 35 — 0% execution correctness the entire window |
 
-Arm A's resulting `outputs/arm_a/grpo` checkpoint is, by the proof in PROOFS.md §1.4, essentially the SFT checkpoint plus one real update out of 35 — that single update was driven by formatting, not correctness. Whatever eval eventually reports for arm A should be read as **very close to the no-DPO SFT starting point**, not as evidence GRPO learned anything about SQL correctness in this arm. Arm B (DPO-initialized) is now running; I will update this section again once it completes its window, once any arm reaches eval, or if the reward signal turns live somewhere else in the run.
+Arm A's resulting `outputs/arm_a/grpo` checkpoint is, by the proof in PROOFS.md §1.4, essentially the SFT checkpoint plus one real update out of 35 — that single update was driven by formatting, not correctness.
+
+### Arm A's eval is now in: 0.00% EX on all 90 held-out questions
+
+All four arms eventually produced a GRPO adapter (each ran its full 2-hour timeout window), and eval has started. **Arm A scored EX = 0.00% on the full n = 90 set (0% BIRD, 0% Spider)** — not a single held-out question was answered correctly. Every one of the 90 generations also hit the `max_new_tokens = 2048` cap (`out = 2048.0` exactly, no early stops), meaning the model never once produced a terminated, gradeable completion either — consistent with a checkpoint that was never shown a single successful example of the exact task it is being asked to do (bare-SQL completion after a latent-only prefix). This is a direct, full-scale confirmation of the bootstrapping-deadlock mechanism: training never produced a correct rollout to learn from, and eval — sampled the identical way — reproduces that same total failure. It also closes the loop on the "latent SFT" fix discussed separately: this result is the empirical case for why that stage is needed, not just a theoretical one. Arm B's eval is in progress; arms C and D have GRPO adapters saved and are queued behind it. I will update this section again once B/C/D's eval numbers land.
 
 ---
 
