@@ -701,7 +701,9 @@ trained weights produced, one at a time, in that loop.
 
 ### The full raw output (every token the model generated - the "thinking text")
 
+<div style="background-color: #e6f7ff; padding: 15px; border-left: 5px solid #1890ff; border-radius: 4px;">
 ```text
+
 <|schema_link|>
 Tables: cars_data
 Columns: cars_data.Cylinders
@@ -794,7 +796,8 @@ SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
 ```
 <|/consensus|>
 <|endofdebate|>
-```
+</div>
+
 
 ### Extraction, execution, and the verdict
 
