@@ -428,7 +428,21 @@ A "latent SFT" checkpoint was built in parallel with this run (57/63 traces, `ou
 
 But **81 of 90 questions produced the exact same output** (`SELECT DISTINCT T1.name FROM station AS T1 JOIN station AS T2 ON T1.id = T2.id - 1 WHERE T1.name != T2.name`), and the remaining 9 a one-token variant of it - **2 unique completions across 90 completely different questions and schemas.** This is not the OOD collapse from §5c (which produced unrelated garbage); this is textbook catastrophic overfitting. The mechanism is visible in how the checkpoint was built: 57 sequential single-example gradient updates, `grad_accum=1`, `lr=1e-5`, no batching to average out any one example's influence - so whichever example(s) landed late in the chain with a strong gradient dominated the weights, and the model memorized one answer rather than learning to condition on the actual per-question input.
 
-**Net read:** the worked-example fix solved the problem it was built to solve - the model no longer produces incoherent, never-terminating output after a latent-primed prefix - but the *training procedure* used to build this particular checkpoint (57 uncontrolled single-example updates) was too aggressive and overfit hard. The fix for that is mechanical, not conceptual: batch multiple records per optimizer step (rather than one fresh process per record with an immediate update each time) so gradients average across examples the way ordinary SFT does. That checkpoint has not yet been built.
+**Net read:** the worked-example fix solved the problem it was built to solve - the model no longer produces incoherent, never-terminating output after a latent-primed prefix - but the *training procedure* used to build this particular checkpoint (57 uncontrolled single-example updates) was too aggressive and overfit hard. The hypothesised fix was mechanical: batch multiple records per optimizer step so gradients average across examples the way ordinary SFT does. That hypothesis was tested directly below, and it was wrong (or at least incomplete).
+
+### Testing the batching fix: three doses, three outcomes, the hypothesis falsified
+
+Same `train_latent_sft` function, same corpus, `grad_accum=4` throughout - only the number of real (post-averaging) optimizer updates differs.
+
+| run | updates | batched? | unique outputs / n | termination | EX |
+|---|---:|---|---:|---|---:|
+| §above (baseline) | 57 | no (one record per process, immediate update) | 2 / 90 | clean (38.9 tok avg) | 0% |
+| under-dosed probe | 4 | yes | 11 / 20 | **broken** - hit the 400-tok cap every time, off-topic content | 0% |
+| **scaled probe** | **~45** | **yes** | **1 / 90** | clean (45 tok avg) | 0% |
+
+4 batched updates was too little to learn anything robust - the model reverted to the exact never-terminating garbage failure from the original 0% collapse, just with more superficial answer diversity (11/20 unique, but none coherent). ~45 batched updates (3 epochs over the full 57-record corpus, loss trajectory a clean monotonic 1.92 -> 1.22 across the run, no sign of a collapse spike) reproduced the *same total mode collapse* as the unbatched run - 1 unique output across all 90 questions, a single memorised `country`/`city` join query regardless of the actual input.
+
+**Batching was not the active ingredient.** The real variable appears to be total gradient-update count against a fixed, tiny (57-example) corpus: too few updates never teaches the task; enough updates to learn anything (~45, on only 57 examples, repeated 3x) is also enough to memorise a single dominant answer instead of learning to condition on the question. Batching changes *how noisy* each update is, not *how much data the model has seen* - with only 57 examples, more epochs just means more repetitions of the same 57 answers, which is a corpus-size problem, not an optimizer-hyperparameter problem. The likely fix is a substantially larger latent-SFT corpus (hundreds of examples, not 57), not further tuning of batch size, learning rate, or epoch count on this one.
 
 ---
 
