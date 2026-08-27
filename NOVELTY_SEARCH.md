@@ -293,6 +293,18 @@ SFT+GRPO, into latent reasoning) has no known prior instance in either the
 Text-to-SQL literature or the latent-reasoning literature, checked from both
 directions.
 
+### 2.9 Activation steering interacting with RL post-training — background for our own steering module (`caa.py`)
+
+Prompted by a direct question ("are there any papers studying the steering of activation after applied RL like GRPO or more?"), a sweep of this adjacent literature turned up three distinct clusters, none of them Text-to-SQL, all of them relevant background for `latentsql/steering/caa.py` (the IMAD §3 difference-in-means agent-subspace module already in this codebase).
+
+**(a) Steering applied on top of an already-RL-tuned model, without studying what the RL did.** [Angular Steering](https://proceedings.neurips.cc/paper_files/paper/2025/file/b0223cad0e73b793f31eb6cc41cefceb-Paper-Conference.pdf) (Vu & Nguyen, NeurIPS 2025) reformulates activation steering as a rotation within a fixed 2D subspace instead of vector addition or orthogonalization, evaluated on RLHF-instruct models (Qwen2.5-3B/7B/14B-Instruct, Llama-3.2-3B/3.1-8B-Instruct, Gemma-2-9b-it). It extracts its feature direction with the **exact same Difference-in-Means primitive** `caa.py` uses (their §4.4, citing [Belrose 2023, "Diff-in-means concept editing is worst-case optimal"] and the same [Arditi et al. 2024, "Refusal in LLMs is Mediated by a Single Direction"] lineage IMAD §3 draws on) — same tool, different target (refusal/emotion direction vs. our agent-persona subspaces). It also reports that smaller models (3B) are measurably more vulnerable to steering-induced incoherence than 7B+ ones (§6.2), a capacity-dependent finding worth keeping in mind given our own student is 3B.
+
+**(b) Papers asking whether RL/safety alignment is "shallow" and can be exposed or undone by activation-level steering** — the closest match to "steering after applied RL" as a research question in its own right: [Why Do Aligned LLMs Remain Jailbreakable: Refusal-Escape Directions, Operator-Level Sources, and Safety-Utility Trade-off](https://arxiv.org/pdf/2605.08878), [Analysing the Safety Pitfalls of Steering Vectors](https://arxiv.org/pdf/2603.24543), [AlphaSteer: Learning Refusal Steering with Principled Null-Space Constraint](https://arxiv.org/pdf/2506.07022), [SteeringControl: Holistic Evaluation of Alignment Steering](https://arxiv.org/pdf/2509.13450). The consistent finding across this cluster: RLHF/safety-RL often only reinforces a refusal *prefix* early in generation rather than durably reshaping deeper representations, so a steering vector applied post-hoc can re-expose pre-RL behavior — RL's effect on activations is real but shallower than the behavioral change suggests. Angular Steering's own §6.2 independently supports this: perplexity stays near baseline while steering aligns with the target feature, but drops below baseline as it moves toward the jailbroken region, suggesting harmful generations (learnt in pretraining) remain more probable under the surface than refusal responses (learnt in safety tuning).
+
+**(c) Steering as a component *inside* an RL training loop**, closer to "steering after GRPO" read operationally: [ASRU: Activation Steering Meets Reinforcement Unlearning](https://arxiv.org/html/2605.15687v1) uses GRPO to learn a fine-grained unlearning boundary, with steering-derived direction identification feeding the reward; [Activation Reward Models for Few-Shot Model Alignment](https://arxiv.org/pdf/2507.01368) uses activation-space signals directly as the reward model rather than a separate scalar reward; goal-conditioned reward-model representations for RLHF steerability report +9.6% helpfulness over a plain SFT baseline by conditioning the reward model on representations of the desired end-state.
+
+**Net effect on the claim:** none of (a)-(c) touch Text-to-SQL or multi-agent-debate internalization, so they do not change §4's novelty claim. They are recorded here because (a) shares our exact direction-extraction primitive and is the nearest published validation that Difference-in-Means subspace steering is a live, NeurIPS-2025-current technique, and (b)/(c) are the right literature to cite if a reviewer asks whether our DPO-on-panellist-preference-pairs stage (which also acts on the model's *behavior* post-hoc, from teacher disagreement rather than a safety objective) risks the same "shallow" fragility this cluster documents for RLHF.
+
 ---
 
 ## 3. Coverage matrix
@@ -497,3 +509,11 @@ UI); that specific citation-graph check remains open, see §6.
 - [NL2SQL Handbook](https://github.com/HKUSTDial/NL2SQL_Handbook)
 - [BAPPA: Benchmarking Agents, Plans, and Pipelines for Automated Text-to-SQL Generation — arXiv:2511.04153](https://arxiv.org/html/2511.04153)
 - [DCMM-SQL: Automated Data-Centric Pipeline and Multi-Model Collaboration Training for Text-to-SQL — arXiv:2510.23284](https://arxiv.org/pdf/2510.23284)
+- [Angular Steering: Behavior Control via Rotation in Activation Space — NeurIPS 2025](https://proceedings.neurips.cc/paper_files/paper/2025/file/b0223cad0e73b793f31eb6cc41cefceb-Paper-Conference.pdf) · [code](https://github.com/lone17/angular-steering/)
+- [Refusal in Language Models Is Mediated by a Single Direction — arXiv:2406.11717](https://arxiv.org/abs/2406.11717)
+- [Why Do Aligned LLMs Remain Jailbreakable: Refusal-Escape Directions, Operator-Level Sources, and Safety-Utility Trade-off — arXiv:2605.08878](https://arxiv.org/pdf/2605.08878)
+- [Analysing the Safety Pitfalls of Steering Vectors — arXiv:2603.24543](https://arxiv.org/pdf/2603.24543)
+- [AlphaSteer: Learning Refusal Steering with Principled Null-Space Constraint — arXiv:2506.07022](https://arxiv.org/pdf/2506.07022)
+- [SteeringControl: Holistic Evaluation of Alignment Steering in LLMs — arXiv:2509.13450](https://arxiv.org/pdf/2509.13450)
+- [ASRU: Activation Steering Meets Reinforcement Unlearning for Multimodal LLMs — arXiv:2605.15687](https://arxiv.org/html/2605.15687v1)
+- [Activation Reward Models for Few-Shot Model Alignment — arXiv:2507.01368](https://arxiv.org/pdf/2507.01368)

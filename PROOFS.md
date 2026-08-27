@@ -1,6 +1,6 @@
-# Two proofs behind the latent-space argument
+# Three proofs behind the latent-space and steering arguments
 
-This document works through, step by step and assuming no prior background, the two mathematical claims made in conversation about LatentSQL: (1) that a GRPO training step is only guaranteed to be a small, local improvement, and that it becomes exactly zero when a group of sampled rollouts all score the same, and (2) that passing a hidden state directly between reasoning roles can carry strictly more information than writing that same reasoning out as text and having the next role re-read it. Each proof starts from plain definitions and builds up using only algebra and calculus, with every step justified in words. All formulas are written in LaTeX so they render as typeset math in any markdown viewer that supports it (GitHub, VS Code preview, most note apps).
+This document works through, step by step and assuming no prior background, three mathematical claims made in conversation about LatentSQL: (1) that a GRPO training step is only guaranteed to be a small, local improvement, and that it becomes exactly zero when a group of sampled rollouts all score the same; (2) that passing a hidden state directly between reasoning roles can carry strictly more information than writing that same reasoning out as text and having the next role re-read it; and (3) that the Difference-in-Means technique our own `latentsql/steering/caa.py` and the NeurIPS 2025 Angular Steering paper both use to build a steering direction is not an arbitrary heuristic — it is, under a simplifying model, provably the best possible choice, and Angular Steering's rotation of that direction is a genuine, length-preserving rotation. Each proof starts from plain definitions and builds up using only algebra, with every step justified in words. All formulas are written in LaTeX so they render as typeset math in any markdown viewer that supports it (GitHub, VS Code preview, most note apps).
 
 ---
 
@@ -136,6 +136,62 @@ while the latent path transmits up to roughly $7.08$ million bits of raw capacit
 
 ---
 
+## Part 3 — why Difference-in-Means is a principled steering direction, and why Angular Steering's rotation is a genuine rotation
+
+### 3.0 Two more background pieces you need
+
+**Dot product and unit vectors.** For two vectors $a$ and $b$, their dot product $a\cdot b$ is a single number that measures how much they point the same way: it is largest (for fixed lengths) when they point in exactly the same direction, zero when they are perpendicular, and most negative when they point in exactly opposite directions. A unit vector is a vector of length exactly $1$, written $\|w\| = 1$ — it represents a pure *direction*, with no notion of "how big." Projecting a vector $h$ onto a unit direction $w$ means computing $w \cdot h$, a single number telling you how far along that direction $h$ sits.
+
+**The Cauchy-Schwarz inequality.** For any two vectors $a,b$: $|a\cdot b| \leq \|a\|\,\|b\|$, with equality exactly when $a$ and $b$ point along the same line (same direction or exactly opposite). This has a short, complete proof from first principles: for any real number $t$, the vector $a - tb$ has a squared length that can never be negative (a length-squared is always $\geq 0$), so
+$$0 \leq \|a - tb\|^2 = \|a\|^2 - 2t(a\cdot b) + t^2\|b\|^2$$
+This is a quadratic in $t$ that never dips below zero, which is only possible if its discriminant is $\leq 0$:
+$$\big(2(a\cdot b)\big)^2 - 4\|a\|^2\|b\|^2 \leq 0 \quad\Longrightarrow\quad (a\cdot b)^2 \leq \|a\|^2\|b\|^2 \quad\Longrightarrow\quad |a\cdot b| \leq \|a\|\,\|b\|$$
+which is exactly the Cauchy-Schwarz inequality — and tracing back through the steps, equality holds exactly when $a - tb = 0$ for some $t$, i.e. when $a$ and $b$ are parallel.
+
+**Orthogonal matrix.** A matrix $R$ is orthogonal if $R^\top R = I$. Geometrically this means multiplying any vector by $R$ never changes its length — $\|Rh\| = \|h\|$ for every $h$ — which is exactly the defining property of a rotation (or reflection).
+
+### 3.1 The setup: what Difference-in-Means actually computes
+
+Suppose we have activation vectors from two classes — for Angular Steering, "harmful" vs. "harmless" prompts; for `caa.py`, "this is agent X's turn in the debate" vs. everything else. Model class "+" activations as $h = \mu_+ + \varepsilon$, a class mean $\mu_+$ plus random noise $\varepsilon$, and class "−" the same way with mean $\mu_-$ and noise of the same statistical spread. "Same spread in every direction" (isotropic noise) means: for *any* unit direction $w$, the average squared size of the noise once projected onto $w$ is the same fixed number $\sigma^2$, regardless of which direction $w$ you chose — write this as $\mathbb{E}[(w\cdot\varepsilon)^2] = \sigma^2$ for every unit $w$. Difference-in-Means simply computes
+$$d = \mu_+ - \mu_-$$
+the vector between the two class means, then normalizes it to a unit direction $\hat d = d / \|d\|$. The question this section answers: *why this direction, out of every possible direction in a 4096-dimensional space?*
+
+### 3.2 Proof: Difference-in-Means maximizes class separation, under the isotropic-noise model
+
+To judge how good a candidate direction $w$ is at telling the two classes apart, use Fisher's separation score: how far apart the two classes' projected means are, relative to how noisy each class already is along that direction:
+$$J(w) = \frac{\big(w\cdot\mu_+ - w\cdot\mu_-\big)^2}{\text{Var}(w\cdot h)} = \frac{(w\cdot d)^2}{\sigma^2}$$
+using $\text{Var}(w\cdot h) = \sigma^2$ for both classes by the isotropic assumption in 3.1 — note this denominator is the *same number* $\sigma^2$ no matter which unit direction $w$ is chosen, which is the key simplification the isotropic assumption buys us. Since $\sigma^2$ does not depend on $w$, maximizing $J(w)$ over all unit directions $w$ is exactly the same problem as maximizing $(w\cdot d)^2$ alone. By Cauchy-Schwarz (3.0), for any unit vector $w$:
+$$|w\cdot d| \leq \|w\|\,\|d\| = \|d\|$$
+with equality exactly when $w$ is parallel to $d$, i.e. $w = d/\|d\| = \hat d$. So the unit direction that maximizes $(w\cdot d)^2$ — and therefore maximizes the separation score $J(w)$ — is
+$$\boxed{w^\star = \hat d = \frac{\mu_+ - \mu_-}{\|\mu_+ - \mu_-\|}}$$
+exactly the normalized Difference-in-Means direction. Under the isotropic-noise model, this is not a heuristic or a convenient default — it is *provably the single best linear direction*, among every direction in the space, for separating the two classes.
+
+### 3.3 What this proof does not show
+
+The proof leans on one simplifying assumption: that activation noise spreads out equally in every direction (isotropic covariance). Real transformer activations are not isotropic — some directions in the residual stream carry systematically more variance than others, and directions can be correlated with each other. Under a general (non-isotropic) shared covariance $\Sigma$, the truly Fisher-optimal direction becomes $w^\star \propto \Sigma^{-1}(\mu_+-\mu_-)$ — a "whitened" version of Difference-in-Means that down-weights noisy directions — not the raw difference itself. Estimating $\Sigma^{-1}$ reliably for a several-thousand-dimensional residual stream from a small calibration set (a few hundred contrastive examples, as both Angular Steering and `caa.py` use) is itself a hard, often ill-posed problem, which is the likely practical reason both this project's steering module and Angular Steering default to the simpler, lower-variance raw Difference-in-Means rather than attempting to estimate and invert $\Sigma$. Angular Steering's own citation, [Belrose (2023), "Diff-in-means concept editing is worst-case optimal"](https://arxiv.org/abs/2406.11717), makes a stronger and differently-argued claim addressing exactly this gap; that argument is not reproduced here, and is cited rather than re-derived.
+
+### 3.4 Proof that Angular Steering's rotation is a genuine, length-preserving rotation
+
+Angular Steering's core operation, applied to a steering plane $P$ spanned by an orthonormal pair $\{b_1, b_2\}$ (built so that $b_1 = \hat d_{\text{feat}}$, the Difference-in-Means direction itself), is
+$$R^P_\phi = I - (b_1b_1^\top + b_2b_2^\top) + [b_1\ b_2]\,R_\phi\,[b_1\ b_2]^\top, \qquad R_\phi = \begin{bmatrix}\cos\phi & -\sin\phi \\ \sin\phi & \cos\phi\end{bmatrix}$$
+To see why this is a genuine rotation, pick a convenient orthonormal basis for the whole space: $\{b_1, b_2, q_1, q_2, \ldots\}$, where the $q_i$'s span everything orthogonal to both $b_1$ and $b_2$ (this is always possible — extend any two orthonormal vectors to a full orthonormal basis). Any activation $h$ can then be written uniquely as
+$$h = x_1 b_1 + x_2 b_2 + r, \qquad r \text{ orthogonal to both } b_1 \text{ and } b_2$$
+Applying $R^P_\phi$ to $h$: the $I - (b_1b_1^\top+b_2b_2^\top)$ term leaves $r$ completely untouched (since $b_1\cdot r = b_2\cdot r = 0$, that term acts as the identity on $r$ and as zero on the $b_1,b_2$ part), while the $[b_1\ b_2]R_\phi[b_1\ b_2]^\top$ term applies the standard 2D rotation to exactly the $(x_1,x_2)$ coordinates and nothing else. So:
+$$R^P_\phi\,h = (x_1\cos\phi - x_2\sin\phi)\,b_1 + (x_1\sin\phi + x_2\cos\phi)\,b_2 + r$$
+The new in-plane part has squared length $(x_1\cos\phi-x_2\sin\phi)^2 + (x_1\sin\phi+x_2\cos\phi)^2$, which expands (using $\cos^2\phi+\sin^2\phi=1$ and the cross terms cancelling) to exactly $x_1^2+x_2^2$ — the *same* as before rotating. Since $r$ is unchanged and is orthogonal to the in-plane part both before and after, Pythagoras gives
+$$\|R^P_\phi h\|^2 = (x_1^2+x_2^2) + \|r\|^2 = \|h\|^2$$
+for every $h$. So $R^P_\phi$ never changes any vector's length — it is a genuine rotation of the whole space, acting only within the 2D plane $P$ and leaving everything orthogonal to $P$ exactly fixed.
+
+### 3.5 A sketch, not a full proof: why addition and orthogonalization sit inside this family
+
+Angular Steering's paper states (with a full derivation in its Appendix A, which was not read for this document) that plain activation addition and directional ablation/orthogonalization are special cases of the rotation above. The intuition, sketched honestly as a special-case observation rather than a re-derivation of their proof: applying $R^P_\phi$ as a small offset ($\phi$ near $0$) to a vector's in-plane coordinates $(x_1,x_2)$ moves them by an amount approximately proportional to $\phi$ in the direction perpendicular to their current position — resembling the flavor of "add a scaled copy of a direction," which is what activation addition does. And rotating by a quarter turn ($\phi = 90°$) sends $(x_1, x_2) \to (-x_2, x_1)$; in the special case where a vector's in-plane component already sits almost entirely along $b_1$ (small $x_2$), this drives the $b_1$-component toward zero, resembling what directional ablation does (deleting the component along the feature direction). Both observations are limiting-case intuitions consistent with what the paper claims, not an independent re-proof of the general statement.
+
+### 3.6 Connection to `latentsql/steering/caa.py`
+
+`caa.py` implements IMAD §3's difference-in-means agent-subspace extraction — the identical primitive proven optimal (under 3.2's assumption) and used by Angular Steering, applied to a different pair of classes: "this activation came from agent X's turn" vs. "this activation came from anywhere else in the debate," rather than "harmful" vs. "harmless." Sections 3.2-3.3 apply to it directly: the direction it extracts is the provably-best linear separator under isotropic noise, with the same caveat that real per-agent activation covariance is not actually isotropic, so the true optimum would need $\Sigma^{-1}$-whitening this project has not attempted either.
+
+---
+
 ## Plain-English summary
 
-The latent channel is proven, by a real information-theoretic argument, to be able to hold far more information than writing the same reasoning out as text — so the *ceiling* argument for why latent reasoning should beat text-based multi-agent debate on communication fidelity is solid math, not a hand-wave. But whether the training procedure (SFT, DPO, GRPO) actually pushes the model to use that ceiling is a completely separate question with no such guarantee: GRPO's gradient is real and provably points uphill only at the exact instant it is computed, and it collapses to exactly zero whenever the sampled group of attempts all agree on how good they are — which, per this project's own diagnostics, has been happening often enough that the model has not yet been forced to compress its reasoning into the latent space it has available.
+The latent channel is proven, by a real information-theoretic argument, to be able to hold far more information than writing the same reasoning out as text — so the *ceiling* argument for why latent reasoning should beat text-based multi-agent debate on communication fidelity is solid math, not a hand-wave. But whether the training procedure (SFT, DPO, GRPO) actually pushes the model to use that ceiling is a completely separate question with no such guarantee: GRPO's gradient is real and provably points uphill only at the exact instant it is computed, and it collapses to exactly zero whenever the sampled group of attempts all agree on how good they are — which, per this project's own diagnostics, has been happening often enough that the model has not yet been forced to compress its reasoning into the latent space it has available. Separately, the Difference-in-Means direction this project's own steering module and the Angular Steering paper both use is not an arbitrary convention: under a simplifying equal-noise model it is provably the single best linear direction for telling two classes of activations apart, and Angular Steering's rotation of that direction around a fixed 2D plane is a genuine, length-preserving rotation, not a loose metaphor.
