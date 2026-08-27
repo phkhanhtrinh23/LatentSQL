@@ -418,7 +418,17 @@ The first full SFT→GRPO→eval cycle since abandoning the IMAD+LatentMAS combi
 
 ### What would change the picture
 
-The anneal needs roughly 4x the wall-clock already spent to reach its target (`length_limit` → 500, `w_fmt` → 0.05) - the point at which token collapse, if it happens at all, would actually show up. A "latent SFT" checkpoint was also built in parallel this run (57/63 traces, `outputs/latent_sft_probe/latent_sft` - see the worked-example discussion in this session) as a candidate starting point for a *second* attempt at the latent-mode combination, now that it has been given a worked example of succeeding in that exact conditioning; it has not yet been evaluated.
+The anneal needs roughly 4x the wall-clock already spent to reach its target (`length_limit` → 500, `w_fmt` → 0.05) - the point at which token collapse, if it happens at all, would actually show up.
+
+### The latent-SFT checkpoint, evaluated: a different failure, not a fix
+
+A "latent SFT" checkpoint was built in parallel with this run (57/63 traces, `outputs/latent_sft_probe/latent_sft`, one record per fresh subprocess chained together - see the worked-example discussion in this session) as a candidate fix for §5c's 0% collapse. Evaluated on the same n = 90 latent-mode protocol: **still EX = 0.00%** (0% BIRD, 0% Spider) - but the *shape* of the failure changed completely, and instructively.
+
+`outputs/arm_a/eval/preds_latent.jsonl` (no worked example, §5c): 15 unique outputs across 90 questions, every completion hit the 2048-token cap, content unrelated to any SQL task (quiz questions about ages, pedestrians). `outputs/latent_sft_probe/eval/preds_latent.jsonl` (with the worked example): **average completion length dropped to 38.9 tokens** (well under the 400-token cap - the model now reliably terminates cleanly at `<|consensus|>...```sql...```", instead of degenerating into an endless loop), average latency 4.82s (vs 39.5s for the text-mode Run 5 checkpoint). Format-wise, the worked example clearly worked: the model now knows *how* to close out a latent-primed generation.
+
+But **81 of 90 questions produced the exact same output** (`SELECT DISTINCT T1.name FROM station AS T1 JOIN station AS T2 ON T1.id = T2.id - 1 WHERE T1.name != T2.name`), and the remaining 9 a one-token variant of it - **2 unique completions across 90 completely different questions and schemas.** This is not the OOD collapse from §5c (which produced unrelated garbage); this is textbook catastrophic overfitting. The mechanism is visible in how the checkpoint was built: 57 sequential single-example gradient updates, `grad_accum=1`, `lr=1e-5`, no batching to average out any one example's influence - so whichever example(s) landed late in the chain with a strong gradient dominated the weights, and the model memorized one answer rather than learning to condition on the actual per-question input.
+
+**Net read:** the worked-example fix solved the problem it was built to solve - the model no longer produces incoherent, never-terminating output after a latent-primed prefix - but the *training procedure* used to build this particular checkpoint (57 uncontrolled single-example updates) was too aggressive and overfit hard. The fix for that is mechanical, not conceptual: batch multiple records per optimizer step (rather than one fresh process per record with an immediate update each time) so gradients average across examples the way ordinary SFT does. That checkpoint has not yet been built.
 
 ---
 
