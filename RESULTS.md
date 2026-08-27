@@ -397,6 +397,31 @@ Code-level check: `LatentReasoner.build_prefix` (what GRPO trains through) and `
 
 ---
 
+## 5d. Run 5 — pure text-mode IMAD + speculative decoding (post-pivot, complete)
+
+The first full SFT→GRPO→eval cycle since abandoning the IMAD+LatentMAS combination (§5c). Config `configs/imad_boost.yaml`: text-mode GRPO (`latent_rollouts: false`, matched to SFT's actual training regime - the fix for §5c's root cause), speculative decoding (k=3), the 4-system panel with `rescue_correct_agent: true` (63 kept traces, not 48).
+
+**GRPO**: timed out at its 10h cap after **62 of 252 planned steps** - **34% dead** (21/62), **66% live**, by a wide margin the healthiest gradient behaviour recorded in this project (every prior text-mode run was 44-56% dead; every latent-mode run was 97-100% dead). The anneal only got ~25% of the way through its schedule: `w_fmt` 1.0 → 0.765 (target 0.05), `length_limit` 3600 → 2834 (target 500).
+
+**Eval, n = 90 (30 BIRD + 60 Spider)**: `student mix n=90 EX=53.33% VES=- tok=2535.8 out=1216.3 39.50s [bird: 23.33% (n=30) spider: 68.33% (n=60)]`.
+
+### Reading this against the two tests that matter (§0)
+
+| | EX | output tokens | verdict |
+|---|---:|---:|---|
+| this run (SFT+GRPO, 62/252 steps) | **53.33%** | 1216.3 | |
+| **Test A** reference - SFT-only (run 2, different corpus) | 52.22% | 1242 | tokens essentially flat (1242 → 1216, -2%) - **internalisation still not demonstrated**, consistent with the anneal being only 25% complete |
+| **Test B** bar - CHESS @ 3B | 48.89% | 1009 | EX clears the bar (+4.44) but **loses on tokens** (1216 vs 1009) - the exact same half-passed pattern every prior run has shown |
+| DAIL-SQL (best baseline) | 60.00% | 326 | still well behind on both axes |
+
+**This is the first non-catastrophic result since the pivot** - EX is a real, plausible number (not 0%, not saturated), and it lands almost exactly where the old SFT-only reference did, which is the expected outcome for a GRPO run that only completed a quarter of its compression curriculum: capability held, compression barely started. Neither test is newly passed by this run; what changed is that the pipeline is demonstrably healthy again (66% live gradient, real EX, real per-example variance) rather than broken (§5c's 0% collapse).
+
+### What would change the picture
+
+The anneal needs roughly 4x the wall-clock already spent to reach its target (`length_limit` → 500, `w_fmt` → 0.05) - the point at which token collapse, if it happens at all, would actually show up. A "latent SFT" checkpoint was also built in parallel this run (57/63 traces, `outputs/latent_sft_probe/latent_sft` - see the worked-example discussion in this session) as a candidate starting point for a *second* attempt at the latent-mode combination, now that it has been given a worked example of succeeding in that exact conditioning; it has not yet been evaluated.
+
+---
+
 ## 6. What these numbers do not show
 
 1. **Nothing is statistically separable.** n = 24 gives ~±19-point intervals; every method's interval overlaps every other's.
