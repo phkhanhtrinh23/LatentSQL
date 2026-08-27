@@ -670,22 +670,21 @@ not a budget failure.
 ## 11e. A full worked example — real inference output, end to end
 
 Everything below is copied verbatim from an actual completed run, not written
-for illustration. Source: `outputs/pilot2/eval_student/preds_student.jsonl`,
-record `qid: spider_dev_164`, checkpoint `outputs/pilot2/grpo` (the "Ours,
-SFT + GRPO" row in [§11d](#11d-pilot-run-2---the-spider-fix-and-the-first-sign-grpo-works)
-and in `RESULTS.md` §2.1, 50.00% EX, n = 24) - the currently-training
-`imad_boost` run (see `RESULTS.md` §5c) has not reached eval yet, so this is
-the most recent *completed* trained-and-evaluated checkpoint, and it uses the
-same architecture `imad_boost` is a deeper version of: plain autoregressive
-text generation, no latent step (that combination was tried later and shelved
-- see `RESULTS.md` §5c).
+for illustration. Source: `outputs/imad_boost/eval/preds_student.jsonl`,
+record `qid: spider_dev_430`, checkpoint `outputs/imad_boost/grpo` (**Run 5**,
+`RESULTS.md` §5d - text-mode LatentSQL + speculative decoding, 62/252 GRPO
+steps, 53.33% EX on n = 90). Note: speculative decoding accelerated the
+*rollout generation during GRPO training* for this checkpoint; the eval run
+that produced this transcript used plain, unaccelerated `model.generate()`
+- see [§8](#8-stage-2--grpo-internalisation-imad-23) for where speculative
+decoding actually sits in the pipeline.
 
 ### What actually happens at inference (recap)
 
 Per the step-by-step explanation given during this project's development: the
-question + schema are rendered into one prompt, tokenized once, and then the
-model decodes **token by token, autoregressively** - a forward pass produces
-logits, one token is picked (greedy at eval time, `temperature: 0.0`),
+question + schema are rendered into one prompt, tokenized once, and then
+LatentSQL decodes **token by token, autoregressively** - a forward pass
+produces logits, one token is picked (greedy at eval time, `temperature: 0.0`),
 appended, and the cycle repeats until an end token or the length cap. Nothing
 below is templated or hand-assembled; it is the literal sequence of tokens the
 trained weights produced, one at a time, in that loop.
@@ -694,149 +693,144 @@ trained weights produced, one at a time, in that loop.
 
 | | |
 |---|---|
-| Dataset | Spider dev, db `car_1` |
-| Question | *"What is the number of carsw ith over 6 cylinders?"* (typo in the original benchmark question, kept as-is) |
-| Gold SQL | `SELECT COUNT(*) FROM CARS_DATA WHERE Cylinders  >  6;` |
-| Prompt tokens | 694 |
+| Dataset | Spider dev, db `wta_1` |
+| Question | *"How many players are there?"* |
+| Gold SQL | `SELECT count(*) FROM players` |
+| Prompt tokens | 1,232 |
 
-### The full raw output (every token the model generated - the "thinking text")
+### The full raw output (every token LatentSQL generated - the "thinking text")
 
-<div style="background-color: #e6f7ff; padding: 15px; border-left: 5px solid #1890ff; border-radius: 4px;">
 ```text
-
 <|schema_link|>
-Tables: cars_data
-Columns: cars_data.Cylinders
-Conditions: cars_data.Cylinders > 6
+Tables: players
+Columns: players.player_id
+Conditions: none
+Values: none
 <|/schema_link|>
 <|classify|> EASY <|/classify|>
 <|round 1|>
 <|agent din_sql|>
-1. The relevant table is `cars_data`.
-2. The required columns are `Cylinders`.
-3. The condition is `Cylinders > 6`.
+1. The table `players` holds the requested information.
+2. Scan the `players` table to count the number of rows.
+3. Return the count as the result.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent dail_sql|>
-This question asks for the count of cars with more than 6 cylinders, which can be directly queried from the `cars_data` table.
+This question is asking for the total number of records in the `players` table.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent chess|>
-1. The relevant table is `cars_data`.
-2. The required columns are `Cylinders`.
-3. The condition is `Cylinders > 6`.
+1. The table `players` holds the requested information.
+2. Scan the `players` table to count the number of rows.
+3. Return the count as the result.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent chase_sql|>
 DIVIDE:
-1. Find the number of cars with more than 6 cylinders.
+1. Count the number of players.
 
 CONQUER:
-1. SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+1. SELECT COUNT(*) FROM players
 
 ASSEMBLE:
 
 OPTIMIZE:
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|/round|>
 <|round 2|>
 <|agent din_sql|>
 My initial query was correct and produced the right result. No changes are needed.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent dail_sql|>
 My initial query was correct and produced the right result. No changes are needed.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent chess|>
 My initial query was correct and produced the right result. No changes are needed.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|agent chase_sql|>
 My initial query was correct and produced the right result. No changes are needed.
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|exec|> COUNT(*)
-(10,) <|/exec|>
+(100000,) <|/exec|>
 <|/agent|>
 <|/round|>
 <|consensus|>
 ```sql
-SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6
+SELECT COUNT(*) FROM players
 ```
 <|/consensus|>
 <|endofdebate|>
-</div>
-
+```
 
 ### Extraction, execution, and the verdict
 
 | | |
 |---|---|
-| Extracted SQL (`extract_final_sql`, pulls the last fenced block after `<\|consensus\|>`) | `SELECT COUNT(*) FROM cars_data WHERE Cylinders > 6` |
-| Executed against `car_1.sqlite` | `(10,)` |
-| Gold executed | `(10,)` |
-| **EX verdict** | **correct** (row sets match; `cars_data`/`CARS_DATA` differ only in identifier case, which SQLite ignores) |
-| Completion tokens | 712 |
-| Latency | 25.03 s |
+| Extracted SQL (`extract_final_sql`, pulls the last fenced block after `<\|consensus\|>`) | `SELECT COUNT(*) FROM players` |
+| Executed against `wta_1.sqlite` | `(100000,)` |
+| Gold executed | `(100000,)` |
+| **EX verdict** | **correct** |
+| Completion tokens | 645 |
+| Latency | 20.89 s |
 
 ### Analysis
 
-**What this demonstrates working.** The single SFT+GRPO checkpoint faithfully
+**What this demonstrates working.** The Run 5 checkpoint faithfully
 reproduces all four teacher systems' *distinct reasoning styles* from one set
 of weights: DIN-SQL's and CHESS's numbered decomposition, DAIL-SQL's short
 direct justification, and CHASE-SQL's DIVIDE/CONQUER/ASSEMBLE/OPTIMIZE
 framework are all present, in the correct order, with no cross-contamination
 between agents' voices. All four independently reach the same correct query
 in round 1; round 2 has every agent explicitly self-critique and confirm "no
-changes are needed" rather than skip the step - the model learned the
+changes are needed" rather than skip the step - LatentSQL learned the
 debate's *shape*, not just its final answer. The `<|consensus|>` block and
 `<|endofdebate|>` marker both fire cleanly, so the extractor did not need to
-fall back to scraping a mid-debate query here. It is also robust to the typo
-in the source question ("carsw ith") without any special handling.
+fall back to scraping a mid-debate query here.
 
-**What this demonstrates NOT working - internalisation.** This is a two-line
-`COUNT(*) ... WHERE` query that a single forward pass could answer directly,
-yet the model still writes a full two-round, four-agent, 712-token transcript
-to get there - the exact failure mode `RESULTS.md` §0.1 and §5.2 document:
-**EX holds, but output tokens never collapse.** A genuinely internalised
-model would emit something close to the extracted SQL alone (a handful of
-tokens) instead of re-deriving and re-confirming it eight times. Cost-wise,
-per `RESULTS.md` §3.1, this 712-token/25s answer is *more* output and *more*
-latency than the explicit multi-agent baselines it is supposed to be replacing
-for hard questions - the savings this method claims come from the *prompt*
-side (one prompt vs. several), not the generation side, until compression
-actually starts working.
+**What this demonstrates NOT working - internalisation.** This is a one-line
+`COUNT(*)` query that a single forward pass could answer directly, yet the
+model still writes a full two-round, four-agent, 645-token transcript to get
+there - the exact failure mode `RESULTS.md` §0.1 and §5.2 document: **EX
+holds, but output tokens never collapse.** A genuinely internalised LatentSQL
+would emit something close to the extracted SQL alone (a handful of tokens)
+instead of re-deriving and re-confirming it eight times. This checkpoint's
+compression anneal had only completed ~25% of its schedule when the 10-hour
+training window ran out (`RESULTS.md` §5d), which is the direct, measured
+reason the collapse has not happened yet - not evidence it cannot happen.
 
 ---
 
