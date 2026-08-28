@@ -699,8 +699,8 @@ trained weights produced, one at a time, in that loop.
 | Prompt tokens | 1,232 |
 
 ### The full raw output (every token LatentSQL generated - the "thinking text")
-
-```text
+<div class="my-block-box">
+  ```text
 <|schema_link|>
 Tables: players
 Columns: players.player_id
@@ -794,7 +794,7 @@ SELECT COUNT(*) FROM players
 ```
 <|/consensus|>
 <|endofdebate|>
-```
+</div>
 
 ### Extraction, execution, and the verdict
 
