@@ -9,16 +9,48 @@ fixes (see RESULTS.md for the experiment log this pipeline produced).
 ## Stage 0 — Teacher trace generation
 
 **Script**: `scripts/01_build_traces.py`
+**Orchestrator**: `FusionSQL` in `latentsql/mas/orchestrator.py`
 **Config**: `configs/latent_sft_1000.yaml` (or `configs/latent_sft_1000_7b.yaml` for the
 7B student — only `sft.model_name_or_path` differs between the two)
 
-A 4-agent multi-agent debate (DIN-SQL, DAIL-SQL, CHESS, CHASE-SQL), 2 rounds, run by a
-7B teacher (`Qwen/Qwen2.5-7B-Instruct`, 4-bit) over a 50/50 BIRD/Spider question mix
-(`mix.bird: 500`, `mix.spider: 500` in the config — 900 for the teacher, 100 held out
-for eval). Each debate is kept only if it reaches consensus, the consensus SQL executes,
-and it matches the gold answer (`trace.require_consensus`, `require_execution`,
-`require_correct`); a rescue rule (`rescue_correct_agent`) salvages a trace if one agent
-was individually correct even without full consensus.
+The teacher is not a re-run of any single paper's system — `FusionSQL` fuses the
+component each source system is strongest on. It has **five stages**, only one of which
+(the debate itself) becomes part of the latent-reasoning curriculum — see the next
+section for exactly which.
+
+1. **Context building** (`FusionSQL._build_context` + `solve`, stage 1 in the code):
+   - `InformationRetriever` (CHESS-style value retrieval: LSH + edit distance over
+     column values) — runs only if `mas.use_value_retrieval` (on in our configs).
+   - `SchemaLinker` (DIN-SQL-style schema linking, narrowed by the CHESS Schema
+     Selector) — always runs.
+   - `QueryClassifier` (DIN-SQL's easy / non-nested / nested difficulty split) — runs
+     only if `mas.use_classifier` (on in our configs).
+   - These populate `trace.schema_prompt`, `trace.schema_links`, `trace.value_hints`,
+     `trace.difficulty_class` — all of which end up baked into the **student's plain
+     prompt text** (schema + value hints), not into any latent role.
+2. **Few-shot example selection**: DAIL-SQL's masked-similarity in-context example
+   selection (`select_dail_examples`), picking `mas.dail_shots` examples for the
+   DAIL-SQL panellist specifically.
+3. **The debate** (`mas.rounds` rounds, `mas.agents` panel — see next section): each
+   panellist proposes a candidate SQL in round 0, then revises given its own and the
+   other panellists' previous turns in later rounds. `QueryFixer` (CHASE-SQL / CHESS
+   revise-style self-correction) is applied to every turn if `mas.use_fixer`. The debate
+   can early-exit once every agent already agrees and has run at least 2 rounds.
+4. **Selection**: `Selector` — either the CHESS Unit Tester (`mas.selector:
+   unit_test`, the default, executes `mas.n_unit_tests` generated tests against each
+   candidate) or CHASE-SQL's pairwise comparison — picks the final `consensus_sql` from
+   the last round's candidates.
+5. **Labeling**: the consensus SQL (and every individual turn) is checked against the
+   real gold SQL by execution accuracy, *after* the fact — the agents themselves never
+   see the gold answer. A trace is kept only if it reached consensus, that consensus
+   executes, and it's correct (`trace.require_consensus`, `require_execution`,
+   `require_correct`); `trace.rescue_correct_agent` salvages a trace where one agent was
+   individually correct even without full-panel consensus.
+
+Run over a 50/50 BIRD/Spider question mix (`mix.bird: 500`, `mix.spider: 500` — 900 for
+the teacher, 100 held out for eval), with a 7B teacher LLM (`Qwen/Qwen2.5-7B-Instruct`,
+4-bit — a general instruct model, used only to *run* the agents above, not to be
+internalized itself).
 
 Output: `outputs/latent_sft_1000/traces/traces.jsonl` (full transcripts, 677 kept of 900
 attempted — 78.11% teacher execution accuracy) and `.../traces/sft.jsonl` (flattened
@@ -56,8 +88,41 @@ the starting point for Stage 1.5.
 **Training loop**: `train_latent_sft()` in `latentsql/distill/latent_sft.py`
 **Script**: `scripts/02c_latent_sft.py`
 
-This is the actual "debate in continuous space" step. For each of the 8 non-consensus
-debate roles (4 agents × 2 rounds), the student either:
+This is the actual "debate in continuous space" step.
+
+### Which pipeline steps actually become latent "roles" — and which don't
+
+Of the five teacher-pipeline stages above, **only stage 3 (the debate) is represented
+as latent roles.** Concretely, `cfg.latent.roles` is:
+
+```
+[din_sql, dail_sql, chess, chase_sql, din_sql, dail_sql, chess, chase_sql, consensus]
+```
+
+— the same 4-agent panel appearing twice (once per debate round, `mas.rounds: 2`),
+followed by one final `consensus` marker. That is **8 latent-trainable roles + 1 fixed
+consensus tag**, nothing more.
+
+Everything else from Stage 0 is **not** a latent role:
+
+- `InformationRetriever`, `SchemaLinker`, `QueryClassifier` (context building) and the
+  DAIL-SQL few-shot selection never run at latent-training time at all — their output
+  (`schema_prompt`, `value_hints`) was already baked into the **plain prompt text** the
+  student reads at the very start (`student_prompt()` in `latentsql/mas/prompts.py`),
+  before any latent step begins. The student sees them as ordinary tokens every time,
+  in every curriculum stage, latent or not.
+- `QueryFixer` and `Selector` never appear to the student as a role either — they only
+  shaped which candidate SQL each debate turn's *text* ended up containing (a fixer
+  correction, or which candidate the selector eventually chose as `consensus_sql`) when
+  the teacher trace was generated. There is no separate "fixer role" or "selector role"
+  in `cfg.latent.roles`; the fixer/selector's effect is already absorbed into the debate
+  turns' own rendered text.
+
+So "how many steps, and which ones, for latent reasoning" — **8 debate-panel turns (4
+agents × 2 rounds) plus 1 consensus marker, and nothing from context building,
+retrieval, classification, fixing, or selection.**
+
+For each of those 8 roles, the student either:
 
 - **runs latent** — appends the role's tag, then auto-regresses `latent_steps` times on
   hidden states, emitting no tokens (LatentMAS-style: the hidden state is fed back as
