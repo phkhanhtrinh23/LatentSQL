@@ -248,7 +248,7 @@ class GRPOTrainer:
         model.eval()
         rollouts: List[Rollout] = []
         with torch.no_grad():
-            past0, attn0, logits0 = self.latent.build_prefix(task.system, task.prompt)
+            past0, attn0, logits0, _aux0, _txt0 = self.latent.build_prefix(task.system, task.prompt)
             if self.spec is not None:
                 dp = tok(task.prompt, return_tensors="pt",
                          add_special_tokens=False)["input_ids"][0].tolist()
@@ -339,7 +339,7 @@ class GRPOTrainer:
         for r in active:
             # rebuild the latent prefix WITH grad: this is the path the policy
             # is actually optimised through
-            past, attn, first_logits = self.latent.build_prefix(
+            past, attn, first_logits, _aux, _txt = self.latent.build_prefix(
                 task.system, task.prompt, grad=True
             )
             ids = torch.tensor([r.completion_ids], device=self.bundle.device)

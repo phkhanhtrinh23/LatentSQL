@@ -578,7 +578,7 @@ def tier2(cfg, work: str, state: Dict[str, Any], model_path: str) -> None:
                     embeds = torch.cat([embeds, tag_e], dim=1) if past is None else tag_e
                     if role == "consensus":
                         break
-                    embeds, past, attn, _ = reasoner._latent_steps(
+                    embeds, past, attn, _, _aux = reasoner._latent_steps(
                         embeds, past, attn, cfg.latent.latent_steps,
                         checkpoint=checkpoint_flag,
                     )

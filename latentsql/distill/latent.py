@@ -133,7 +133,7 @@ class LatentReasoner:
 
     # -- low level --------------------------------------------------------
     def _latent_steps(self, inputs_embeds, past_key_values, attention_mask, m: int,
-                      checkpoint: bool = False):
+                      checkpoint: bool = False, aux_target_ids=None):
         """Auto-regress ``m`` times on hidden states (LatentMAS 3.1).
 
         ``checkpoint=True`` wraps the whole ``m``-step block in
@@ -169,18 +169,40 @@ class LatentReasoner:
         Verified empirically in ``tests/test_core.py`` by comparing LoRA
         gradients computed with and without this checkpointing on the same
         rollout: they agree to float32 tolerance.
+
+        ``aux_target_ids`` (optional token-id sequence): a "decode-and-compare"
+        auxiliary loss - at latent step ``t`` (``t < len(aux_target_ids)``),
+        the model's own LM head has already produced ``out.logits`` for that
+        step's hidden state as a side effect of the forward call above (no
+        extra matmul against the vocab needed); this adds
+        ``-log p(aux_target_ids[t])`` under that distribution to an
+        accumulated aux loss. The intent (see RESULTS.md / this session's
+        discussion): nothing currently forces a latent slot to correspond to
+        what the teacher's actual agent turn would say at that position -
+        this is a lightweight way to add that pressure without a second
+        teacher forward pass, by reusing logits the step already computes.
+        ``aux_target_ids`` is truncated to the first ``m`` tokens elsewhere
+        (by the caller) since there are only ``m`` steps to compare against.
+        Returns 0.0 (as a tensor) when ``aux_target_ids`` is ``None``/empty,
+        so the checkpointed function's output structure - and therefore what
+        non-reentrant checkpoint recomputes - stays identical whether or not
+        the aux loss is active for a given call.
         """
         import torch
+        import torch.nn.functional as F
 
         model = self.bundle.model
         mask_dtype, mask_device = attention_mask.dtype, attention_mask.device
         start_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
+        n_aux = len(aux_target_ids) if aux_target_ids else 0
 
         def _run(embeds):
             if past_key_values is not None:
                 past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
             e, hidden, length = embeds, None, start_len
-            for _ in range(max(0, m)):
+            aux_terms = []
+            next_logits = None
+            for t in range(max(0, m)):
                 attn = torch.ones(1, length + 1, dtype=mask_dtype, device=mask_device)
                 out = model(
                     inputs_embeds=e,
@@ -191,22 +213,30 @@ class LatentReasoner:
                 )
                 length += 1
                 hidden = out.hidden_states[-1][:, -1:, :]  # last-layer, last position
+                next_logits = out.logits[:, -1, :]         # this step's own next-token prediction
+                if t < n_aux:
+                    step_logits = next_logits.float()  # single position - cheap upcast
+                    step_logp = F.log_softmax(step_logits, dim=-1)[0, aux_target_ids[t]]
+                    aux_terms.append(-step_logp)
                 e = self.align(hidden)                     # back into input space
-            return e
+            aux_loss = (torch.stack(aux_terms).mean() if aux_terms
+                       else torch.zeros((), device=embeds.device, dtype=torch.float32))
+            return e, aux_loss, next_logits
 
         if checkpoint and m > 0 and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint as _ckpt
 
-            new_embeds = _ckpt(_run, inputs_embeds, use_reentrant=False)
+            new_embeds, aux_loss, next_logits = _ckpt(_run, inputs_embeds, use_reentrant=False)
         else:
-            new_embeds = _run(inputs_embeds)
+            new_embeds, aux_loss, next_logits = _run(inputs_embeds)
 
         new_len = start_len + max(0, m)
         new_attention_mask = torch.ones(1, new_len, dtype=mask_dtype, device=mask_device)
-        # `hidden` (pre-alignment) is only used by callers for inspection/logging,
-        # never for gradient purposes - re-derive it plainly, uncheckpointed,
-        # rather than threading a second return value through the checkpoint
-        return new_embeds, past_key_values, new_attention_mask, None
+        # `next_logits` (this role's own last step's next-token prediction) lets
+        # a caller bridge a following supervised-text role's first token back to
+        # whatever this latent role actually predicted - see build_prefix's
+        # COCONUT-fidelity text-generation supervision.
+        return new_embeds, past_key_values, new_attention_mask, next_logits, aux_loss
 
     def _append_text(self, text: str, past_key_values, attention_mask):
         import torch
@@ -222,8 +252,107 @@ class LatentReasoner:
         )
         return embeds, past_key_values, attention_mask
 
+    def _text_steps(self, pieces, past_key_values, attention_mask, checkpoint=False,
+                    prev_logits=None, supervise=False):
+        """Forward a consecutive run of explicit-text (curriculum) roles'
+        real text through the model, extending the shared KV cache.
+
+        Mirrors ``_latent_steps``'s shape exactly: ONE checkpoint wraps an
+        internal loop over multiple ``model()`` calls, rather than one
+        checkpoint per role. An earlier version checkpointed each role
+        separately while sharing one mutating cache object across those
+        independent checkpoint calls; backward could then recompute one
+        role while the cache still carried a LATER role's extension
+        (``CheckpointError``: recomputed KV shapes came out longer than
+        the ones saved during the real forward). Grouping the whole run
+        into a single checkpoint keeps its cache mutation inside one
+        recompute - the same guarantee ``_latent_steps`` already relies on
+        for its own internal ``m``-step loop.
+
+        ``past_key_values=None`` is replaced with a fresh empty
+        ``DynamicCache`` up front (rather than left ``None``) so both the
+        real call and the backward-time recompute close over the exact
+        same cache object - no separate path is needed for "this is the
+        very first forward in the whole prefix".
+
+        ``supervise=True`` adds a real next-token generation loss over
+        every piece's own tokens - COCONUT-fidelity fix: the reference
+        method keeps training the model to actually PRODUCE whatever
+        reasoning text has not yet been replaced by latent thoughts, not
+        just read it as conditioning. Two components, both from logits the
+        forward pass already computes (no extra matmul):
+          * within a piece, position i predicts token i+1 (ordinary
+            teacher-forced LM loss over that piece's own span);
+          * a piece's OWN first token is bridged from ``prev_logits`` (this
+            role run's own prediction before its first piece) or, from the
+            second piece onward, the previous piece's own last-position
+            logits - chained via ``cur_logits`` below. The very first
+            piece of the very first (fully-fresh-cache) call has no
+            ``prev_logits`` available and simply skips that one bridge
+            term, since there is nothing upstream to bridge from.
+        """
+        import torch
+        import torch.nn.functional as F
+        from transformers import DynamicCache
+
+        model, tok = self.bundle.model, self.bundle.tokenizer
+        mask_dtype, mask_device = attention_mask.dtype, attention_mask.device
+        if past_key_values is None:
+            past_key_values = DynamicCache()
+        start_len = int(past_key_values.get_seq_length())
+        piece_ids = [
+            tok(piece, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+            for piece in pieces
+        ]
+
+        def _run(dummy):
+            past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
+            length = start_len
+            last_hidden = dummy
+            gen_terms = []
+            cur_logits = prev_logits
+            for ids in piece_ids:
+                ids_t = torch.tensor([ids], device=self.bundle.device)
+                embeds = model.get_input_embeddings()(ids_t)
+                length += len(ids)
+                attn = torch.ones(1, length, dtype=mask_dtype, device=mask_device)
+                out = model(inputs_embeds=embeds, past_key_values=past_key_values,
+                           attention_mask=attn, use_cache=True, output_hidden_states=True)
+                last_hidden = out.hidden_states[-1]
+                if supervise and ids:
+                    if cur_logits is not None:
+                        lp0 = F.log_softmax(cur_logits.float(), dim=-1)[0, ids[0]]
+                        gen_terms.append(-lp0)
+                    if len(ids) > 1:
+                        step_logits = out.logits[0, :-1, :].float()
+                        step_logp = F.log_softmax(step_logits, dim=-1)
+                        tgt = torch.tensor(ids[1:], device=step_logits.device)
+                        lp = step_logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                        gen_terms.append(-lp.mean())
+                    cur_logits = out.logits[:, -1, :]
+            gen_loss = (torch.stack(gen_terms).mean() if gen_terms
+                       else torch.zeros((), device=dummy.device, dtype=torch.float32))
+            return last_hidden, gen_loss
+
+        dummy = torch.zeros(1, 1, model.config.hidden_size, device=self.bundle.device,
+                            dtype=next(model.parameters()).dtype)
+        if checkpoint and pieces and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            last_hidden, gen_loss = _ckpt(_run, dummy, use_reentrant=False)
+        else:
+            last_hidden, gen_loss = _run(dummy)
+
+        total_len = start_len + sum(len(ids) for ids in piece_ids)
+        new_attention_mask = torch.ones(1, total_len, dtype=mask_dtype, device=mask_device)
+        return past_key_values, new_attention_mask, last_hidden, gen_loss
+
     # -- public -----------------------------------------------------------
-    def build_prefix(self, system: str, prompt: str, grad: bool = False):
+    def build_prefix(self, system: str, prompt: str, grad: bool = False,
+                     role_turns: Optional[Sequence[Optional[str]]] = None,
+                     n_latent_roles: Optional[int] = None,
+                     decode_compare: bool = False,
+                     supervise_text: bool = False):
         """Run the role tags and their latent steps; return the KV prefix.
 
         This is the whole "debate in continuous space" step: for each role we
@@ -238,13 +367,58 @@ class LatentReasoner:
         than training-free: LatentMAS applies these mechanisms at inference to
         a frozen model, and we optimise in the same regime we infer in.
 
-        Returns ``(past_key_values, attention_mask, next_token_logits)`` where
-        the logits predict the first decoded token.
+        ``role_turns`` / ``n_latent_roles`` implement a COCONUT-style
+        curriculum (Hao et al. 2024, "Training Large Language Models to
+        Reason in a Continuous Latent Space", credited in COCONUT sec. 2 to
+        Deng et al. 2023/2024): ``role_turns[i]`` is the teacher's actual
+        rendered text for ``cfg.roles[i]`` (``AgentTurn.render()``, tag
+        included), or ``None``. The FIRST ``n_latent_roles`` non-consensus
+        roles run as latent steps; later roles are fed their real text
+        instead (teacher-forced, ordinary token embeddings) - matching the
+        reference implementation's own direction (it replaces reasoning
+        steps with latent thoughts front-to-back, earliest steps first, not
+        back-to-front as an earlier version of this function did). A
+        curriculum ramps ``n_latent_roles`` from 0 (pure text, known to
+        train fine) up to ``len(cfg.roles) - 1`` (fully latent, the regime
+        GRPO/eval actually need) instead of demanding the full jump on step
+        one - which is what produced the OOD collapse in RESULTS.md 5c.
+        Both args default to ``None``, which reproduces the original
+        fully-latent behaviour exactly (GRPO/eval are unaffected).
+
+        ``decode_compare`` (default ``False``, so GRPO/eval are unaffected):
+        adds a "decode-and-compare" auxiliary loss on every latent role that
+        still has real teacher text available (``role_turns[idx]`` not
+        ``None``) - nothing else currently forces a latent slot to
+        correspond to what that agent would actually have said, since a
+        latent role's ``role_turns[idx]`` is otherwise simply discarded (only
+        its bare tag is used to seed the m latent steps). See
+        ``_latent_steps``'s docstring for the mechanism: reuses each latent
+        step's own already-computed ``out.logits`` (no extra teacher forward
+        pass, no extra vocab matmul) to cross-entropy against the first
+        ``latent_steps`` tokens of that role's real turn.
+
+        ``supervise_text`` (default ``False``): COCONUT-fidelity fix - the
+        reference implementation's loss is not restricted to the final
+        answer, it covers every token from wherever latent leaves off
+        through the answer, so the model keeps being trained to actually
+        PRODUCE whatever reasoning text has not yet been replaced by latent
+        thoughts, not just read it as conditioning (which is all the
+        explicit-text roles were before this flag existed). See
+        ``_text_steps``'s docstring for the mechanism.
+
+        Returns ``(past_key_values, attention_mask, next_token_logits,
+        aux_loss, text_gen_loss)`` where the logits predict the first
+        decoded token, ``aux_loss`` is the mean decode-and-compare loss
+        across all latent roles that had real text available, and
+        ``text_gen_loss`` is the mean next-token generation loss across all
+        supervised explicit-text roles (each 0.0 if its flag is off or no
+        role qualified).
         """
         import torch
 
         tok, model = self.bundle.tokenizer, self.bundle.model
         cfg = self.cfg
+        n_roles = len(cfg.roles) - 1  # excludes "consensus"
         chat = render_chat(
             tok,
             [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
@@ -268,31 +442,105 @@ class LatentReasoner:
         ctx = torch.enable_grad() if grad else torch.no_grad()
         try:
           with ctx:
-            for role in cfg.roles:
-                tag = T_CONSENSUS_OPEN if role == "consensus" else agent_tag(role) + "\n"
-                tag_embeds, past, attention_mask = self._append_text(tag, past, attention_mask)
+            # Consecutive explicit-text (curriculum) roles are buffered and
+            # flushed through ONE _text_steps checkpoint (rather than one
+            # checkpoint per role - see _text_steps' docstring for why that
+            # was wrong) right before the next latent/consensus role needs
+            # the cache. When curriculum is off every role is_latent, so
+            # this buffer never fills and the loop is byte-for-byte the
+            # original fully-latent path - GRPO/eval are unaffected.
+            pending_pieces: list = []
+            pending_role_turns: list = []
+            # Always real tensors (never a bare 0.0 float), even when the
+            # corresponding flag is off or no role qualified - callers (e.g.
+            # latent_sft.py) unconditionally call .detach()/.float() on
+            # these return values.
+            aux_loss_total = torch.zeros((), device=self.bundle.device, dtype=torch.float32)
+            text_gen_loss_total = torch.zeros((), device=self.bundle.device, dtype=torch.float32)
+            n_aux_roles = 0
+            n_text_roles = 0
+            last_logits = [None]  # this run's own most recent next-token prediction
+
+            def _flush_pending():
+                nonlocal past, attention_mask, text_gen_loss_total, n_text_roles
+                if not pending_pieces:
+                    return
+                past, attention_mask, _h, gen_loss = self._text_steps(
+                    list(pending_pieces), past, attention_mask, checkpoint=grad,
+                    prev_logits=last_logits[0], supervise=supervise_text,
+                )
+                if supervise_text and any(pending_role_turns):
+                    text_gen_loss_total = text_gen_loss_total + gen_loss
+                    n_text_roles += 1
+                last_logits[0] = None  # consumed; _text_steps' own internal chaining is done
+                pending_pieces.clear()
+                pending_role_turns.clear()
+
+            for idx, role in enumerate(cfg.roles):
+                is_consensus = role == "consensus"
+                # COCONUT replaces reasoning steps with latent thoughts
+                # front-to-back: the FIRST n_latent_roles non-consensus
+                # roles go latent, later ones stay text longest (reversed
+                # from an earlier version of this function, which went
+                # back-to-front).
+                is_latent = is_consensus or n_latent_roles is None or (
+                    idx < n_latent_roles
+                )
+                if is_consensus:
+                    piece = T_CONSENSUS_OPEN
+                elif is_latent or not role_turns or role_turns[idx] is None:
+                    piece = agent_tag(role) + "\n"
+                else:
+                    piece = role_turns[idx]  # teacher's real turn - already tagged
+
+                if not is_latent:
+                    pending_pieces.append(piece)
+                    pending_role_turns.append(role_turns[idx] if role_turns else None)
+                    continue
+
+                _flush_pending()
+                piece_embeds, past, attention_mask = self._append_text(piece, past, attention_mask)
                 inputs_embeds = (
-                    torch.cat([inputs_embeds, tag_embeds], dim=1)
-                    if past is None else tag_embeds
+                    torch.cat([inputs_embeds, piece_embeds], dim=1)
+                    if past is None else piece_embeds
                 )
-                if role == "consensus":
+                if is_consensus:
                     break
-                inputs_embeds, past, attention_mask, _h = self._latent_steps(
+
+                aux_target_ids = None
+                if decode_compare and role_turns and role_turns[idx] is not None:
+                    # Real text was discarded above (only agent_tag(role) was
+                    # used to seed this latent role) - reuse it here as the
+                    # decode-and-compare target instead of throwing it away.
+                    full_ids = tok(role_turns[idx], add_special_tokens=False)["input_ids"]
+                    aux_target_ids = full_ids[: cfg.latent_steps]
+
+                inputs_embeds, past, attention_mask, next_logits, aux_loss = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps,
-                    checkpoint=grad,
+                    checkpoint=grad, aux_target_ids=aux_target_ids,
                 )
+                last_logits[0] = next_logits  # bridges into a later supervised-text role, if any
+                if aux_target_ids:
+                    aux_loss_total = aux_loss_total + aux_loss
+                    n_aux_roles += 1
                 if not cfg.share_working_memory:
                     past = None
                     attention_mask = torch.ones(
                         1, 1, dtype=attention_mask.dtype, device=attention_mask.device
                     )
+                    last_logits[0] = None  # working memory dropped - nothing to bridge from
             out = model(inputs_embeds=inputs_embeds, past_key_values=past,
                         attention_mask=attention_mask, use_cache=True)
         finally:
             if grad and ckpt:
                 model.gradient_checkpointing_enable()
             model.config.use_cache = prev_use_cache
-        return out.past_key_values, attention_mask, out.logits[:, -1, :]
+        if n_aux_roles:
+            aux_loss_total = aux_loss_total / n_aux_roles
+        if n_text_roles:
+            text_gen_loss_total = text_gen_loss_total / n_text_roles
+        return (out.past_key_values, attention_mask, out.logits[:, -1, :],
+                aux_loss_total, text_gen_loss_total)
 
     def generate(
         self,
@@ -328,7 +576,7 @@ class LatentReasoner:
                 )
                 if role == "consensus":
                     break
-                inputs_embeds, past, attention_mask, _h = self._latent_steps(
+                inputs_embeds, past, attention_mask, _h, _aux = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps
                 )
                 n_latent += cfg.latent_steps
