@@ -25,6 +25,8 @@ EVAL_N=${9:-30}
 LR=${10:-1e-4}
 LATENT_STEPS=${11:-12}
 RUNDIR=${12:-outputs/latent_sft_1000/curriculum_chain_batched}
+GPU_FRACTION=${13:-0.72}
+BASE_MODEL=${14:-Qwen/Qwen2.5-Coder-3B-Instruct}
 OUT="$RUNDIR/latent_sft"
 MPLOG="${RUNDIR}_multipass.log"
 : > "$MPLOG"
@@ -35,7 +37,8 @@ for p in $(seq 1 "$N_PASSES"); do
   [ "$p" -gt 1 ] && wipe=0
   echo "=== [$(date +%H:%M:%S)] PASS $p/$N_PASSES starting from $CUR (wipe=$wipe) ===" | tee -a "$MPLOG"
   bash scripts/run_curriculum_chain_batched.sh "$N" "$BATCH_SIZE" 0 "$CUR" "$N_ROLES" \
-    "$DATA" "$CONFIG" "$EVAL_EVERY" "$EVAL_N" "$LR" "$wipe" "$LATENT_STEPS" "$RUNDIR"
+    "$DATA" "$CONFIG" "$EVAL_EVERY" "$EVAL_N" "$LR" "$wipe" "$LATENT_STEPS" "$RUNDIR" \
+    "$GPU_FRACTION" "$BASE_MODEL"
   code=$?
   echo "=== [$(date +%H:%M:%S)] PASS $p/$N_PASSES done, exit code $code ===" | tee -a "$MPLOG"
   if [ $code -ne 0 ]; then

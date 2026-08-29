@@ -49,6 +49,8 @@ LATENT_STEPS=${12:-12}                          # COCONUT's own demonstrated max
                                                  # our 12-per-role x up to 8 roles = 96 at full depth
                                                  # is 16x beyond anything they've shown works.
 RUNDIR=${13:-outputs/latent_sft_1000/curriculum_chain_batched}
+GPU_FRACTION=${14:-0.72}                        # 0.893 ~= 21GB of the 23.508GB card
+BASE_MODEL=${15:-Qwen/Qwen2.5-Coder-3B-Instruct}
 OUT="$RUNDIR/latent_sft"
 OPTIM_STATE="$RUNDIR/optim_state.pt"
 LOG="${RUNDIR}.log"
@@ -68,7 +70,7 @@ for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
   # round(b/(N_BATCHES-1) * N_ROLES), matching train_latent_sft's own frac formula
   n_latent_roles=$(python3 -c "print(round($b/max(1,$N_BATCHES-1)*$N_ROLES))")
   echo "=== [$(date +%H:%M:%S)] batch $b/$((N_BATCHES-1)) (records $offset..$((offset+limit-1))), n_latent_roles=$n_latent_roles, from $CUR ===" | tee -a "$LOG"
-  LATENTSQL_GPU_FRACTION=0.72 LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  LATENTSQL_GPU_FRACTION=$GPU_FRACTION LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
   python3 scripts/02c_latent_sft.py \
     --config "$CONFIG" \
     --data "$DATA" \
@@ -92,12 +94,12 @@ for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
 
   if [ "$EVAL_EVERY" -gt 0 ] && [ $(( (b + 1) % EVAL_EVERY )) -eq 0 ]; then
     echo "=== [$(date +%H:%M:%S)] intermediate eval after batch $b (n=$EVAL_N) ===" | tee -a "$LOG" "$EVAL_LOG"
-    LATENTSQL_GPU_FRACTION=0.72 LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
+    LATENTSQL_GPU_FRACTION=$GPU_FRACTION LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
     python3 scripts/04_eval.py \
       --config "$CONFIG" \
       --methods latent \
       --student "$CUR" \
-      --base Qwen/Qwen2.5-Coder-3B-Instruct \
+      --base "$BASE_MODEL" \
       --limit "$EVAL_N" \
       --out "${EVAL_DIR}/batch_${b}" \
       >> "$EVAL_LOG" 2>&1
