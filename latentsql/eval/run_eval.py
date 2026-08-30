@@ -141,6 +141,7 @@ def eval_student(
                 run = reasoner.generate(
                     sp["system"], sp["user"], max_new_tokens=max_new_tokens,
                     temperature=temperature, n_latent_roles=latent_roles,
+                    spec=spec,
                 )
                 text, n_out = run.text, run.n_decoded_tokens
                 n_in = len(tok(sp["system"] + sp["user"])["input_ids"])
@@ -149,6 +150,8 @@ def eval_student(
                     "latent_roles": latent_roles,
                     "roles": run.roles,
                 }
+                if run.spec is not None:
+                    extra["spec"] = run.spec
             else:
                 chat = render_chat(
                     tok,

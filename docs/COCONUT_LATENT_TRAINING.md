@@ -280,6 +280,17 @@ SQL_READY_TOKENS=16
 LATE_LR=2e-5
 ```
 
+Latent GRPO also now enables a correct-rollout brevity tie-breaker:
+
+```text
+grpo.reward.w_brevity=0.2
+```
+
+Without this term, all-correct rollout groups receive identical reward
+(`1.0` correctness + `0.1` executable SQL) and therefore zero GRPO advantage.
+The brevity term is awarded only to correct rollouts, so it separates saturated
+groups by decoded length without rewarding short wrong answers.
+
 The completed stage-6 run did not use this auxiliary loss. Its logs show
 `sql_ready_loss: None`, confirming it was pre-patch.
 
@@ -370,3 +381,302 @@ The patched code was syntax-checked with:
 python3 -m py_compile scripts/02c_latent_sft.py latentsql/distill/latent_sft.py
 bash -n scripts/run_chess_coconut_sql_direct.sh
 ```
+
+```
+The equal reward is expected from the current reward design, not a speculative-decoding bug.
+
+What happened in the larger run:
+
+step 1: reward_mean=1.1, r_clip_mean=1.0, reward_std_mean=0.0, adv_nonzero_frac=0.0
+step 2: reward_mean=1.1, r_clip_mean=1.0, reward_std_mean=0.0, adv_nonzero_frac=0.0
+step 3: reward_mean=0.1633, r_clip_mean=0.0, reward_std_mean=0.0315, adv_nonzero_frac=1.0
+
+Why steps 1-2 had identical rewards:
+
+The latent GRPO reward is mostly binary execution correctness:
+      + w_exec_ok * r_exec
+      + w_atomic * r_atomic for wrong rollouts
+      + w_memory * r_memory for wrong rollouts
+      + w_brevity * r_brevity for correct rollouts
+
+Current config has:
+
+w_clip = 1.0
+w_exec_ok = 0.1
+w_brevity = 0.0
+w_fmt = 0.0
+
+So if every rollout in a group is correct and executable, each gets:
+
+1.0 + 0.1 = 1.1
+
+No variance means GRPO advantage is zero:
+
+adv_nonzero_frac = 0.0
+
+So GRPO cannot learn from all-correct groups unless we enable a tie-breaker, e.g. brevity reward.
+```
+## GRPO Eval After The Brevity Run (2026-08-31)
+
+Checkpoint evaluated:
+
+```text
+outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200
+```
+
+This is the stage-6 CHESS-step SQL-direct student after 50 GRPO optimizer steps
+on 50 hard prompts (`max_prompt_chars=1200`, group size 8, brevity reward on,
+`w_fmt=0`), rollouts sampled through a k=3 speculative draft. GRPO training
+details are in `grpo_result.json` next to the adapter.
+
+Both evals below use the same held-out n=90 mix, the same six latent CHESS roles
+plus a decoded consensus, and `--latent-steps 2`.
+
+### Result 1 — greedy decode (the headline number)
+
+```bash
+LATENTSQL_GPU_FRACTION=0.96 \
+LATENTSQL_CPU_THREADS=4 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+python3 scripts/04_eval.py \
+  --config configs/latent_sft_1000_7b_bf16.yaml \
+  --methods latent \
+  --student outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200 \
+  --base Qwen/Qwen2.5-Coder-7B-Instruct \
+  --latent-steps 2 \
+  --latent-role-list information_retriever,schema_linker,query_classifier,candidate_generator,query_fixer,unit_tester,consensus \
+  --latent-roles 6 \
+  --out outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200_eval
+```
+
+| Run | n | EX | bird EX | spider EX | Avg tokens | Avg output tokens | Unparseable |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Full latent after stage 6 (SFT, pre-GRPO) | 90 | 52.22 | 33.33 | 71.11 | 1638.0 | 67.5 | 4 |
+| **After GRPO brevity cap1200** | 90 | **58.89** | **37.78** | **80.00** | 1632.4 | **61.9** | **0** |
+| Δ | | **+6.67** | +4.45 | +8.89 | −5.6 | −5.6 | −4 |
+
+By difficulty: spider-all 80.00 (36/45), bird simple 44.00 (11/25), bird
+moderate 33.33 (5/15), bird challenging 20.00 (1/5).
+
+GRPO raised accuracy while output length *fell* 8%, which is what the brevity
+reward was shaped to do. The gain is concentrated on Spider (+8.89). Two caveats
+worth carrying: the 63.33 figure quoted for the earlier probe was n=30, not
+comparable to this n=90; and GRPO's 50 training prompts were drawn from the same
+pool under the same `max_prompt_chars` filter, so the split is held out but the
+difficulty filtering is shared.
+
+`n_unparseable` went 4 → 0: every one of the 90 generations produced extractable
+SQL, so the latent → `<|consensus|>` → SQL format survived GRPO intact.
+
+### Result 2 — speculative decode, untrained 7B as draft
+
+Same checkpoint, same 90 questions, with the *base* (untrained)
+Qwen2.5-Coder-7B-Instruct as the speculative draft:
+
+```bash
+  ... same as above, plus:
+  --spec-decode \
+  --spec-draft-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --spec-draft-quantization 4bit \
+  --spec-k 3 \
+  --out outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200_eval_spec
+```
+
+| | greedy | speculative (7B draft) |
+|---|---:|---:|
+| EX (n=90) | **58.89** | 57.78 |
+| bird EX | **37.78** | 35.56 |
+| spider EX | 80.00 | 80.00 |
+| Avg output tokens | 61.94 | 61.79 |
+| **Latency / sample** | **2.092 s** | 4.257 s |
+| Total wall-clock | **188.3 s** | 383.1 s |
+| Peak GPU | **15.85 GB** | 21.85 GB |
+| Acceptance length | — | 2.337 |
+| Acceptance rate | — | 0.446 |
+
+**Speculative decoding is 2.03x slower here, not faster.** This is the expected
+outcome for a same-size draft: a 7B drafting for a 7B pays roughly the target's
+own cost per proposed token, so a mean acceptance length of 2.34 cannot buy back
+the draft's forward passes (316.6 s of the 383.1 s total was spent inside the
+sampler). The 4-bit draft quantization, needed to fit two 7B models on a 24 GB
+card, makes the draft slower per token than the bf16 target it is drafting for.
+Speculative decoding pays off with a *small* draft; `--spec-draft-model` still
+defaults to Qwen2.5-Coder-0.5B-Instruct for that reason.
+
+The latent path also gives speculation less to work with than the `student` path
+does: only the decoded SQL is drafted (~62 tokens), never the latent prefix, and
+the draft cannot see the latent thoughts at all — it conditions on the plain
+text prompt, which is why acceptance sits at 0.446.
+
+### On the 1.11-point EX difference
+
+Greedy verification at `eval.temperature: 0.0` is *distributionally* lossless,
+and 86/90 predictions came back byte-identical, 89/90 identical in correctness.
+The four that differ are floating-point, not distributional: verification scores
+k+1 tokens in one batched forward pass, whereas the greedy path runs one token
+per forward, and in bf16 those are not bit-identical. Three of the four diverge
+into an equivalent query (a flipped join order, `"` vs `'` quoting) and score the
+same; one (`bird_dev_565`) degrades into a different query and flips True →
+False. So read 58.89 as the accuracy of this checkpoint and the 1.11 gap as
+decode noise at n=90, not as a property of speculative decoding.
+
+### Code Changes This Eval Required
+
+`--spec-decode` previously applied only to `--methods student`; on `latent` it
+was accepted and silently ignored (`scripts/04_eval.py` forwarded the sampler
+only when `method == "student"`, and the banner said so).
+
+- `latentsql/distill/latent.py` — `LatentReasoner.generate()` takes an optional
+  `spec` sampler. The latent prefix is built exactly as on the greedy path, then
+  handed to `SpeculativeSampler.generate()` as `target_past` / `target_attn` /
+  `target_first_logits`, with the plain text prompt as `draft_prompt_ids`. This
+  is the same wiring GRPO's `_sample_group_latent` already used. `LatentRun`
+  gained a `spec` field carrying `SpecStats.as_dict()`.
+- `latentsql/eval/run_eval.py` — the latent branch passes `spec` through and
+  records the per-sample stats under `extra["spec"]`.
+- `scripts/04_eval.py` — forwards the sampler for `latent` as well as `student`;
+  new `--spec-draft-quantization` (defaults to `sft.quantization`) so the draft
+  can be quantized independently of the target, which is what makes a 7B draft
+  fit alongside a bf16 7B target on 24 GB; corrected the stale `[spec]` banner.
+
+Draft quality affects only acceptance rate, never correctness, so quantizing the
+draft is safe.
+
+## Speculative Draft Sweep — 0.5B / 3B / 7B (2026-08-31)
+
+Same checkpoint, same held-out n=90, same six latent roles. Only the draft
+model changes. This supersedes the closing claim of the previous section
+("speculative decoding pays off with a *small* draft"), which was an
+extrapolation from the 7B result and is **wrong**: measured at three draft
+sizes, speculation loses at every one.
+
+| draft | EX | bird | spider | Latency/sample | Total | vs greedy | Acc. length | Acc. rate | Peak GPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none (greedy) | **58.89** | **37.78** | 80.00 | **2.092 s** | **188 s** | **1.00x** | — | — | **15.85 GB** |
+| Coder-0.5B bf16 | 57.78 | 35.56 | 80.00 | 2.989 s | 269 s | 0.70x | 2.26 | 0.418 | 17.27 GB |
+| Coder-3B bf16 | 57.78 | 35.56 | 80.00 | 3.392 s | 305 s | 0.62x | 2.37 | 0.458 | 22.28 GB |
+| Coder-7B 4bit | 57.78 | 35.56 | 80.00 | 4.257 s | 383 s | 0.49x | 2.34 | 0.446 | 21.84 GB |
+
+Every speculative run scores an identical 57.78 EX with an identical
+bird/spider split, and each agrees with greedy on 89/90 questions (86-88/90
+byte-identical predictions). The single flipped question is the same bf16
+batched-verification noise described in the previous section, not an effect of
+draft size.
+
+### Reading The Sweep
+
+Two numbers carry the finding.
+
+1. **Acceptance length is flat across a 14x range of draft size** (2.26 / 2.37 /
+   2.34 for 0.5B / 3B / 7B). Draft *quality* is not the limiting factor. A
+   bigger draft proposes barely better tokens here, so it buys nothing.
+2. **Latency is nearly insensitive to draft size.** Shrinking the draft 14x
+   (7B -> 0.5B) improved wall-clock only 1.42x, and still landed 1.43x *slower*
+   than plain greedy decoding.
+
+Together these say the cost is dominated by fixed **per-round** overhead, not by
+the draft's forward passes - which is why no draft size rescues it.
+
+One structural cause is specific to the latent path: the target enters decoding
+with the latent prefix already in its KV cache, but the draft cannot see latent
+thoughts, so it re-prefills the full ~1570-token text prompt once per sample,
+amortized over only ~62 generated tokens. Speculation needs long generations to
+pay off, and the whole point of this student is that its generation is short.
+
+`_copy_cache`'s `copy.deepcopy` was measured and **ruled out** as the bottleneck:
+a realistic 28-layer / seq-1600 / 88 MB Qwen-7B cache deep-copies in 0.94 ms, so
+the ~54 copies per sample cost ~50 ms against a ~900 ms gap. The leading
+remaining hypothesis - not yet measured - is host-device synchronization inside
+the accept/reject loop: `float(p_rows[i][0, x])`, `float(q_x)`,
+`float(torch.rand(1).item())` and `_sample`'s `.item()` each force a CUDA sync,
+running to roughly 400-500 syncs per sample, plus a full 152k-wide softmax
+allocated per proposal. Both costs are per round and independent of draft size,
+matching the observed insensitivity. Confirming this needs a profiler run.
+
+### Conclusion For This Path
+
+Use greedy decoding for `--methods latent`. Speculative decoding is a wall-clock
+regression here at every draft size tested, and it costs 1.4-6.4 GB of extra
+GPU. It remains potentially useful on the `student` path, which generates a
+whole debate (hundreds to ~1000 tokens) rather than ~62 tokens of SQL - that
+case was not measured here.
+
+### Bug Fixed: Draft/Target Vocab Mismatch
+
+The first 3B run crashed in the rejection step:
+
+```text
+RuntimeError: The size of tensor a (152064) must match the size of tensor b
+(151936) at non-singleton dimension 1
+```
+
+Qwen pads each model's embedding matrix independently even though the tokenizer
+is byte-identical:
+
+| model | `vocab_size` |
+|---|---:|
+| Qwen2.5-Coder-7B-Instruct | 152064 |
+| Qwen2.5-Coder-3B-Instruct | 151936 |
+| Qwen2.5-Coder-1.5B-Instruct | 151936 |
+| Qwen2.5-Coder-0.5B-Instruct | 151936 |
+
+Step 3 of `SpeculativeSampler.generate` computes `p - q` elementwise, so a draft
+whose padded width differs from the target's dies there. **`--spec-decode`
+therefore only ever worked when the draft was the 7B target itself** - which is
+why GRPO used `spec7b`, and it means the documented default
+(`--spec-draft-model Qwen/Qwen2.5-Coder-0.5B-Instruct`) would have crashed for
+anyone who tried it, on the `student` path as well as `latent`.
+
+Fix in `latentsql/distill/speculative.py`: truncate both logit vectors to
+`vocab = min(target_width, draft_width)` *before* the softmax, which
+renormalises exactly over the retained support. The dropped slots sit above the
+real tokenizer vocab (151665 tokens) and no valid token id ever lands in them.
+The 7B-draft path is unchanged, since `min(152064, 152064)` is a no-op - the
+numbers in the previous section stand.
+
+## Checkpoints And Cleanup — Second Pass (2026-08-31)
+
+A second cleanup followed the same policy as the 2026-08-30 pass: nothing was
+deleted, everything was **moved** out of the workspace so it stays recoverable.
+
+```text
+/tmp/latent_agent_text2sql_removed_checkpoints_20260831_0146
+```
+
+`outputs/` went **4.1 GB -> 1.6 GB** (2.5 GB moved).
+
+Moved:
+
+| Item | Size | Why it was safe |
+|---|---:|---|
+| `chess_coconut_sql_direct/checkpoints/stage_6` | 319 MB | Byte-identical duplicate of `chess_coconut_sql_direct/latent_sft`; md5 verified equal before moving |
+| `chess_coconut_sql_direct/optim_state.pt` | 617 MB | Resume-only optimizer state; that curriculum finished at stage 6 and GRPO has already run on top of it |
+| `curriculum_chain_7b_bf16_multipass_fixed/optim_state.pt` | 617 MB | Resume-only optimizer state for a superseded arm |
+| `chess_coconut_sql_direct_grpo_brevity_probe` | 319 MB | GRPO smoke probe, 2 optimizer steps / 40 s |
+| `chess_coconut_sql_direct_grpo_spec7b_probe` | 319 MB | GRPO smoke probe, 1 optimizer step / 13 s |
+| `chess_coconut_sql_direct_grpo_probe_nospec` | 319 MB | GRPO smoke probe, 2 optimizer steps / 20 s |
+
+`chess_coconut_sql_direct/checkpoints/` is now empty and was removed; stage_1
+through stage_5 had already been moved out in the 2026-08-30 pass.
+
+The five adapters that remain are the ones worth keeping:
+
+```text
+outputs/latent_sft_1000/sft_7b_bf16                                          # SFT baseline
+outputs/latent_sft_1000/chess_coconut_sql_direct/latent_sft                  # stage-6 latent student, the 52.22 EX baseline
+outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200  # current best, 58.89 EX
+outputs/latent_sft_1000/curriculum_chain_7b_bf16_multipass_fixed/latent_sft  # earlier documented arm
+outputs/latent_sft_1000/coconut_staged/latent_sft                            # earlier documented arm
+```
+
+For the two earlier arms only the optimizer state was dropped, never the
+weights. `traces/` (13 MB, the training corpus) and all 40 eval-result
+directories were left in place - they are ~1 MB each and hold the actual
+recorded numbers. In particular
+`chess_coconut_sql_direct_grpo_spec7b_probe_eval30/` survives, so the 63.33 EX
+(n=30) probe figure cited elsewhere in this document is still backed by its
+predictions even though the 319 MB probe adapter it came from is gone.
+
+Two things were deliberately left alone: `0.96.log` in the repo root (a stray
+untracked log from an aborted run) and `pdfs/` (papers the README documents as
+intentionally uncommitted).

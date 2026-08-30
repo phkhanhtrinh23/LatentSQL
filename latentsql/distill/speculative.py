@@ -180,6 +180,17 @@ class SpeculativeSampler:
         d_past, d_logits = d_out.past_key_values, d_out.logits[:, -1, :]
         d_attn = torch.ones_like(d_in)
 
+        # Draft and target need not share a padded vocab width. Qwen pads each
+        # model's embedding matrix independently (Coder-7B -> 152064,
+        # Coder-0.5B/1.5B/3B -> 151936) even though the tokenizer is identical,
+        # and step 3 subtracts q from p elementwise, so both must be scored over
+        # the same support. Truncating the logits to the common prefix BEFORE
+        # the softmax renormalises exactly; the dropped slots sit above the real
+        # tokenizer vocab and no valid token id ever lands in them. Without
+        # this, any draft that is not the target itself dies in step 3 with a
+        # tensor-size mismatch - which is why only a 7B draft had ever run.
+        vocab = min(int(t_logits.shape[-1]), int(d_logits.shape[-1]))
+
         emitted: List[int] = []
         while len(emitted) < max_new_tokens:
             stats.n_rounds += 1
@@ -192,7 +203,7 @@ class SpeculativeSampler:
             # only the ACCEPTED tokens may advance the draft's real state
             dp, dl, da = _copy_cache(d_past), d_logits, d_attn.clone()
             for _ in range(budget):
-                q = _to_probs(dl, self.temperature)
+                q = _to_probs(dl[:, :vocab], self.temperature)
                 x = _sample(q, self.temperature)
                 qs.append(q)
                 props.append(x)
@@ -204,7 +215,7 @@ class SpeculativeSampler:
 
             # 2. the target scores all proposals in ONE pass
             #    t_logits already holds p_1; the forward gives p_2..p_{k+1}
-            p_rows = [_to_probs(t_logits, self.temperature)]
+            p_rows = [_to_probs(t_logits[:, :vocab], self.temperature)]
             prop_t = torch.tensor([props], device=dev)
             t_attn_ext = torch.cat(
                 [t_attn, torch.ones(1, len(props), dtype=t_attn.dtype, device=dev)], -1
@@ -215,7 +226,7 @@ class SpeculativeSampler:
             v = tgt(input_ids=prop_t, past_key_values=_copy_cache(t_past),
                     attention_mask=t_attn_ext, use_cache=True)
             for i in range(len(props)):
-                p_rows.append(_to_probs(v.logits[:, i, :], self.temperature))
+                p_rows.append(_to_probs(v.logits[:, i, :vocab], self.temperature))
 
             # 3. accept / reject, preserving the target distribution
             n_acc = 0

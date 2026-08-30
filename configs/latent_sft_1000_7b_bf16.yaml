@@ -105,6 +105,11 @@ grpo:
     w_tag_order: 0.1
     w_atomic: 0.5
     w_memory: 0.3
+    # Latent rollouts often produce all-correct groups. Without a tie-breaker,
+    # every rollout receives 1.0 correctness + 0.1 executable SQL and GRPO has
+    # zero advantage. Brevity is awarded only to correct rollouts, so it gives
+    # signal inside saturated groups without rewarding wrong short answers.
+    w_brevity: 0.2
 
 latent:
   enabled: true

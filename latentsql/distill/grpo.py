@@ -506,6 +506,7 @@ class GRPOTrainer:
             take = [order.pop() for _ in range(min(cfg.batch_prompts, len(order)))]
 
             batch_rewards, batch_lens, batch_fmt, batch_clip = [], [], [], []
+            batch_brevity = []
             batch_std, batch_live = [], []
             for ti in take:
                 self._cur_task = tasks[ti]
@@ -525,6 +526,7 @@ class GRPOTrainer:
                 batch_lens += [r.reward.n_tokens for r in rollouts]
                 batch_fmt += [r.reward.r_fmt for r in rollouts]
                 batch_clip += [r.reward.r_clip for r in rollouts]
+                batch_brevity += [r.reward.r_brevity for r in rollouts]
                 gen_tokens_total += sum(len(r.completion_ids) for r in rollouts)
 
                 # the loss backwards chunk by chunk inside _loss_for, so a
@@ -548,6 +550,7 @@ class GRPOTrainer:
                         "reward_mean": _mean(batch_rewards),
                         "r_fmt_mean": _mean(batch_fmt),
                         "r_clip_mean": _mean(batch_clip),
+                        "r_brevity_mean": _mean(batch_brevity),
                         "gen_tokens_mean": _mean(batch_lens),
                         #: within-group reward spread; 0 => no learning signal
                         "reward_std_mean": _mean(batch_std),

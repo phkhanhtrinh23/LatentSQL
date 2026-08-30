@@ -1091,3 +1091,151 @@ committed — copyright and repo size).
 - Du et al. *Improving Factuality and Reasoning via Multiagent Debate.* 2023.
 - Shao et al. *DeepSeekMath (GRPO).* 2024.
 - Rimsky et al. *Steering Llama 2 via Contrastive Activation Addition.* ACL 2024.
+
+---
+
+## 17. GRPO on the CHESS-step latent student — recorded results (2026-08-31)
+
+Full detail, commands and the code changes are in
+[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md); this is
+the summary.
+
+`outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200`
+is the stage-6 CHESS-step SQL-direct student (six latent roles, `latent_steps=2`,
+only the consensus SQL decoded) after 50 GRPO steps on 50 hard prompts with the
+brevity reward enabled. Evaluated on the held-out n=90 BIRD+Spider mix.
+
+### GRPO moved the student, and shortened it
+
+| | SFT (pre-GRPO) | after GRPO | Δ |
+|---|---:|---:|---:|
+| EX (n=90) | 52.22% | **58.89%** | **+6.67** |
+| bird EX | 33.33% | **37.78%** | +4.45 |
+| spider EX | 71.11% | **80.00%** | +8.89 |
+| Avg output tokens | 67.5 | **61.9** | −5.6 |
+| Unparseable | 4 | **0** | −4 |
+
+Accuracy rose while output length fell — the brevity reward doing what it was
+shaped to do — and every one of the 90 generations stayed parseable, so the
+latent → `<|consensus|>` → SQL format survived GRPO. The gain is concentrated on
+Spider. Note that GRPO's training prompts came from the same pool under the same
+length filter as the eval split, so the Spider number is the more robust half of
+this result; and the 63.33% quoted earlier for a probe checkpoint was n=30, not
+comparable to this n=90.
+
+### Speculative decoding with a same-size draft is a loss
+
+Same checkpoint and questions, drafting with the *untrained* base
+Qwen2.5-Coder-7B-Instruct (4-bit, k=3):
+
+| | greedy | speculative (7B draft) |
+|---|---:|---:|
+| EX (n=90) | **58.89%** | 57.78% |
+| **Latency / sample** | **2.09 s** | 4.26 s |
+| Total wall-clock | **188 s** | 383 s |
+| Peak GPU | **15.9 GB** | 21.8 GB |
+| Acceptance length | — | 2.34 |
+
+**2.03x slower.** A 7B draft costs about what the 7B target costs per proposed
+token, so an acceptance length of 2.34 cannot pay for the draft's forwards (317
+of the 383 s went inside the sampler), and the 4-bit quantization needed to fit
+both models on a 24 GB card makes the draft slower per token than the bf16
+target. Speculation is worth it only with a genuinely small draft —
+`--spec-draft-model` still defaults to the 0.5B. On the latent path there is
+also less to speculate on: only the ~62 decoded SQL tokens are drafted, never
+the latent prefix, and the draft cannot see the latent thoughts (it conditions
+on the plain text prompt), which holds acceptance to 0.446.
+
+The 1.11-point EX gap is decode noise, not a distributional effect: at
+`temperature 0.0` verification is lossless, 86/90 predictions are byte-identical
+and 89/90 agree on correctness. The four that differ do so because batched
+k+1-token verification is not bit-identical to one-token-per-forward greedy
+decoding in bf16; three land on equivalent SQL, one flips.
+
+`--spec-decode` previously applied only to `--methods student` and was silently
+ignored on `latent`. It is now wired through `LatentReasoner.generate()`, and
+`--spec-draft-quantization` lets the draft be quantized independently of the
+target. See section 15's note that wall-clock comparisons should always say
+which mode was used — these two rows are the same mode, `latent`, differing only
+in the sampler.
+
+---
+
+## 18. Speculative decoding on the latent path — a measured dead end (2026-08-31)
+
+Section 17 closed by suggesting a *small* draft would make speculative decoding
+pay off. That was an extrapolation from a single 7B-draft run, and measuring it
+at three draft sizes shows it is **wrong**. Full detail in
+[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
+
+Same checkpoint, same held-out n=90, `--methods latent`; only the draft changes:
+
+| draft | EX | Latency/sample | Total | vs greedy | Acc. length | Peak GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| none (greedy) | **58.89%** | **2.09 s** | **188 s** | **1.00x** | — | **15.9 GB** |
+| Coder-0.5B bf16 | 57.78% | 2.99 s | 269 s | 0.70x | 2.26 | 17.3 GB |
+| Coder-3B bf16 | 57.78% | 3.39 s | 305 s | 0.62x | 2.37 | 22.3 GB |
+| Coder-7B 4bit | 57.78% | 4.26 s | 383 s | 0.49x | 2.34 | 21.8 GB |
+
+**Speculation is slower at every draft size**, and the two numbers that explain
+why are: acceptance length is flat across a 14x range of draft size (2.26 →
+2.37), and shrinking the draft 14x improved wall-clock only 1.42x. Draft quality
+is not the limiter; fixed per-round overhead is. One structural cause is
+specific to this path — the target starts decoding with the latent prefix in its
+KV cache, but the draft cannot see latent thoughts, so it re-prefills the whole
+~1570-token prompt per sample to cover only ~62 generated tokens. Speculation
+needs long generations; this student's whole point is that it emits few tokens.
+
+`copy.deepcopy` of the KV cache was measured and ruled out (0.94 ms for a
+realistic 88 MB cache, ~50 ms/sample against a ~900 ms gap). The leading
+unmeasured suspect is the ~400-500 CUDA syncs per sample forced by the
+`float(...)`/`.item()` calls in the accept/reject loop.
+
+**Practical guidance: use greedy for `--methods latent`.** The `student` path,
+which emits a whole debate rather than ~62 tokens of SQL, was not measured and
+may still benefit.
+
+All four runs agree on 89/90 questions; the EX spread (58.89 vs 57.78, one
+question) is bf16 batched-verification noise, documented in section 17.
+
+### Bug this surfaced
+
+Qwen pads each model's embedding independently — Coder-7B is `vocab_size`
+152064, while 0.5B/1.5B/3B are 151936 — and the sampler's rejection step
+computes `p - q` elementwise. **`--spec-decode` only ever worked when the draft
+was the 7B target itself**; the documented default draft (Coder-0.5B) would have
+crashed, on the `student` path as well as `latent`. Fixed in
+`latentsql/distill/speculative.py` by truncating both logit vectors to the
+common vocab prefix before the softmax (which renormalises exactly; the dropped
+slots are padding no valid token id reaches). The 7B path is a no-op, so
+section 17's numbers stand.
+
+---
+
+## 19. Workspace cleanup (2026-08-31)
+
+`outputs/` went **4.1 GB → 1.6 GB**. Following the same policy as the previous
+pass, nothing was deleted — everything was *moved* to
+`/tmp/latent_agent_text2sql_removed_checkpoints_20260831_0146`, so it is
+recoverable until the next reboot. Per-item rationale is in
+[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
+
+Moved (2.5 GB): a stage-6 checkpoint that was a byte-identical duplicate of the
+live adapter (md5 verified), two resume-only `optim_state.pt` files for runs
+that have finished or been superseded (617 MB each), and three GRPO smoke probes
+of 1–2 optimizer steps apiece.
+
+Kept — the five adapters that matter:
+
+| Adapter | Why |
+|---|---|
+| `sft_7b_bf16` | SFT baseline |
+| `chess_coconut_sql_direct/latent_sft` | stage-6 latent student; the 52.22% EX baseline and GRPO's starting point |
+| `chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200` | current best, 58.89% EX (section 17) |
+| `curriculum_chain_7b_bf16_multipass_fixed/latent_sft` | earlier documented arm |
+| `coconut_staged/latent_sft` | earlier documented arm |
+
+For the two earlier arms only the optimizer state was dropped, never the
+weights. `traces/` and all 40 eval-result directories were kept — they are ~1 MB
+each and hold the recorded numbers, including the predictions behind the 63.33%
+(n=30) probe figure whose adapter is now gone.

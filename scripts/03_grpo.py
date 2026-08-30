@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -30,9 +31,31 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--epochs", type=float, default=None)
     ap.add_argument("--group-size", type=int, default=None)
+    ap.add_argument("--batch-prompts", type=int, default=None)
+    ap.add_argument("--grad-accum", type=int, default=None)
+    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--max-prompt-chars", type=int, default=None,
+                    help="drop GRPO records whose prompt text is longer than this")
+    ap.add_argument("--prefer-hard", action="store_true",
+                    help="prioritize likely-hard trace records before applying --limit")
+    ap.add_argument("--hard-preds", default=None,
+                    help="optional preds jsonl; wrong/unparseable qids are prioritized if they overlap")
     ap.add_argument("--len-start", type=int, default=None)
     ap.add_argument("--len-end", type=int, default=None)
+    ap.add_argument("--w-brevity", type=float, default=None,
+                    help="reward weight for shorter correct latent rollouts")
+    ap.add_argument("--brevity-ref-tokens", type=int, default=None,
+                    help="token count that receives zero brevity reward")
+    ap.add_argument("--latent-steps", type=int, default=None)
+    ap.add_argument("--latent-role-list", default=None)
+    ap.add_argument("--spec-draft-model", default=None)
+    ap.add_argument("--spec-k", type=int, default=None)
+    ap.add_argument("--no-spec-decode", action="store_true",
+                    help="disable speculative decoding for this run")
     ap.add_argument(
         "--from-examples", default=None,
         help="build GRPO prompts straight from a benchmark (bird|spider|synthetic) "
@@ -50,10 +73,37 @@ def main() -> int:
         cfg.grpo.epochs = args.epochs
     if args.group_size:
         cfg.grpo.group_size = args.group_size
+    if args.batch_prompts:
+        cfg.grpo.batch_prompts = args.batch_prompts
+    if args.grad_accum:
+        cfg.grpo.grad_accum = args.grad_accum
+    if args.max_new_tokens:
+        cfg.grpo.max_new_tokens = args.max_new_tokens
+    if args.lr is not None:
+        cfg.grpo.lr = args.lr
+    if args.temperature is not None:
+        cfg.grpo.temperature = args.temperature
+    if args.top_p is not None:
+        cfg.grpo.top_p = args.top_p
     if args.len_start:
         cfg.grpo.reward.len_start = args.len_start
     if args.len_end:
         cfg.grpo.reward.len_end = args.len_end
+    if args.w_brevity is not None:
+        cfg.grpo.reward.w_brevity = args.w_brevity
+    if args.brevity_ref_tokens is not None:
+        cfg.grpo.reward.brevity_ref_tokens = args.brevity_ref_tokens
+    if args.latent_steps:
+        cfg.latent.latent_steps = args.latent_steps
+    if args.latent_role_list:
+        cfg.latent.roles = [r.strip() for r in args.latent_role_list.split(",") if r.strip()]
+    if args.spec_draft_model:
+        cfg.grpo.spec_draft_model = args.spec_draft_model
+        cfg.grpo.spec_decode = True
+    if args.spec_k:
+        cfg.grpo.spec_k = args.spec_k
+    if args.no_spec_decode:
+        cfg.grpo.spec_decode = False
     set_seed(cfg.grpo.seed)
 
     banner("loading tasks")
@@ -75,6 +125,41 @@ def main() -> int:
         print(f"no-teacher ablation: prompts built directly from {used}")
     else:
         records = load_records(args.data)
+        if args.max_prompt_chars:
+            before = len(records)
+            records = [
+                r for r in records
+                if len(getattr(r, "prompt", "") or "") <= args.max_prompt_chars
+            ]
+            print(
+                f"prompt length filter kept {len(records)}/{before} "
+                f"(max_prompt_chars={args.max_prompt_chars})"
+            )
+        if args.prefer_hard:
+            hard_qids = set()
+            if args.hard_preds and os.path.exists(args.hard_preds):
+                with open(args.hard_preds, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        if row.get("correct") is False or not row.get("pred_sql"):
+                            hard_qids.add(row.get("qid", ""))
+
+            def _hard_key(r):
+                qid = getattr(r, "qid", "")
+                is_bird = 1 if qid.startswith("bird_") else 0
+                # High teacher-token traces usually reflect larger schemas or
+                # harder debates; prompt length catches cases where the trace
+                # token count is missing.
+                return (
+                    1 if qid in hard_qids else 0,
+                    is_bird,
+                    int(getattr(r, "teacher_tokens", 0) or 0),
+                    len(getattr(r, "prompt", "") or ""),
+                )
+
+            records = sorted(records, key=_hard_key, reverse=True)
         if args.limit:
             records = records[: args.limit]
         tasks = tasks_from_records(records)

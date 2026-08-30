@@ -118,6 +118,10 @@ class LatentRun:
     #: ``share_working_memory`` this accumulates every role's latent thoughts;
     #: without it, each role starts from an empty cache.
     n_memory_positions: int = 0
+    #: ``SpecStats.as_dict()`` for the SQL decode when a ``SpeculativeSampler``
+    #: was used, else ``None``. The latent prefix is never drafted - only the
+    #: decoded query is - so these counts cover the query alone.
+    spec: Optional[Dict[str, Any]] = None
 
 
 class LatentReasoner:
@@ -571,7 +575,14 @@ class LatentReasoner:
         max_new_tokens: int = 256,
         temperature: float = 0.0,
         n_latent_roles: Optional[int] = None,
+        spec: Optional[Any] = None,
     ) -> LatentRun:
+        """``spec``, if given, is a ``SpeculativeSampler`` used for the SQL
+        decode only. The latent prefix is built exactly as on the greedy path
+        and handed to the sampler as an already-processed target prefix; the
+        draft model cannot see latent thoughts, so it conditions on the plain
+        text prompt and rejection sampling absorbs the mismatch. Greedy
+        verification is lossless, so EX should match the non-spec run."""
         import torch
 
         tok, model = self.bundle.tokenizer, self.bundle.model
@@ -636,6 +647,23 @@ class LatentReasoner:
             # Decode SQL directly. No remaining agent debate is generated.
             sql_budget = total_budget
             out_ids: List[int] = []
+            spec_stats = None
+            if spec is not None:
+                # The draft has no access to the latent prefix, so it conditions
+                # on the plain text prompt; the target continues from the real
+                # latent KV cache. next_logits already predicts the first
+                # decoded token, which is what target_first_logits expects.
+                draft_prompt_ids = tok(
+                    prompt, return_tensors="pt", add_special_tokens=False
+                )["input_ids"][0].tolist()
+                out_ids = spec.generate(
+                    [], sql_budget, eos_token_id=tok.eos_token_id,
+                    target_past=past, target_attn=attention_mask,
+                    target_first_logits=next_logits,
+                    draft_prompt_ids=draft_prompt_ids,
+                )
+                spec_stats = spec.stats.take().as_dict()
+                sql_budget = 0
             for _ in range(sql_budget):
                 logits = next_logits
                 if logits is None:
@@ -671,6 +699,7 @@ class LatentReasoner:
             n_decoded_tokens=len(out_ids),
             roles=list(cfg.roles),
             n_memory_positions=n_memory,
+            spec=spec_stats,
         )
 
 

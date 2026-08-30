@@ -49,11 +49,16 @@ def main() -> int:
                          "debate before its answer, so too small a budget scores "
                          "truncation rather than capability")
     ap.add_argument("--spec-decode", action="store_true",
-                    help="accelerate the student method's generation with speculative "
+                    help="accelerate the student/latent methods' generation with speculative "
                          "decoding (lossless at temperature=0 - EX should be unchanged, "
                          "only wall-clock/tokens-per-second). Previously training-only.")
     ap.add_argument("--spec-draft-model", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
     ap.add_argument("--spec-k", type=int, default=3)
+    ap.add_argument("--spec-draft-quantization", default=None,
+                    help="quantization for the DRAFT only (default: sft.quantization). "
+                         "A bf16 7B target plus a bf16 7B draft does not fit on a 24GB "
+                         "card; '4bit' keeps the draft ~5GB. Draft quality only affects "
+                         "acceptance rate, never correctness.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -111,12 +116,13 @@ def main() -> int:
         from latentsql.distill.speculative import SpeculativeSampler, load_draft
 
         banner("loading speculative draft model")
+        draft_quant = args.spec_draft_quantization or getattr(cfg.sft, "quantization", "none")
         draft = load_draft(args.spec_draft_model, hub_dir=cfg.paths.hf_hub,
-                           quantization=getattr(cfg.sft, "quantization", "none"))
+                           quantization=draft_quant)
         spec = SpeculativeSampler(bundle, draft, k=args.spec_k, temperature=cfg.eval.temperature)
-        print(f"[spec] draft={args.spec_draft_model} k={args.spec_k} "
-              f"- lossless at temperature=0, accelerates 'student' generation only "
-              f"(not 'latent' - see run_eval.py)")
+        print(f"[spec] draft={args.spec_draft_model} ({draft_quant}) k={args.spec_k} "
+              f"- lossless at temperature=0, accelerates 'student' and 'latent'; "
+              f"on 'latent' only the SQL decode is drafted, not the latent prefix")
 
     from latentsql.utils.telemetry import RunLog, reset_gpu_peak, run_environment
 
@@ -139,7 +145,7 @@ def main() -> int:
             method, examples, cfg, llm=llm, bundle=bundle,
             pool=[], cache_dir=cfg.paths.cache_dir, compute_ves=args.ves,
             **({"latent_roles": args.latent_roles} if method == "latent" else {}),
-            **({"spec": spec} if method == "student" and spec is not None else {}),
+            **({"spec": spec} if method in ("student", "latent") and spec is not None else {}),
             **({"stream_path": os.path.join(out_dir, f"preds_{method}_live.jsonl")}
                if method in STUDENT_METHODS else {}),
         )
