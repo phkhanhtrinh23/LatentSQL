@@ -190,15 +190,30 @@ class LatentReasoner:
         """
         import torch
         import torch.nn.functional as F
+        from transformers import DynamicCache
 
         model = self.bundle.model
         mask_dtype, mask_device = attention_mask.dtype, attention_mask.device
-        start_len = int(past_key_values.get_seq_length()) if past_key_values is not None else 0
+        if past_key_values is None:
+            # _text_steps already does this (see its own docstring: "so both
+            # the real call and the backward-time recompute close over the
+            # exact same cache object") - this function was missing it. A
+            # bare `None` can't be mutated in place, so every one of the m
+            # internal model() calls below was silently getting its OWN
+            # ephemeral HF-internal cache (created and discarded inside
+            # model(), never captured via out.past_key_values) instead of
+            # one real cache growing across steps - breaking
+            # share_working_memory's whole premise (nothing was actually
+            # being carried forward) and feeding attention_mask lengths that
+            # didn't match the real (absent) cache state, which is the
+            # actual source of this record set's erratic, content-
+            # independent OOMs - not sequence length.
+            past_key_values = DynamicCache()
+        start_len = int(past_key_values.get_seq_length())
         n_aux = len(aux_target_ids) if aux_target_ids else 0
 
         def _run(embeds):
-            if past_key_values is not None:
-                past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
+            past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
             e, hidden, length = embeds, None, start_len
             aux_terms = []
             next_logits = None
@@ -253,7 +268,8 @@ class LatentReasoner:
         return embeds, past_key_values, attention_mask
 
     def _text_steps(self, pieces, past_key_values, attention_mask, checkpoint=False,
-                    prev_logits=None, supervise=False):
+                    prev_logits=None, supervise=False, max_total_tokens=None,
+                    need_hidden=False):
         """Forward a consecutive run of explicit-text (curriculum) roles'
         real text through the model, extending the shared KV cache.
 
@@ -305,6 +321,36 @@ class LatentReasoner:
             for piece in pieces
         ]
 
+        if max_total_tokens:
+            # Hard token-level safety cap: char-based --max-prompt-chars/
+            # --max-role-chars are only a proxy for token count and have
+            # already proven insufficient on their own (an OOM inside
+            # self_attn mid-forward, not a clean pre-flight rejection).
+            # Truncate here instead, at the actual point the sequence is
+            # about to grow, so a batch never gets aborted for a runaway
+            # prefix - later pieces are shortened (or dropped entirely once
+            # the budget is spent) rather than letting the shared KV cache
+            # grow unboundedly.
+            budget = max(0, max_total_tokens - start_len)
+            used, capped = 0, []
+            for ids in piece_ids:
+                room = max(0, budget - used)   # clamp: a negative room would slice
+                                                # ids[:room] from the END (Python
+                                                # semantics), NOT truncate to empty -
+                                                # without this clamp, once the budget
+                                                # was spent, later pieces kept almost
+                                                # all of their tokens instead of none
+                capped.append(ids[:room])
+                used += len(capped[-1])
+            piece_ids = capped
+
+        import os as _os
+        if _os.environ.get("LATENTSQL_DEBUG_CTX"):
+            print(f"[_text_steps DEBUG] start_len={start_len} n_pieces={len(piece_ids)} "
+                  f"piece_lens={[len(x) for x in piece_ids]} "
+                  f"total={start_len + sum(len(x) for x in piece_ids)} "
+                  f"max_total_tokens={max_total_tokens}", flush=True)
+
         def _run(dummy):
             past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
             length = start_len
@@ -312,13 +358,17 @@ class LatentReasoner:
             gen_terms = []
             cur_logits = prev_logits
             for ids in piece_ids:
+                if not ids:
+                    continue
                 ids_t = torch.tensor([ids], device=self.bundle.device)
                 embeds = model.get_input_embeddings()(ids_t)
                 length += len(ids)
                 attn = torch.ones(1, length, dtype=mask_dtype, device=mask_device)
                 out = model(inputs_embeds=embeds, past_key_values=past_key_values,
-                           attention_mask=attn, use_cache=True, output_hidden_states=True)
-                last_hidden = out.hidden_states[-1]
+                           attention_mask=attn, use_cache=True,
+                           output_hidden_states=need_hidden)
+                if need_hidden:
+                    last_hidden = out.hidden_states[-1]
                 if supervise and ids:
                     if cur_logits is not None:
                         lp0 = F.log_softmax(cur_logits.float(), dim=-1)[0, ids[0]]
@@ -332,20 +382,20 @@ class LatentReasoner:
                     cur_logits = out.logits[:, -1, :]
             gen_loss = (torch.stack(gen_terms).mean() if gen_terms
                        else torch.zeros((), device=dummy.device, dtype=torch.float32))
-            return last_hidden, gen_loss
+            return last_hidden, gen_loss, cur_logits
 
         dummy = torch.zeros(1, 1, model.config.hidden_size, device=self.bundle.device,
                             dtype=next(model.parameters()).dtype)
         if checkpoint and pieces and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint as _ckpt
 
-            last_hidden, gen_loss = _ckpt(_run, dummy, use_reentrant=False)
+            last_hidden, gen_loss, cur_logits = _ckpt(_run, dummy, use_reentrant=False)
         else:
-            last_hidden, gen_loss = _run(dummy)
+            last_hidden, gen_loss, cur_logits = _run(dummy)
 
         total_len = start_len + sum(len(ids) for ids in piece_ids)
         new_attention_mask = torch.ones(1, total_len, dtype=mask_dtype, device=mask_device)
-        return past_key_values, new_attention_mask, last_hidden, gen_loss
+        return past_key_values, new_attention_mask, last_hidden, gen_loss, cur_logits
 
     # -- public -----------------------------------------------------------
     def build_prefix(self, system: str, prompt: str, grad: bool = False,
@@ -367,23 +417,11 @@ class LatentReasoner:
         than training-free: LatentMAS applies these mechanisms at inference to
         a frozen model, and we optimise in the same regime we infer in.
 
-        ``role_turns`` / ``n_latent_roles`` implement a COCONUT-style
-        curriculum (Hao et al. 2024, "Training Large Language Models to
-        Reason in a Continuous Latent Space", credited in COCONUT sec. 2 to
-        Deng et al. 2023/2024): ``role_turns[i]`` is the teacher's actual
-        rendered text for ``cfg.roles[i]`` (``AgentTurn.render()``, tag
-        included), or ``None``. The FIRST ``n_latent_roles`` non-consensus
-        roles run as latent steps; later roles are fed their real text
-        instead (teacher-forced, ordinary token embeddings) - matching the
-        reference implementation's own direction (it replaces reasoning
-        steps with latent thoughts front-to-back, earliest steps first, not
-        back-to-front as an earlier version of this function did). A
-        curriculum ramps ``n_latent_roles`` from 0 (pure text, known to
-        train fine) up to ``len(cfg.roles) - 1`` (fully latent, the regime
-        GRPO/eval actually need) instead of demanding the full jump on step
-        one - which is what produced the OOD collapse in RESULTS.md 5c.
-        Both args default to ``None``, which reproduces the original
-        fully-latent behaviour exactly (GRPO/eval are unaffected).
+        ``n_latent_roles`` controls how many non-consensus role markers are
+        converted into latent thoughts before jumping directly to
+        ``<|consensus|>``. Later agent debate text is deliberately not fed or
+        generated on this path; the supervised continuation is SQL only.
+        ``role_turns`` is only used by optional ``decode_compare``.
 
         ``decode_compare`` (default ``False``, so GRPO/eval are unaffected):
         adds a "decode-and-compare" auxiliary loss on every latent role that
@@ -397,14 +435,8 @@ class LatentReasoner:
         pass, no extra vocab matmul) to cross-entropy against the first
         ``latent_steps`` tokens of that role's real turn.
 
-        ``supervise_text`` (default ``False``): COCONUT-fidelity fix - the
-        reference implementation's loss is not restricted to the final
-        answer, it covers every token from wherever latent leaves off
-        through the answer, so the model keeps being trained to actually
-        PRODUCE whatever reasoning text has not yet been replaced by latent
-        thoughts, not just read it as conditioning (which is all the
-        explicit-text roles were before this flag existed). See
-        ``_text_steps``'s docstring for the mechanism.
+        ``supervise_text`` is retained for compatibility with older callers,
+        but this SQL-direct path does not feed later explicit debate turns.
 
         Returns ``(past_key_values, attention_mask, next_token_logits,
         aux_loss, text_gen_loss)`` where the logits predict the first
@@ -424,11 +456,6 @@ class LatentReasoner:
             [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             add_generation_prompt=True,
         )
-        enc = tok(chat, return_tensors="pt", add_special_tokens=False).to(self.bundle.device)
-        attention_mask = enc["attention_mask"]
-        inputs_embeds = model.get_input_embeddings()(enc["input_ids"])
-        past = None
-
         # Gradient checkpointing forces use_cache=False, which returns a null
         # past_key_values - and the latent prefix is built by carrying that
         # cache from one role to the next, so the attention mask would then
@@ -442,15 +469,22 @@ class LatentReasoner:
         ctx = torch.enable_grad() if grad else torch.no_grad()
         try:
           with ctx:
-            # Consecutive explicit-text (curriculum) roles are buffered and
-            # flushed through ONE _text_steps checkpoint (rather than one
-            # checkpoint per role - see _text_steps' docstring for why that
-            # was wrong) right before the next latent/consensus role needs
-            # the cache. When curriculum is off every role is_latent, so
-            # this buffer never fills and the loop is byte-for-byte the
-            # original fully-latent path - GRPO/eval are unaffected.
-            pending_pieces: list = []
-            pending_role_turns: list = []
+            enc = tok(chat, return_tensors="pt", add_special_tokens=False).to(self.bundle.device)
+            max_ctx = getattr(cfg, "max_context_tokens", None)
+            attention_mask = torch.ones(1, 0, dtype=enc["attention_mask"].dtype, device=self.bundle.device)
+            past = None
+            # Prefill the chat prompt into the KV cache before any latent step.
+            # A latent step is one hidden-state position; feeding the whole prompt
+            # as that "one" position gives wrong cache/attention accounting.
+            past, attention_mask, prompt_hidden, _prompt_loss, prompt_logits = self._text_steps(
+                [chat], past, attention_mask, checkpoint=grad, supervise=False,
+                max_total_tokens=max_ctx, need_hidden=False,
+            )
+            import os as _os
+            if _os.environ.get("LATENTSQL_DEBUG_CTX"):
+                print(f"[build_prefix DEBUG] prompt_len={enc['input_ids'].shape[1]} "
+                      f"max_ctx={max_ctx}", flush=True)
+
             # Always real tensors (never a bare 0.0 float), even when the
             # corresponding flag is off or no role qualified - callers (e.g.
             # latent_sft.py) unconditionally call .detach()/.float() on
@@ -459,52 +493,29 @@ class LatentReasoner:
             text_gen_loss_total = torch.zeros((), device=self.bundle.device, dtype=torch.float32)
             n_aux_roles = 0
             n_text_roles = 0
-            last_logits = [None]  # this run's own most recent next-token prediction
+            last_logits = [prompt_logits]  # this run's own most recent next-token prediction
+            last_hidden = [prompt_hidden]
 
-            def _flush_pending():
-                nonlocal past, attention_mask, text_gen_loss_total, n_text_roles
-                if not pending_pieces:
-                    return
-                past, attention_mask, _h, gen_loss = self._text_steps(
-                    list(pending_pieces), past, attention_mask, checkpoint=grad,
-                    prev_logits=last_logits[0], supervise=supervise_text,
-                )
-                if supervise_text and any(pending_role_turns):
-                    text_gen_loss_total = text_gen_loss_total + gen_loss
-                    n_text_roles += 1
-                last_logits[0] = None  # consumed; _text_steps' own internal chaining is done
-                pending_pieces.clear()
-                pending_role_turns.clear()
-
+            consensus_fed = False
             for idx, role in enumerate(cfg.roles):
                 is_consensus = role == "consensus"
-                # COCONUT replaces reasoning steps with latent thoughts
-                # front-to-back: the FIRST n_latent_roles non-consensus
-                # roles go latent, later ones stay text longest (reversed
-                # from an earlier version of this function, which went
-                # back-to-front).
-                is_latent = is_consensus or n_latent_roles is None or (
-                    idx < n_latent_roles
-                )
                 if is_consensus:
                     piece = T_CONSENSUS_OPEN
-                elif is_latent or not role_turns or role_turns[idx] is None:
-                    piece = agent_tag(role) + "\n"
                 else:
-                    piece = role_turns[idx]  # teacher's real turn - already tagged
+                    if n_latent_roles is not None and idx >= n_latent_roles:
+                        break
+                    piece = agent_tag(role) + "\n"
 
-                if not is_latent:
-                    pending_pieces.append(piece)
-                    pending_role_turns.append(role_turns[idx] if role_turns else None)
-                    continue
-
-                _flush_pending()
-                piece_embeds, past, attention_mask = self._append_text(piece, past, attention_mask)
-                inputs_embeds = (
-                    torch.cat([inputs_embeds, piece_embeds], dim=1)
-                    if past is None else piece_embeds
+                past, attention_mask, h, _tag_loss, logits = self._text_steps(
+                    [piece], past, attention_mask, checkpoint=grad,
+                    prev_logits=last_logits[0], supervise=False,
+                    max_total_tokens=getattr(cfg, "max_context_tokens", None),
+                    need_hidden=not is_consensus,
                 )
+                last_hidden[0] = h
+                last_logits[0] = logits
                 if is_consensus:
+                    consensus_fed = True
                     break
 
                 aux_target_ids = None
@@ -515,6 +526,7 @@ class LatentReasoner:
                     full_ids = tok(role_turns[idx], add_special_tokens=False)["input_ids"]
                     aux_target_ids = full_ids[: cfg.latent_steps]
 
+                inputs_embeds = self.align(last_hidden[0][:, -1:, :])
                 inputs_embeds, past, attention_mask, next_logits, aux_loss = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps,
                     checkpoint=grad, aux_target_ids=aux_target_ids,
@@ -529,8 +541,18 @@ class LatentReasoner:
                         1, 1, dtype=attention_mask.dtype, device=attention_mask.device
                     )
                     last_logits[0] = None  # working memory dropped - nothing to bridge from
-            out = model(inputs_embeds=inputs_embeds, past_key_values=past,
-                        attention_mask=attention_mask, use_cache=True)
+            if not consensus_fed:
+                past, attention_mask, h, _tag_loss, logits = self._text_steps(
+                    [T_CONSENSUS_OPEN], past, attention_mask, checkpoint=grad,
+                    prev_logits=last_logits[0], supervise=False,
+                    max_total_tokens=getattr(cfg, "max_context_tokens", None),
+                    need_hidden=False,
+                )
+                last_hidden[0] = h
+                last_logits[0] = logits
+            first_logits = last_logits[0]
+            if first_logits is None:
+                raise RuntimeError("latent prefix ended without next-token logits")
         finally:
             if grad and ckpt:
                 model.gradient_checkpointing_enable()
@@ -539,7 +561,7 @@ class LatentReasoner:
             aux_loss_total = aux_loss_total / n_aux_roles
         if n_text_roles:
             text_gen_loss_total = text_gen_loss_total / n_text_roles
-        return (out.past_key_values, attention_mask, out.logits[:, -1, :],
+        return (past, attention_mask, first_logits,
                 aux_loss_total, text_gen_loss_total)
 
     def generate(
@@ -548,6 +570,7 @@ class LatentReasoner:
         prompt: str,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
+        n_latent_roles: Optional[int] = None,
     ) -> LatentRun:
         import torch
 
@@ -559,26 +582,39 @@ class LatentReasoner:
             add_generation_prompt=True,
         )
         enc = tok(chat, return_tensors="pt", add_special_tokens=False).to(self.bundle.device)
-        attention_mask = enc["attention_mask"]
-        inputs_embeds = model.get_input_embeddings()(enc["input_ids"])
+        attention_mask = torch.ones(1, 0, dtype=enc["attention_mask"].dtype, device=self.bundle.device)
         past = None
         n_latent = 0
+        next_logits = None
 
         with torch.no_grad():
-            for role in cfg.roles:
+            past, attention_mask, last_hidden, _loss, next_logits = self._text_steps(
+                [chat], past, attention_mask, checkpoint=False, supervise=False,
+                max_total_tokens=getattr(cfg, "max_context_tokens", None),
+                need_hidden=False,
+            )
+            total_budget = max(0, int(max_new_tokens))
+            consensus_fed = False
+            for idx, role in enumerate(cfg.roles):
+                if role != "consensus" and n_latent_roles is not None and idx >= n_latent_roles:
+                    break
                 # the role tag anchors the latent block to the subspace the
                 # student learned for that agent during SFT
                 tag = T_CONSENSUS_OPEN if role == "consensus" else agent_tag(role) + "\n"
-                tag_embeds, past, attention_mask = self._append_text(tag, past, attention_mask)
-                inputs_embeds = (
-                    torch.cat([inputs_embeds, tag_embeds], dim=1)
-                    if past is None else tag_embeds
+                past, attention_mask, last_hidden, _loss, next_logits = self._text_steps(
+                    [tag], past, attention_mask, checkpoint=False, supervise=False,
+                    prev_logits=next_logits,
+                    max_total_tokens=getattr(cfg, "max_context_tokens", None),
+                    need_hidden=role != "consensus",
                 )
                 if role == "consensus":
+                    consensus_fed = True
                     break
+                inputs_embeds = self.align(last_hidden[:, -1:, :])
                 inputs_embeds, past, attention_mask, _h, _aux = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps
                 )
+                next_logits = _h
                 n_latent += cfg.latent_steps
                 if not cfg.share_working_memory:
                     # ablation: drop the predecessor's KV working memory
@@ -589,17 +625,28 @@ class LatentReasoner:
 
             n_memory = int(attention_mask.shape[-1])
 
-            # decode the final query normally
-            out_ids: List[int] = []
-            for _ in range(max_new_tokens):
-                out = model(
-                    inputs_embeds=inputs_embeds,
-                    past_key_values=past,
-                    attention_mask=attention_mask,
-                    use_cache=True,
+            if not consensus_fed:
+                past, attention_mask, _h, _loss, next_logits = self._text_steps(
+                    [T_CONSENSUS_OPEN], past, attention_mask, checkpoint=False,
+                    supervise=False, prev_logits=next_logits,
+                    max_total_tokens=getattr(cfg, "max_context_tokens", None),
+                    need_hidden=False,
                 )
-                past = out.past_key_values
-                logits = out.logits[:, -1, :]
+
+            # Decode SQL directly. No remaining agent debate is generated.
+            sql_budget = total_budget
+            out_ids: List[int] = []
+            for _ in range(sql_budget):
+                logits = next_logits
+                if logits is None:
+                    out = model(
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=past,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                    )
+                    past = out.past_key_values
+                    logits = out.logits[:, -1, :]
                 if temperature and temperature > 0:
                     probs = torch.softmax(logits.float() / temperature, dim=-1)
                     nxt = torch.multinomial(probs, num_samples=1)
@@ -613,6 +660,7 @@ class LatentReasoner:
                 attention_mask = torch.cat(
                     [attention_mask, torch.ones_like(attention_mask[:, :1])], dim=-1
                 )
+                next_logits = None
 
         text = tok.decode(out_ids, skip_special_tokens=True)
         full = T_CONSENSUS_OPEN + text

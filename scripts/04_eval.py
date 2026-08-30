@@ -39,6 +39,11 @@ def main() -> int:
     ap.add_argument("--model", default=None,
                     help="override llm.model, e.g. to run the baselines on a 3B")
     ap.add_argument("--latent-steps", type=int, default=None)
+    ap.add_argument("--latent-role-list", default=None,
+                    help="latent mode only: comma-separated role markers used before consensus")
+    ap.add_argument("--latent-roles", type=int, default=None,
+                    help="latent mode only: cap how many non-consensus roles use latent "
+                         "steps; later role tags are forwarded as text context")
     ap.add_argument("--max-new-tokens", type=int, default=None,
                     help="override eval.max_new_tokens; the student emits a whole "
                          "debate before its answer, so too small a budget scores "
@@ -61,6 +66,8 @@ def main() -> int:
         cfg.eval.n_samples = args.limit
     if args.latent_steps:
         cfg.latent.latent_steps = args.latent_steps
+    if args.latent_role_list:
+        cfg.latent.roles = [r.strip() for r in args.latent_role_list.split(",") if r.strip()]
     if args.max_new_tokens:
         cfg.eval.max_new_tokens = args.max_new_tokens
     set_seed(cfg.seed)
@@ -131,6 +138,7 @@ def main() -> int:
         preds, report = run(
             method, examples, cfg, llm=llm, bundle=bundle,
             pool=[], cache_dir=cfg.paths.cache_dir, compute_ves=args.ves,
+            **({"latent_roles": args.latent_roles} if method == "latent" else {}),
             **({"spec": spec} if method == "student" and spec is not None else {}),
             **({"stream_path": os.path.join(out_dir, f"preds_{method}_live.jsonl")}
                if method in STUDENT_METHODS else {}),

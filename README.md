@@ -21,6 +21,7 @@ Multi-Agent Systems") layered on top.
 | [COMPARISON.md](COMPARISON.md) | **LatentSQL vs. FINER-SQL** — what is actually different, what we borrowed, and what we had to change |
 | [RESULTS.md](RESULTS.md) | **Recorded results** — accuracy, cost, GPU/wall-clock, and worked examples of what internalisation fixed |
 | [METHOD.md](METHOD.md) | **The method in full detail** — the teacher panel, the trace format, both training stages, the latent layer, the evaluation protocol, and the measured drawbacks and failure modes |
+| [docs/COCONUT_LATENT_TRAINING.md](docs/COCONUT_LATENT_TRAINING.md) | **Current COCONUT-style latent training record** — CHESS-step SQL-direct curriculum, stage 1-6 results, full latent eval, token savings, and next-run hyperparameters |
 | [latentsql/mas/](latentsql/mas/) | The teacher: agents, prompts, debate orchestration, trace format, and standalone re-implementations of the four published systems |
 | [latentsql/distill/](latentsql/distill/) | IMAD stage 1 (SFT), stage 2 (GRPO + annealed reward), and the LatentMAS latent-thought module |
 | [latentsql/steering/](latentsql/steering/) | Agent-subspace extraction and activation steering (IMAD §3) |
@@ -138,6 +139,34 @@ python scripts/04_eval.py         --config configs/bird_local.yaml \
     --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas,student,latent
 python scripts/05_steering.py     --config configs/bird_local.yaml --compare-base
 ```
+
+### Current COCONUT-style latent run
+
+The latest recorded latent compression experiment is documented in
+[docs/COCONUT_LATENT_TRAINING.md](docs/COCONUT_LATENT_TRAINING.md). It uses a
+CHESS-step SQL-direct curriculum over:
+
+```text
+information_retriever, schema_linker, query_classifier, candidate_generator,
+query_fixer, unit_tester, consensus
+```
+
+The completed stage-6 full latent eval is:
+
+| Run | n | EX (%) | EX bird (%) | EX spider (%) | Avg tokens | Avg output tokens | Token saved vs previous SFT |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Previous SFT student | 90 | 56.67 | 31.11 | 82.22 | 2922.8 | 1339.3 | - |
+| Full latent after stage 6 | 90 | 52.22 | 33.33 | 71.11 | 1638.0 | 67.5 | 43.96% |
+
+`Avg tokens` is `prompt_tokens + completion_tokens`; latent hidden-state steps
+are tracked separately as `extra.latent_steps`, not counted as decoded output
+tokens. The stage-6 full latent run used six latent roles and two latent steps
+per role, so each prediction used twelve latent steps before/around consensus
+generation.
+
+Individual held-out DAIL/DIN/CHESS/CHASE eval tables are not currently saved in
+the output tree. The saved teacher reference is the 900-sample trace-generation
+panel consensus, not a matched 90-example standalone-baseline eval.
 
 ---
 

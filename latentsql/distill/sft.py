@@ -151,6 +151,7 @@ def train_sft(
     bundle: Optional[ModelBundle] = None,
     log_path: Optional[str] = None,
 ) -> Dict[str, Any]:
+    import gc
     import torch
 
     random.seed(cfg.seed)
@@ -165,10 +166,17 @@ def train_sft(
             model.enable_input_require_grads()
 
     encoded = []
+    n_pruned = 0
     for r in records:
         ex = build_example(tok, r, cfg.max_seq_len, cfg.train_on_full_trace)
         if ex:
             encoded.append(ex)
+        else:
+            n_pruned += 1
+    if n_pruned:
+        print(f"[sft] {n_pruned}/{len(records)} records pruned - their prompt alone "
+              f"exceeds max_seq_len={cfg.max_seq_len} (kept rather than truncating the "
+              f"answer, which would train on a cut-off target)", flush=True)
     if not encoded:
         raise ValueError("no trainable examples after tokenisation (max_seq_len too small?)")
 
@@ -226,6 +234,18 @@ def train_sft(
         loss.backward()
         micro += 1
         tokens_seen += int(batch.attention_mask.sum())
+        loss_value = float(out.loss.detach().float())
+        # This loop had no per-step cleanup at all - unlike train_latent_sft's
+        # loop (see its own comment on why gc.collect() is needed, not just
+        # empty_cache()), so held references from one micro-step's forward
+        # graph could accumulate into the next. Observed in practice as a
+        # steady per-step GPU climb (21.68 -> 21.96 -> 22.10GB across three
+        # logged steps) that then OOM'd on an unremarkable-sized record - not
+        # obviously a single huge outlier, consistent with accumulation.
+        del out, loss, batch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if micro % cfg.grad_accum == 0:
             for g in optim.param_groups:
@@ -237,7 +257,7 @@ def train_sft(
             if opt_step % cfg.logging_steps == 0 or opt_step == opt_steps:
                 rec = {
                     "step": opt_step,
-                    "loss": float(out.loss.detach().float()),
+                    "loss": loss_value,
                     "lr": lr_at(opt_step),
                     "tokens_seen": tokens_seen,
                     "elapsed_s": round(time.time() - t0, 1),

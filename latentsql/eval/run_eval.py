@@ -82,6 +82,7 @@ def eval_student(
     steering: Any = None,
     steering_agent: str = "",
     steering_alpha: float = 1.0,
+    latent_roles: Optional[int] = None,
     progress: bool = True,
     spec: Any = None,
     stream_path: Optional[str] = None,
@@ -138,11 +139,16 @@ def eval_student(
         try:
             if reasoner is not None:
                 run = reasoner.generate(
-                    sp["system"], sp["user"], max_new_tokens=max_new_tokens, temperature=temperature
+                    sp["system"], sp["user"], max_new_tokens=max_new_tokens,
+                    temperature=temperature, n_latent_roles=latent_roles,
                 )
                 text, n_out = run.text, run.n_decoded_tokens
                 n_in = len(tok(sp["system"] + sp["user"])["input_ids"])
-                extra = {"latent_steps": run.n_latent_steps, "roles": run.roles}
+                extra = {
+                    "latent_steps": run.n_latent_steps,
+                    "latent_roles": latent_roles,
+                    "roles": run.roles,
+                }
             else:
                 chat = render_chat(
                     tok,

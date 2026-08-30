@@ -41,6 +41,8 @@ import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..mas.prompts import student_prompt
+from ..llm.hf_local import render_chat
+from ..mas.trace import T_CONSENSUS_OPEN, T_CONSENSUS_CLOSE, T_END, T_AGENT_CLOSE, agent_tag
 
 #: sequence positions upcast to fp32 at once when scoring log-probabilities -
 #: same chunking trick as grpo.py/dpo.py, same OOM this avoids.
@@ -53,6 +55,121 @@ def _target_ids(tok, gold_sql: str) -> List[int]:
     if tok.eos_token_id is not None:
         ids = ids + [tok.eos_token_id]
     return ids
+
+
+def _consensus_target_ids(tok, gold_sql: str) -> List[int]:
+    """SQL-only target after the consensus marker."""
+    text = f"\n```sql\n{gold_sql.strip()}\n```\n{T_CONSENSUS_CLOSE}\n{T_END}"
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    if tok.eos_token_id is not None:
+        ids = ids + [tok.eos_token_id]
+    return ids
+
+
+def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: int,
+                           target_ids: Sequence[int],
+                           sql_ready_role: Optional[int] = None,
+                           sql_ready_tokens: int = 16) -> tuple:
+    """Strict COCONUT training loss, without the inference-time KV cache.
+
+    COCONUT trains by repeatedly running the model on the current sequence to
+    obtain the next continuous thought, appending that hidden state as an input
+    embedding, then doing a final teacher-forced forward over the sequence with
+    loss masked on the prompt and latent thoughts. This is deliberately separate
+    from ``LatentReasoner.build_prefix``: that method builds the inference/GRPO
+    KV prefix, while this method follows the paper's memory-safer training
+    shape using ``use_cache=False``.
+    """
+    import torch
+
+    tok, model = reasoner.bundle.tokenizer, reasoner.bundle.model
+    device = reasoner.bundle.device
+    cfg = reasoner.cfg
+    embed = model.get_input_embeddings()
+    chat = render_chat(
+        tok,
+        [{"role": "system", "content": rec["system"]}, {"role": "user", "content": rec["prompt"]}],
+        add_generation_prompt=True,
+    )
+
+    pieces = []
+    labels = []
+    sql_ready_terms = []
+
+    def add_token_ids(ids: Sequence[int], supervise: bool):
+        if not ids:
+            return
+        ids_t = torch.tensor([list(ids)], device=device)
+        pieces.append(embed(ids_t))
+        labels.extend(list(ids) if supervise else [-100] * len(ids))
+
+    def add_text(text: str, supervise: bool):
+        add_token_ids(tok(text, add_special_tokens=False)["input_ids"], supervise)
+
+    add_text(chat, supervise=False)
+    for idx, role in enumerate(cfg.roles):
+        if role == "consensus":
+            break
+        if idx >= n_latent_roles:
+            break
+        add_text(agent_tag(role) + "\n", supervise=False)
+        for _ in range(cfg.latent_steps):
+            cur = torch.cat(pieces, dim=1)
+            attn = torch.ones(cur.shape[:2], dtype=torch.long, device=device)
+            out = model(
+                inputs_embeds=cur,
+                attention_mask=attn,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            hidden = out.hidden_states[-1][:, -1:, :]
+            pieces.append(reasoner.align(hidden))
+            labels.append(-100)
+            del out, cur, attn
+
+        if sql_ready_role and idx + 1 == sql_ready_role and target_ids:
+            probe_target = list(target_ids[: max(1, int(sql_ready_tokens))])
+            consensus_ids = tok(T_CONSENSUS_OPEN, add_special_tokens=False)["input_ids"]
+            probe_pieces = list(pieces)
+            probe_labels = list(labels)
+            if consensus_ids:
+                ids_t = torch.tensor([consensus_ids], device=device)
+                probe_pieces.append(embed(ids_t))
+                probe_labels.extend([-100] * len(consensus_ids))
+            ids_t = torch.tensor([probe_target], device=device)
+            probe_pieces.append(embed(ids_t))
+            probe_labels.extend(probe_target)
+            probe_inputs = torch.cat(probe_pieces, dim=1)
+            probe_labels_t = torch.tensor([probe_labels], device=device)
+            probe_attn = torch.ones(probe_inputs.shape[:2], dtype=torch.long, device=device)
+            probe_out = model(
+                inputs_embeds=probe_inputs,
+                attention_mask=probe_attn,
+                labels=probe_labels_t,
+                use_cache=False,
+            )
+            sql_ready_terms.append(probe_out.loss)
+            del probe_out, probe_inputs, probe_labels_t, probe_attn, probe_pieces, probe_labels
+
+    add_text(T_CONSENSUS_OPEN, supervise=False)
+    add_token_ids(target_ids, supervise=True)
+
+    inputs_embeds = torch.cat(pieces, dim=1)
+    labels_t = torch.tensor([labels], device=device)
+    attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+    out = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attn,
+        labels=labels_t,
+        use_cache=False,
+    )
+    n_supervised = sum(1 for x in labels if x != -100)
+    sql_ready_loss = (
+        torch.stack(sql_ready_terms).mean()
+        if sql_ready_terms
+        else torch.zeros((), device=device, dtype=torch.float32)
+    )
+    return out.loss, n_supervised, len(cfg.roles) - 1, sql_ready_loss
 
 
 def role_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
@@ -76,11 +193,77 @@ def role_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
     return out
 
 
+def chess_step_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
+    """Render available CHESS-style pipeline artifacts as ordered steps.
+
+    Existing traces do not keep CHESS's raw three candidates or unit-test
+    assertions separately. The best local approximation is therefore the
+    pipeline state the project does record: retrieved values, schema links,
+    query class, the selected CHESS candidate, execution feedback, and the
+    selector/consensus decision.
+    """
+    chess_turns = [t for t in trace.turns if t.agent == "chess"]
+    first_chess = sorted(chess_turns, key=lambda t: t.round)[0] if chess_turns else None
+    final_chess = sorted(chess_turns, key=lambda t: t.round)[-1] if chess_turns else None
+
+    def block(role: str, body: str) -> Optional[str]:
+        body = (body or "").strip()
+        if not body:
+            return None
+        return f"{agent_tag(role)}\n{body}\n{T_AGENT_CLOSE}"
+
+    values = "\n".join(f"- {v}" for v in getattr(trace, "value_hints", []) or [])
+    step_map: Dict[str, Optional[str]] = {
+        "information_retriever": block(
+            "information_retriever",
+            values or "No retrieved literal values were needed.",
+        ),
+        "schema_linker": block("schema_linker", getattr(trace, "schema_links", "")),
+        "query_classifier": block(
+            "query_classifier", getattr(trace, "difficulty_class", "") or "UNKNOWN"
+        ),
+        "candidate_generator": block(
+            "candidate_generator",
+            (
+                f"{first_chess.reasoning.strip()}\n```sql\n{first_chess.sql}\n```"
+                if first_chess and first_chess.sql else ""
+            ),
+        ),
+        "query_fixer": block(
+            "query_fixer",
+            (
+                f"Execution feedback:\n"
+                f"{(final_chess.exec_error or final_chess.exec_preview or 'query executed').strip()}\n"
+                f"Corrected query:\n```sql\n{final_chess.sql}\n```"
+                if final_chess and final_chess.sql else ""
+            ),
+        ),
+        "unit_tester": block(
+            "unit_tester",
+            (
+                f"Selector: {getattr(trace, 'meta', {}).get('selector', 'unknown')}\n"
+                f"Chosen SQL:\n```sql\n{trace.consensus_sql or trace.gold_sql}\n```"
+            ),
+        ),
+    }
+
+    out: List[str] = []
+    for role in roles:
+        if role == "consensus":
+            break
+        text = step_map.get(role)
+        if text is None:
+            return None
+        out.append(text)
+    return out
+
+
 def build_records_from_traces(traces: Sequence[Any], cfg: Any,
                               max_prompt_chars: Optional[int] = None,
                               max_role_chars: Optional[int] = None,
                               tokenizer: Any = None,
-                              max_total_tokens: Optional[int] = None) -> List[Dict[str, Any]]:
+                              max_total_tokens: Optional[int] = None,
+                              chain_format: str = "debate_roles") -> List[Dict[str, Any]]:
     """Turn ``DebateTrace`` objects into latent-SFT records, with ``role_turns``
     populated for the curriculum. Traces missing a full set of role turns keep
     ``role_turns=None`` (curriculum falls back to a bare tag for any role it
@@ -107,6 +290,8 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
     n_missing_turns = 0
     n_oversized_turns = 0
     n_oversized_tokens = 0
+    n_truncated_schema = 0
+    n_dropped_overflow = 0
     for tr in traces:
         if not tr.gold_sql:
             continue
@@ -115,8 +300,29 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
             value_hints="\n".join(f"- {v}" for v in tr.value_hints),
         )
         if max_prompt_chars and len(sp["user"]) > max_prompt_chars:
-            continue
-        rt = role_turns_for(tr, cfg.latent.roles)
+            # Truncate the schema (almost always the largest, most cuttable
+            # part - a full CREATE TABLE dump) rather than dropping the
+            # record outright, so an otherwise-fine question doesn't get
+            # thrown away just because its schema is long. Question/evidence/
+            # value hints are short and load-bearing - never touched.
+            overage = len(sp["user"]) - max_prompt_chars
+            schema_budget = max(0, len(tr.schema_prompt) - overage - 20)
+            truncated_schema = tr.schema_prompt[:schema_budget] + "\n-- (schema truncated)"
+            sp = student_prompt(
+                schema=truncated_schema, question=tr.question, evidence=tr.evidence,
+                value_hints="\n".join(f"- {v}" for v in tr.value_hints),
+            )
+            n_truncated_schema += 1
+            if len(sp["user"]) > max_prompt_chars:
+                # question/evidence/value hints alone already overflow - no
+                # amount of schema truncation fixes that, so this one really
+                # does have to be dropped.
+                n_dropped_overflow += 1
+                continue
+        if chain_format == "chess_steps":
+            rt = chess_step_turns_for(tr, cfg.latent.roles)
+        else:
+            rt = role_turns_for(tr, cfg.latent.roles)
         if rt is None:
             n_missing_turns += 1
         elif max_role_chars and max(len(t) for t in rt) > max_role_chars:
@@ -134,6 +340,11 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
             "qid": tr.qid, "system": sp["system"], "prompt": sp["user"],
             "gold_sql": tr.gold_sql, "role_turns": rt,
         })
+    if n_truncated_schema:
+        print(f"[latent_sft] {n_truncated_schema}/{len(out) + n_dropped_overflow} traces had "
+              f"their schema truncated to fit max_prompt_chars={max_prompt_chars} "
+              f"({n_dropped_overflow} still overflowed on question/evidence alone and were "
+              f"dropped)", flush=True)
     if n_missing_turns:
         print(f"[latent_sft] {n_missing_turns}/{len(out)} traces missing a full role-turn set "
               f"(curriculum falls back to a bare tag for those roles)", flush=True)
@@ -175,9 +386,22 @@ def train_latent_sft(
     n_roles = len(cfg.latent.roles) - 1  # excludes "consensus"
     curriculum = bool(getattr(cfg, "curriculum", False))
 
+    coconut_objective = bool(getattr(cfg, "coconut_objective", False))
+    require_role_turns = bool(getattr(cfg, "require_role_turns", False))
     usable = [r for r in records if r.get("gold_sql")]
+    if require_role_turns:
+        before = len(usable)
+        usable = [r for r in usable if r.get("role_turns") is not None]
+        dropped = before - len(usable)
+        if dropped:
+            print(f"[latent_sft] dropped {dropped}/{before} records without full role-turn text "
+                  f"(strict role-turn training)", flush=True)
     if not usable:
         raise ValueError("no records with a gold_sql - nothing to train on")
+    if coconut_objective and not curriculum:
+        raise ValueError("--coconut-objective requires curriculum=True")
+    if coconut_objective:
+        cfg.supervise_text = False
 
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=cfg.lr)
@@ -203,10 +427,14 @@ def train_latent_sft(
             header=run_environment(
                 stage="latent_sft", n_records=len(usable), lr=cfg.lr, epochs=cfg.epochs,
                 latent_steps=cfg.latent.latent_steps, roles=list(cfg.latent.roles),
-                curriculum=curriculum,
+                curriculum=curriculum, coconut_objective=coconut_objective,
             ),
         )
     reset_gpu_peak()
+    if os.environ.get("LATENTSQL_DEBUG_CTX"):
+        print(f"[latent_sft DEBUG] baseline after model+optim load: "
+              f"alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
+              f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GB", flush=True)
 
     order = list(range(len(usable)))
     rng = random.Random(getattr(cfg, "seed", 0))
@@ -225,7 +453,7 @@ def train_latent_sft(
     # suspend it for the whole prefix+completion computation, not just the prefix.
     ckpt = bool(getattr(model, "is_gradient_checkpointing", False))
     prev_use_cache = getattr(model.config, "use_cache", True)
-    if ckpt:
+    if ckpt and not coconut_objective:
         model.gradient_checkpointing_disable()
     model.config.use_cache = True
 
@@ -235,7 +463,10 @@ def train_latent_sft(
             if step % len(order) == 0 and step > 0:
                 rng.shuffle(order)
             rec = usable[order[step % len(order)]]
-            target_ids = _target_ids(tok, rec["gold_sql"])
+            target_ids = (
+                _consensus_target_ids(tok, rec["gold_sql"])
+                if coconut_objective else _target_ids(tok, rec["gold_sql"])
+            )
             if not target_ids:
                 continue
 
@@ -264,41 +495,66 @@ def train_latent_sft(
             aux_weight = float(getattr(cfg, "aux_weight", 0.5))
             supervise_text = bool(getattr(cfg, "supervise_text", False))
             text_weight = float(getattr(cfg, "text_weight", 1.0))
+            sql_ready_role = getattr(cfg, "sql_ready_role", None)
+            sql_ready_weight = float(getattr(cfg, "sql_ready_weight", 0.0) or 0.0)
+            sql_ready_tokens = int(getattr(cfg, "sql_ready_tokens", 16) or 16)
+            sql_ready_active = (
+                coconut_objective
+                and sql_ready_role is not None
+                and sql_ready_weight > 0
+                and n_latent_roles is not None
+                and n_latent_roles >= int(sql_ready_role)
+            )
 
             try:
-                past, attn, first_logits, aux_loss, text_gen_loss = reasoner.build_prefix(
-                    rec["system"], rec["prompt"], grad=True,
-                    role_turns=role_turns, n_latent_roles=n_latent_roles,
-                    decode_compare=decode_compare, supervise_text=supervise_text,
-                )
-                ids = torch.tensor([target_ids], device=bundle.device)
-                first_lp = F.log_softmax(first_logits.float(), dim=-1)[0, target_ids[0]]
-                terms = [first_lp]
-                if len(target_ids) > 1:
-                    attn2 = torch.cat(
-                        [attn, torch.ones(1, ids.shape[1] - 1, dtype=attn.dtype, device=attn.device)],
-                        dim=-1,
+                if coconut_objective:
+                    base_loss, n_tok, _n_roles, sql_ready_loss = _coconut_sequence_loss(
+                        reasoner, rec, n_latent_roles, target_ids,
+                        sql_ready_role=(int(sql_ready_role) if sql_ready_active else None),
+                        sql_ready_tokens=sql_ready_tokens,
                     )
-                    out = model(input_ids=ids[:, :-1], past_key_values=past,
-                                attention_mask=attn2, use_cache=False)
-                    logits, tgt = out.logits, ids[:, 1:]
-                    parts = []
-                    for i in range(0, logits.shape[1], _LOGP_CHUNK):
-                        block = F.log_softmax(logits[:, i:i + _LOGP_CHUNK, :].float(), dim=-1)
-                        tb = tgt[:, i:i + _LOGP_CHUNK]
-                        parts.append(block.gather(-1, tb.unsqueeze(-1)).squeeze(-1))
-                    terms.append(torch.cat(parts, dim=1).sum())
-                    del out, logits
-                token_logp = torch.stack(
-                    [x.reshape(()) if x.dim() == 0 else x.sum() for x in terms]
-                ).sum()
-                n_tok = len(target_ids)
-                sql_loss = -token_logp / n_tok  # mean NLL per token
-                loss = sql_loss
-                if decode_compare:
-                    loss = loss + aux_weight * aux_loss
-                if supervise_text:
-                    loss = loss + text_weight * text_gen_loss
+                    sql_loss = base_loss
+                    loss = sql_loss
+                    if sql_ready_active:
+                        loss = loss + sql_ready_weight * sql_ready_loss
+                    aux_loss = torch.zeros((), device=bundle.device, dtype=torch.float32)
+                    text_gen_loss = sql_loss
+                    past = attn = first_logits = terms = token_logp = ids = None
+                else:
+                    past, attn, first_logits, aux_loss, text_gen_loss = reasoner.build_prefix(
+                        rec["system"], rec["prompt"], grad=True,
+                        role_turns=role_turns, n_latent_roles=n_latent_roles,
+                        decode_compare=decode_compare, supervise_text=supervise_text,
+                    )
+                    ids = torch.tensor([target_ids], device=bundle.device)
+                    first_lp = F.log_softmax(first_logits.float(), dim=-1)[0, target_ids[0]]
+                    terms = [first_lp]
+                    if len(target_ids) > 1:
+                        attn2 = torch.cat(
+                            [attn, torch.ones(1, ids.shape[1] - 1, dtype=attn.dtype, device=attn.device)],
+                            dim=-1,
+                        )
+                        out = model(input_ids=ids[:, :-1], past_key_values=past,
+                                    attention_mask=attn2, use_cache=False)
+                        logits, tgt = out.logits, ids[:, 1:]
+                        parts = []
+                        for i in range(0, logits.shape[1], _LOGP_CHUNK):
+                            block = F.log_softmax(logits[:, i:i + _LOGP_CHUNK, :].float(), dim=-1)
+                            tb = tgt[:, i:i + _LOGP_CHUNK]
+                            parts.append(block.gather(-1, tb.unsqueeze(-1)).squeeze(-1))
+                        terms.append(torch.cat(parts, dim=1).sum())
+                        del out, logits
+                    token_logp = torch.stack(
+                        [x.reshape(()) if x.dim() == 0 else x.sum() for x in terms]
+                    ).sum()
+                    n_tok = len(target_ids)
+                    sql_loss = -token_logp / n_tok  # mean NLL per token
+                    loss = sql_loss
+                    if decode_compare:
+                        loss = loss + aux_weight * aux_loss
+                    if supervise_text:
+                        loss = loss + text_weight * text_gen_loss
+                    sql_ready_loss = torch.zeros((), device=bundle.device, dtype=torch.float32)
 
                 (loss / cfg.grad_accum).backward()
             except torch.cuda.OutOfMemoryError as e:
@@ -327,7 +583,9 @@ def train_latent_sft(
             loss_value = float(loss.detach())
             sql_loss_value = float(sql_loss.detach())
             aux_loss_value = float(aux_loss.detach())
-            del past, attn, first_logits, terms, token_logp, loss, sql_loss, aux_loss, ids
+            sql_ready_loss_value = float(sql_ready_loss.detach())
+            text_loss_value = float(text_gen_loss.detach())
+            del past, attn, first_logits, terms, token_logp, loss, sql_loss, aux_loss, sql_ready_loss, text_gen_loss, ids
             # empty_cache() alone does not reclaim tensors still held by a
             # Python reference cycle (autograd graphs commonly form one via
             # grad_fn <-> saved tensors) - only a real gc pass breaks those.
@@ -345,6 +603,8 @@ def train_latent_sft(
                     "step": step + 1, "loss": loss_value,
                     "sql_loss": sql_loss_value,
                     "aux_loss": aux_loss_value if decode_compare else None,
+                    "sql_ready_loss": sql_ready_loss_value if sql_ready_active else None,
+                    "text_loss": text_loss_value if supervise_text else None,
                     "qid": rec.get("qid", ""), "n_target_tokens": n_tok,
                     "n_latent_roles": n_latent_roles if curriculum else n_roles,
                     "elapsed_s": round(time.time() - t0, 1),
@@ -360,7 +620,7 @@ def train_latent_sft(
 
                 save_student(bundle, cfg.output_dir)
     finally:
-        if ckpt:
+        if ckpt and not coconut_objective:
             model.gradient_checkpointing_enable()
         model.config.use_cache = prev_use_cache
 
@@ -375,6 +635,7 @@ def train_latent_sft(
         "n_records": len(usable),
         "steps": n_steps,
         "curriculum": curriculum,
+        "coconut_objective": coconut_objective,
         "elapsed_s": round(time.time() - t0, 1),
         "final_loss": history[-1]["loss"] if history else None,
         **gpu_stats(),

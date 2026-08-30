@@ -320,6 +320,10 @@ class LatentConfig:
     soft_embed_temperature: float = 1.0
     share_working_memory: bool = True   # prepend previous roles' KV caches
     train_latent_slots: bool = False    # curriculum-replace agent spans with latent slots
+    max_context_tokens: Optional[int] = None  # optional runtime KV-prefix cap; strict
+                                             # COCONUT training should normally filter
+                                             # long records before training rather than
+                                             # silently truncating the supervised chain.
 
 
 @dataclass

@@ -14,7 +14,7 @@ set -u
 cd /home/trinh/Dropbox/thesis/latent_agent_text2sql
 
 N_PASSES=${1:-5}
-N=${2:-813}
+N=${2:-auto}
 BATCH_SIZE=${3:-16}
 BASE=${4:-outputs/latent_sft_big/sft}
 N_ROLES=${5:-8}
@@ -23,10 +23,14 @@ CONFIG=${7:-configs/latent_sft_1000.yaml}
 EVAL_EVERY=${8:-10}
 EVAL_N=${9:-30}
 LR=${10:-1e-4}
-LATENT_STEPS=${11:-12}
+LATENT_STEPS=${11:-2}
 RUNDIR=${12:-outputs/latent_sft_1000/curriculum_chain_batched}
 GPU_FRACTION=${13:-0.72}
 BASE_MODEL=${14:-Qwen/Qwen2.5-Coder-3B-Instruct}
+MAX_PROMPT_CHARS=${15:-2000}                    # was missing entirely - this wrapper silently
+MAX_ROLE_CHARS=${16:-400}                       # fell back to run_curriculum_chain_batched.sh's
+                                                 # OWN defaults (3000/600), which are NOT the
+                                                 # values validated safe this session.
 OUT="$RUNDIR/latent_sft"
 MPLOG="${RUNDIR}_multipass.log"
 : > "$MPLOG"
@@ -38,7 +42,7 @@ for p in $(seq 1 "$N_PASSES"); do
   echo "=== [$(date +%H:%M:%S)] PASS $p/$N_PASSES starting from $CUR (wipe=$wipe) ===" | tee -a "$MPLOG"
   bash scripts/run_curriculum_chain_batched.sh "$N" "$BATCH_SIZE" 0 "$CUR" "$N_ROLES" \
     "$DATA" "$CONFIG" "$EVAL_EVERY" "$EVAL_N" "$LR" "$wipe" "$LATENT_STEPS" "$RUNDIR" \
-    "$GPU_FRACTION" "$BASE_MODEL"
+    "$GPU_FRACTION" "$BASE_MODEL" "$MAX_PROMPT_CHARS" "$MAX_ROLE_CHARS"
   code=$?
   echo "=== [$(date +%H:%M:%S)] PASS $p/$N_PASSES done, exit code $code ===" | tee -a "$MPLOG"
   if [ $code -ne 0 ]; then

@@ -28,7 +28,7 @@
 set -u
 cd /home/trinh/Dropbox/thesis/latent_agent_text2sql
 
-N=${1:-1000}                                    # total records in this ramp
+N=${1:-auto}                                    # total FILTERED records in this ramp
 BATCH_SIZE=${2:-16}
 START_BATCH=${3:-0}
 BASE=${4:-outputs/latent_sft_big/sft}
@@ -44,23 +44,69 @@ WIPE=${11:-1}                                   # 0 for pass 2+ of a multi-pass 
                                                  # across passes instead of resetting them just
                                                  # because each pass's own curriculum ramp
                                                  # restarts at batch 0.
-LATENT_STEPS=${12:-12}                          # COCONUT's own demonstrated max is c_thought=2 x
-                                                 # max_latent_stage=3 = 6 total latent tokens ever -
-                                                 # our 12-per-role x up to 8 roles = 96 at full depth
-                                                 # is 16x beyond anything they've shown works.
+LATENT_STEPS=${12:-2}                           # COCONUT's own demonstrated max is c_thought=2 x
+                                                 # max_latent_stage=3 = 6 total latent tokens ever.
+                                                 # Also a hard memory constraint on this card: each
+                                                 # latent role is LATENT_STEPS chained, uncheckpointed
+                                                 # (HF per-layer checkpointing is off for this whole
+                                                 # path - see latent_sft.py) forward calls: at
+                                                 # LATENT_STEPS=5, n_latent_roles=4 (20 chained calls)
+                                                 # OOM'd on 100% of batches in the 7B bf16 curriculum
+                                                 # run; LATENT_STEPS=2 (8 chained calls at the same
+                                                 # depth, 16 at full depth=8) fits with margin.
 RUNDIR=${13:-outputs/latent_sft_1000/curriculum_chain_batched}
 GPU_FRACTION=${14:-0.72}                        # 0.893 ~= 21GB of the 23.508GB card
 BASE_MODEL=${15:-Qwen/Qwen2.5-Coder-3B-Instruct}
+MAX_PROMPT_CHARS=${16:-3000}
+MAX_ROLE_CHARS=${17:-600}
 OUT="$RUNDIR/latent_sft"
 OPTIM_STATE="$RUNDIR/optim_state.pt"
 LOG="${RUNDIR}.log"
 EVAL_LOG="${RUNDIR}_eval_progress.log"
 EVAL_DIR="${RUNDIR}_eval_progress"
 mkdir -p "$RUNDIR"
-N_BATCHES=$(( (N + BATCH_SIZE - 1) / BATCH_SIZE ))
 [ "$START_BATCH" -eq 0 ] && [ "$WIPE" -eq 1 ] && { : > "$LOG"; : > "$EVAL_LOG"; rm -f "$OPTIM_STATE"; }
 
+USABLE_N=$(python3 - "$DATA" "$CONFIG" "$MAX_PROMPT_CHARS" "$MAX_ROLE_CHARS" <<'PY'
+import contextlib
+import io
+import sys
+
+from latentsql.config import load_config
+from latentsql.distill.latent_sft import build_records_from_traces
+from latentsql.mas.trace import load_traces
+
+data, config, max_prompt, max_role = sys.argv[1:5]
+cfg = load_config(config)
+max_prompt = None if max_prompt in ("", "none", "None") else int(max_prompt)
+max_role = None if max_role in ("", "none", "None") else int(max_role)
+with contextlib.redirect_stdout(io.StringIO()):
+    records = build_records_from_traces(
+        load_traces(data),
+        cfg,
+        max_prompt_chars=max_prompt,
+        max_role_chars=max_role,
+    )
+print(len(records))
+PY
+)
+case "$N" in
+  auto)
+    N="$USABLE_N"
+    ;;
+  *)
+    if [ "$N" -gt "$USABLE_N" ]; then
+      echo "[curriculum] requested N=$N, but only $USABLE_N records remain after filtering; clamping N=$USABLE_N" | tee -a "$LOG"
+      N="$USABLE_N"
+    fi
+    ;;
+esac
+
+N_BATCHES=$(( (N + BATCH_SIZE - 1) / BATCH_SIZE ))
+echo "[curriculum] using N=$N filtered records ($USABLE_N available), batch_size=$BATCH_SIZE" | tee -a "$LOG"
+
 CUR="$BASE"
+declare -a OK_DEPTH=()
 for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
   offset=$((b * BATCH_SIZE))
   remaining=$((N - offset))
@@ -78,7 +124,7 @@ for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
     --out "$OUT" \
     --curriculum --latent-steps "$LATENT_STEPS" \
     --roles din_sql,dail_sql,chess,chase_sql,din_sql,dail_sql,chess,chase_sql,consensus \
-    --max-prompt-chars 3000 --max-role-chars 600 \
+    --max-prompt-chars "$MAX_PROMPT_CHARS" --max-role-chars "$MAX_ROLE_CHARS" \
     --force-n-latent-roles "$n_latent_roles" \
     --optim-state "$OPTIM_STATE" \
     --supervise-text --text-weight 1.0 --lr "$LR" \
@@ -90,6 +136,7 @@ for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
     echo "!!! batch $b FAILED (see $LOG) - skipping, next batch starts fresh from $CUR (unchanged)" | tee -a "$LOG"
     continue
   fi
+  OK_DEPTH[$n_latent_roles]=$(( ${OK_DEPTH[$n_latent_roles]:-0} + 1 ))
   CUR="$OUT"
 
   if [ "$EVAL_EVERY" -gt 0 ] && [ $(( (b + 1) % EVAL_EVERY )) -eq 0 ]; then
@@ -112,3 +159,7 @@ for b in $(seq "$START_BATCH" $((N_BATCHES - 1))); do
   fi
 done
 echo "=== chain done: batches $START_BATCH..$((N_BATCHES-1)) folded into $OUT ===" | tee -a "$LOG"
+if [ "${OK_DEPTH[$N_ROLES]:-0}" -eq 0 ]; then
+  echo "!!! no successful full-depth batches (n_latent_roles=$N_ROLES); checkpoint is not valid for full latent eval" | tee -a "$LOG"
+  exit 2
+fi
