@@ -22,6 +22,33 @@ outputs/*
 *.pt
 !latentsql/**/*.py
 
+# LaTeX build artifacts - keep only the .tex source and the compiled .pdf
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.bbl
+*.bcf
+*.blg
+*.run.xml
+*.nav
+*.snm
+*.vrb
+*.idx
+*.ilg
+*.ind
+*.glo
+*.gls
+*.glg
+*.acn
+*.acr
+*.alg
+
 # os
 .DS_Store
 Thumbs.db

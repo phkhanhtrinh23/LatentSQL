@@ -1,0 +1,3186 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{seqsplit}
+\usepackage{longtable}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=0.5em,
+  framexleftmargin=0.5em
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+\title{LatentSQL: Internalising a Multi-Agent Text-to-SQL Pipeline\\
+into the Latent Space of a Single Small Language Model\\
+\large A step-by-step derivation, from first principles to the code}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Large language models solve Text-to-SQL well but are expensive to run. Small
+language models (SLMs) are cheap, but individually lack the reasoning capacity
+for hard queries. The standard remedy is to decompose the task across a
+\emph{multi-agent system} --- retrieval, schema linking, classification,
+candidate generation, fixing, verification --- which restores accuracy at the
+cost of many model calls, tens of thousands of generated tokens, extra training
+and coordination machinery, and error propagation between stages.
+
+\textbf{LatentSQL} removes the coordination layer without removing the
+reasoning. It trains \emph{one} SLM to run the entire pipeline inside its own
+activation space: each pipeline role is replaced by a small number of
+\emph{continuous thoughts} --- hidden-state vectors fed back into the model as
+input embeddings, emitting no tokens at all --- and only the final SQL query is
+ever decoded. The architecture follows \textbf{IMAD} (Yi, Mueller and Lee, ACL
+2026, ``Latent Agents: A Post-Training Procedure for Internalized Multi-Agent
+Debate''), the latent mechanism follows \textbf{Coconut} (Hao et al., ``Training
+Large Language Models to Reason in a Continuous Latent Space''), and the role
+chain follows \textbf{CHESS} (Talaei et al., 2024).
+
+This document explains that system from the very beginning, assuming no prior
+knowledge, and is organised strictly from the lowest level to the highest.
+
+Part~\ref{part:problem} states the problem from nothing. Part~\ref{part:token}
+descends to the smallest object in the system --- one token, one embedding, one
+hidden state --- and shows exactly where text is created. Part~\ref{part:bottleneck}
+proves, with the Data Processing Inequality and an entropy ceiling, that writing
+reasoning out as text is a strictly lossy channel, and computes the size of the
+loss with this project's own numbers. Part~\ref{part:coconut} builds the
+continuous thought, the alignment map, and the latent working memory.
+Part~\ref{part:roles} turns a six-stage agent pipeline into a chain of latent
+slots. Part~\ref{part:activation} gives the activation-space theory that makes
+this possible at all, including a proof that difference-in-means is the optimal
+linear probe under isotropic noise. Part~\ref{part:objective} derives the
+training loss exactly as the code computes it. Part~\ref{part:optimiser} proves
+a small, uncomfortable fact about Adam that turns out to explain a real failure.
+Part~\ref{part:collapse} is a complete worked diagnosis of that failure --- the
+stage-4 collapse --- and its repair. Part~\ref{part:grpo} adds reinforcement
+learning. Part~\ref{part:grpo-activation} asks what that reinforcement stage
+does to the agent-subspace geometry Part~\ref{part:activation} established ---
+proving a structural limit in this project's own GRPO implementation and
+weighing it against four newly-read papers on latent-reasoning GRPO and
+persona-vector geometry. Part~\ref{part:code} maps every equation to the exact
+line of code that implements it. Part~\ref{part:results} reports the measured results,
+including where the method fails. Part~\ref{part:limits} lists what is not
+established. Part~\ref{part:formulas} collects every formula in one place.
+
+Every symbol is defined before it is used. Every proof is given in full. Every
+number reported is one this project actually measured, and where two
+explanations are consistent with a measurement, both are stated.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+\part{The problem, stated from nothing}
+\label{part:problem}
+
+\section{What a Text-to-SQL system does}
+
+A \textbf{database} is a collection of tables. A \textbf{schema} is the
+description of those tables: their names, their columns, and the type of each
+column. Here is a tiny one, written in the language databases themselves use:
+
+\begin{lstlisting}
+CREATE TABLE museum   (museum_id INT, name TEXT, opened INT);
+CREATE TABLE visitor  (visitor_id INT, name TEXT, age INT);
+CREATE TABLE visit    (museum_id INT, visitor_id INT, spent REAL);
+\end{lstlisting}
+
+A \textbf{query} is a program in the language SQL that asks a question of those
+tables and returns a small table of numbers or strings as its answer:
+
+\begin{lstlisting}
+SELECT name FROM visitor WHERE age > 30;
+\end{lstlisting}
+
+\textbf{Text-to-SQL} is the task of writing that program automatically. The
+input is a question in English together with the schema; the output is a SQL
+query. Formally, we want a function
+\[
+f:\ (q, S)\ \longmapsto\ y,
+\]
+where $q$ is the question, $S$ is the schema, and $y$ is a SQL query.
+
+\subsection{How we decide whether the output is right}
+
+We do \emph{not} compare the generated query to the gold query as strings. Two
+different SQL programs very often compute exactly the same answer, and a
+string comparison would call one of them wrong for no reason.
+
+\begin{definition}[Execution accuracy, EX]
+\label{def:ex}
+Let $y$ be the predicted query and $y^\star$ the gold query, both run against
+the same database $D$. Write $\mathrm{exec}(y, D)$ for the table of results
+returned. Then the example is scored
+\[
+\mathrm{EX}(y,y^\star,D)=
+\begin{cases}
+1 & \text{if } \mathrm{exec}(y,D) = \mathrm{exec}(y^\star, D),\\[2pt]
+0 & \text{otherwise (including if $y$ fails to parse or errors).}
+\end{cases}
+\]
+Over a test set of $n$ examples, \textbf{execution accuracy} is the mean of
+this quantity, reported as a percentage.
+\end{definition}
+
+\begin{remark}
+Comparison of two result tables needs one subtlety: if the gold query contains
+an \texttt{ORDER BY} clause, row order is part of the answer and must match; if
+it does not, the two tables are compared as multisets of rows. This is what
+\texttt{latentsql/db/execute.py} does, via \texttt{gold\_is\_ordered} and
+\texttt{result\_match}.
+\end{remark}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Every accuracy number in this document is EX in the sense of
+Definition~\ref{def:ex}: the query was actually executed against the actual
+database, and the returned rows were compared. Nothing is scored by string
+similarity.
+}}
+\end{center}
+
+\subsection{The two benchmarks}
+
+We use a 50/50 mixture of two standard datasets.
+
+\begin{itemize}
+\item \textbf{Spider}: many small databases, questions that are mostly
+  single-table or simple joins. Easier.
+\item \textbf{BIRD}: large, messy, real-world databases, questions that need
+  external ``evidence'' hints and often numeric reasoning. Much harder.
+\end{itemize}
+
+Because the two differ so much in difficulty, a single averaged number hides
+what happened. Every result table below therefore reports EX overall
+\emph{and} EX on each half separately.
+
+\section{Why one small model is not enough}
+
+A \textbf{language model} is a function that, given a sequence of text, produces
+a probability distribution over the next token; generating text means sampling
+from that distribution repeatedly. A \textbf{small language model (SLM)} here
+means one with roughly $7$ billion parameters or fewer --- specifically
+\texttt{Qwen2.5-Coder-7B-Instruct}, which fits on a single 24\,GB consumer GPU.
+
+Ask such a model a hard BIRD question directly, in one shot, and it frequently
+fails. The reason is not that it lacks knowledge of SQL. It is that a hard
+question requires several distinct \emph{kinds} of work in sequence:
+
+\begin{enumerate}
+\item Find which literal values in the question actually occur in the database
+  (``Los Angeles'' might be stored as \texttt{LA}).
+\item Decide which of $80$ tables and $600$ columns are relevant at all.
+\item Decide whether the query is simple, needs a join, or needs a nested
+  subquery.
+\item Write a candidate query.
+\item Run it, see the error, and fix it.
+\item Check that the fixed query actually answers the question asked.
+\end{enumerate}
+
+Each of these is easy in isolation. Doing all six inside a single forward pass,
+with no intermediate scratch space, is not.
+
+\section{What a multi-agent pipeline does, and what it costs}
+
+The established fix is to give the model scratch space by \emph{decomposing}
+the task. Instead of one call, we make several, each with its own prompt, each
+handling one of the six jobs above, each passing its output as text to the
+next. This is what DIN-SQL, DAIL-SQL, CHESS and CHASE-SQL all do in different
+arrangements. CHESS in particular names four specialised agents --- Information
+Retriever, Schema Selector, Candidate Generator, Unit Tester --- and it is
+CHESS's decomposition we adopt.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{The multi-agent system works.} It is not a straw man. It genuinely
+raises accuracy, and it is the right baseline to beat.
+}}
+\end{center}
+
+But it costs four separate things:
+
+\begin{enumerate}
+\item \textbf{Tokens.} Every intermediate result must be \emph{written out} in
+  words so the next stage can read it. In this project's own measurements, a
+  fully verbalised run averages $2922.8$ total tokens per question, of which
+  $1339.3$ are generated.
+\item \textbf{Latency and money.} Each stage is a separate forward pass over a
+  long prompt.
+\item \textbf{Machinery.} Someone must write, tune, and maintain the
+  orchestration: the prompts, the routing, the retry logic.
+\item \textbf{Error propagation.} If schema linking drops the one column the
+  answer needs, no later stage can recover it. The mistake is now baked into
+  the text that everything downstream reads.
+\end{enumerate}
+
+\section{The idea of this project}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{Keep the decomposition. Delete the text.}\\[4pt]
+Train one small model so that each pipeline stage happens as a handful of
+\emph{internal vector states} rather than as written words, and only the final
+SQL query is ever decoded into tokens.
+}}
+\end{center}
+
+If this works, all four costs fall at once: the intermediate tokens disappear
+(they were never generated), the extra forward passes collapse into one
+sequence, the orchestration is gone (it is inside the weights), and error
+propagation is softened because a vector can carry an uncertain, partially
+formed hypothesis in a way a committed sentence cannot --- a point made precise
+in Section~\ref{sec:superposition}.
+
+\section{The formal problem}
+
+\begin{definition}[The object we are building]
+Let $\pi_\theta$ be a language model with parameters $\theta$. We want to
+choose $\theta$ so that, on a held-out set $\{(q_i, S_i, y^\star_i, D_i)\}_{i=1}^n$,
+the model's output $y_i$ maximises
+\[
+\frac{1}{n}\sum_{i=1}^{n}\mathrm{EX}(y_i, y^\star_i, D_i)
+\]
+subject to the constraint that the number of tokens decoded per question is
+small --- ideally just the SQL query itself, roughly $60$ tokens.
+\end{definition}
+
+Note carefully what is \emph{not} the goal. We are not trying to beat a
+frontier LLM. We are trying to answer two much sharper questions:
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{Test A.} Does a single SLM that runs the pipeline \emph{latently} beat
+the same SLM trained to run it \emph{in text}?\\[4pt]
+\textbf{Test B.} Does it match the explicit multi-agent system at the same
+model size, at a fraction of the tokens?
+}}
+\end{center}
+
+Everything below is (i) building the latent mechanism, (ii) proving what it can
+and cannot buy, (iii) training it, and (iv) measuring it.
+
+\newpage
+\part{The lowest level: one token, one hidden state}
+\label{part:token}
+
+Nothing in this part is specific to our method. It is the standard machinery of
+a transformer language model, written out in the exact notation the rest of the
+document uses. If you already know it, you can skim to
+Section~\ref{sec:roundtrip}, which is where the thesis actually begins.
+
+\section{Step 1: the token and its embedding}
+
+Text is first cut into \textbf{tokens} --- pieces roughly the size of a common
+word or a fragment of a rare one. The set of all possible tokens is the
+\textbf{vocabulary} $V$; each token is identified by an integer index. For our
+model,
+\[
+|V| = 152{,}064.
+\]
+
+A model cannot do arithmetic on an integer index, so each token $x$ is mapped
+to a vector by an \textbf{embedding function}
+\[
+e:\ V \to \mathbb{R}^{d}, \qquad d = 3584 \text{ for our model}.
+\]
+Concretely $e$ is a lookup in a matrix $W_{\mathrm{in}} \in \mathbb{R}^{|V|\times d}$:
+row $x$ of that matrix \emph{is} $e(x)$. The number $d$ is called the
+\textbf{hidden dimension}.
+
+\begin{example}
+If the token \texttt{"SELECT"} has index $4416$, then $e(\texttt{"SELECT"})$ is
+row $4416$ of $W_{\mathrm{in}}$: a specific list of $3584$ real numbers.
+\end{example}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{The single most important fact in this document:} the model does not
+actually consume tokens. It consumes \emph{vectors in $\mathbb{R}^d$}. Tokens
+are merely the usual way of producing those vectors. Nothing forces the input
+vector at a position to be a row of $W_{\mathrm{in}}$.
+}}
+\end{center}
+
+\section{Step 2: the transformer as a function on embeddings}
+
+Given a sequence of tokens $x = (x_1,\dots,x_T)$, form the matrix of their
+embeddings up to position $t$:
+\[
+E_t = \big[\,e(x_1),\ e(x_2),\ \dots,\ e(x_t)\,\big] \in \mathbb{R}^{t\times d}.
+\]
+The transformer is a function that maps this to a matrix of the same shape:
+\[
+H_t = \mathrm{Transformer}(E_t) \in \mathbb{R}^{t \times d}.
+\tag{2.1}
+\]
+Row $s$ of $H_t$ is the model's internal representation of position $s$ after
+it has looked at positions $1$ through $s$. We write
+\[
+h_t = H_t[t,:] \in \mathbb{R}^{d}
+\]
+for the last row: the \textbf{last hidden state}, the representation of the
+most recent position. This is the vector the whole method is built on.
+
+\begin{remark}[causality]
+The transformer is \emph{causal}: row $s$ depends only on positions $\le s$.
+That is what makes it possible to compute $h_1, h_2, \dots$ one at a time and
+reuse the earlier work --- see Section~\ref{sec:kv}.
+\end{remark}
+
+\begin{remark}[the final normalisation]
+$h_t$ as we use it is taken \emph{after} the model's final normalisation layer,
+so its magnitude is controlled --- a typical entry is order $1$, not order
+$100$. Coconut makes exactly this observation, and it matters: a raw,
+un-normalised state fed back as an input would be far outside the range the
+model's first layer expects.
+\end{remark}
+
+\section{Step 3: the language-model head --- the only place text is created}
+
+To turn $h_t$ into a next token, the model applies one more matrix, the
+\textbf{output head} $W_{\mathrm{out}} \in \mathbb{R}^{|V|\times d}$, and then a
+softmax:
+\[
+\ell_t = W_{\mathrm{out}}\, h_t \in \mathbb{R}^{|V|},
+\qquad
+p(x_{t+1} = v \mid x_{\le t}) = \mathrm{softmax}(\ell_t)_v
+= \frac{\exp(\ell_{t,v})}{\sum_{u \in V}\exp(\ell_{t,u})}.
+\tag{2.2}
+\]
+The entries of $\ell_t$ are called \textbf{logits}. The softmax turns them into
+a probability distribution: every entry lands in $(0,1)$ and they sum to $1$.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Equation (2.2) is the \emph{only} step in the entire model where a continuous
+internal state becomes discrete text. Everything before it is vectors.
+}}
+\end{center}
+
+\section{Step 4: what generating text actually costs}
+\label{sec:roundtrip}
+
+Ordinary generation --- what chain-of-thought does, and what a multi-agent
+pipeline does between its stages --- is the following loop:
+\[
+h_t
+\ \xrightarrow{\ W_{\mathrm{out}},\ \mathrm{softmax}\ }\ p(\cdot)
+\ \xrightarrow{\ \text{sample or argmax}\ }\ x_{t+1}
+\ \xrightarrow{\ e(\cdot)\ }\ e(x_{t+1}) = W_{\mathrm{in}}[x_{t+1},:]
+\ \longrightarrow\ \text{next step's input}.
+\tag{2.3}
+\]
+
+Look at the shapes along that path:
+\[
+\underbrace{\mathbb{R}^{3584}}_{h_t}
+\ \longrightarrow\
+\underbrace{\Delta^{|V|-1}}_{\text{a distribution}}
+\ \longrightarrow\
+\underbrace{\{1,\dots,152064\}}_{\text{one integer}}
+\ \longrightarrow\
+\underbrace{\mathbb{R}^{3584}}_{e(x_{t+1})}.
+\]
+
+The middle arrow is the problem. A vector of $3584$ real numbers is collapsed
+into a single integer chosen from $152{,}064$ possibilities, and then re-expanded.
+Whatever the state was holding that was not expressible as ``the identity of one
+token'' is gone, permanently, and no later step can get it back.
+
+\begin{example}[the collapse, in miniature]
+Take a toy model with $d = 3$ and a vocabulary of $4$ tokens
+$V=\{A,B,C,D\}$. Suppose at some step the last hidden state produces logits
+\[
+\ell = (2.0,\ 1.9,\ 0.1,\ 0.0)
+\quad\Longrightarrow\quad
+p \approx (0.44,\ 0.40,\ 0.07,\ 0.06).
+\]
+The state is genuinely undecided between $A$ and $B$: it holds \emph{both}
+hypotheses, with almost equal weight. Greedy decoding emits $A$, and the next
+step's input becomes exactly $e(A)$. The distinction between ``I am sure it is
+$A$'' (say $p = (0.99, 0.003,\dots)$) and ``it is probably $A$ but might well be
+$B$'' has been erased: both produce the identical next input vector $e(A)$.
+\end{example}
+
+That example is the entire motivation for what follows. The next Part turns it
+into a theorem and puts a number on it.
+
+\newpage
+\part{The decode bottleneck, made precise}
+\label{part:bottleneck}
+
+Part~\ref{part:token} ended with an example suggesting that writing reasoning
+out as text throws information away. This Part proves it, bounds it, and --- as
+importantly --- says exactly which architectures the bound does and does not
+apply to. Getting that scoping right matters: the naive version of this argument
+is wrong, and it is worth seeing why.
+
+\section{Three ways a reasoning step can hand off to the next}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{(a) Separate-call multi-agent (what CHESS, DIN-SQL, DAIL-SQL actually do).}
+Stage $k$ finishes. Its entire internal state is discarded. Stage $k+1$ is a
+\emph{new call} with a \emph{fresh context} containing stage $k$'s written
+output as text.\\[5pt]
+\textbf{(b) Single-model chain-of-thought.} One continuous forward pass. The
+internal state of every earlier position is kept in the KV cache and remains
+attendable. But the \emph{input} at each new position is $e(x_t)$: one of
+$|V|$ fixed vectors.\\[5pt]
+\textbf{(c) Latent (ours).} One continuous forward pass. The KV cache is kept
+\emph{and} the input at each new position is an arbitrary vector in
+$\mathbb{R}^d$, not a row of $W_{\mathrm{in}}$.
+}}
+\end{center}
+
+The information-theoretic theorem below is about (a) versus (c). The separate
+argument in Section~\ref{sec:superposition} is about (b) versus (c). Conflating
+them produces a claim that is easy to disprove, so we keep them apart.
+
+\section{Background: entropy and mutual information}
+
+\begin{definition}[Entropy]
+For a random variable $X$ taking values $x$ with probabilities $p(x)$,
+\[
+H(X) = -\sum_x p(x)\log_2 p(x)
+\]
+measured in bits. It is the average number of yes/no questions needed to pin
+$X$ down. A fair coin has $H=1$; a constant has $H=0$.
+\end{definition}
+
+\begin{definition}[Mutual information]
+\[
+I(X;Y) = H(X) - H(X\mid Y),
+\]
+the reduction in uncertainty about $X$ from learning $Y$. It is $0$ when they
+are independent and equals $H(X)$ when $Y$ determines $X$. It is symmetric and
+never negative.
+\end{definition}
+
+\begin{definition}[Markov chain]
+$X \to Y \to Z$ is a Markov chain if $Z$ depends on $X$ only through $Y$:
+formally, $X$ and $Z$ are conditionally independent given $Y$, so
+$I(X;Z\mid Y)=0$.
+\end{definition}
+
+\section{The setup, matching what the code and the baselines actually do}
+
+Let $H \in \mathbb{R}^{d}$ be the internal state that stage $k$ has arrived at:
+everything it figured out. In architecture (a), stage $k$ must convert $H$ into
+a token sequence
+\[
+T = \mathrm{decode}(H),\qquad |T| = L \text{ tokens},
+\]
+and stage $k+1$ reconstructs its own understanding by reading that text,
+\[
+H' = \mathrm{encode}(T).
+\]
+Stage $k+1$ has no access whatsoever to the original $H$ --- the process that
+produced it has exited and its memory is freed.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+This is not a modelling approximation. It is a literal description of what a
+separate-call multi-agent pipeline does. That is precisely why the theorem
+below applies to it.
+}}
+\end{center}
+
+\section{Theorem: text handoff cannot beat its own token count}
+
+\begin{theorem}[Data Processing Inequality]
+\label{thm:dpi}
+If $H \to T \to H'$ is a Markov chain, then
+\[
+I(H;T) \ \ge\ I(H;H').
+\]
+\end{theorem}
+
+\begin{proof}
+Apply the chain rule for mutual information to the three-variable quantity
+$I(H;\,T,H')$ in two different orders. Splitting off $T$ first:
+\[
+I(H;T,H') = I(H;T) + I(H;H'\mid T).
+\]
+Splitting off $H'$ first:
+\[
+I(H;T,H') = I(H;H') + I(H;T\mid H').
+\]
+Both equal the same quantity, so they equal each other:
+\[
+I(H;T) + I(H;H'\mid T) = I(H;H') + I(H;T\mid H').
+\]
+By the Markov property, $I(H;H'\mid T)=0$. Hence
+\[
+I(H;T) = I(H;H') + I(H;T\mid H').
+\]
+Every mutual information, including a conditional one, is non-negative (it is
+an expectation of a Kullback--Leibler divergence, which is $\ge 0$). Therefore
+$I(H;T\mid H')\ge 0$ and $I(H;T) \ge I(H;H')$.
+\end{proof}
+
+\begin{lemma}[The token channel has a hard ceiling]
+\label{lem:ceiling}
+If $T$ is a sequence of at most $L$ tokens from a vocabulary $V$, then
+\[
+I(H;T) \ \le\ H(T)\ \le\ L\log_2|V| \ \text{bits.}
+\]
+\end{lemma}
+
+\begin{proof}
+First, $I(H;T) = H(T) - H(T\mid H) \le H(T)$, because $H(T\mid H)\ge 0$: you
+cannot share more information with a variable than that variable contains.
+Second, there are at most $|V|^L$ distinct sequences of length $\le L$ (there
+are $|V|$ choices at each of $L$ positions). The entropy of a variable with $N$
+possible values is at most $\log_2 N$, attained only when all are equally
+likely. Hence $H(T) \le \log_2(|V|^L) = L\log_2|V|$.
+\end{proof}
+
+\begin{corollary}[The handoff bound]
+\label{cor:handoff}
+In a separate-call multi-agent pipeline, the information the successor stage can
+possibly recover about its predecessor's internal state is at most
+\[
+I(H;H') \ \le\ L\log_2|V|\ \text{bits},
+\]
+no matter how the text is written, how clever the prompt is, or how large the
+successor model is.
+\end{corollary}
+
+\begin{proof}
+Chain Theorem~\ref{thm:dpi} with Lemma~\ref{lem:ceiling}.
+\end{proof}
+
+\subsection{Putting our numbers in}
+
+Our model has $|V| = 152{,}064$, so
+\[
+\log_2|V| = \log_2 152064 \approx 17.214 \ \text{bits per token.}
+\]
+
+\begin{example}[one role handoff]
+A rendered teacher role turn in our corpus --- a schema-linking block, say ---
+runs to roughly $L = 200$ tokens. The ceiling is
+\[
+200 \times 17.214 \approx 3{,}443\ \text{bits}.
+\]
+\end{example}
+
+\begin{example}[the whole transcript]
+An entire verbalised debate in our traces averages about $L=900$ generated
+tokens, giving
+\[
+900 \times 17.214 \approx 15{,}493\ \text{bits}
+\]
+for the complete multi-stage transcript.
+\end{example}
+
+Now the other side. In architecture (c) the successor role does not read text.
+It continues the same forward pass and attends directly to the predecessor's
+own KV entries. For our model the per-position key/value state is
+\[
+2 \ (\text{keys and values}) \times
+\underbrace{28}_{\text{layers}} \times
+\underbrace{4}_{\text{KV heads}} \times
+\underbrace{128}_{\text{head dim}}
+= 28{,}672 \ \text{numbers},
+\]
+each stored in \texttt{bfloat16}, hence at most $16$ bits of entropy each:
+\[
+28{,}672 \times 16 = 458{,}752\ \text{bits per position.}
+\]
+The CHESS-step configuration runs $6$ roles $\times$ $2$ latent steps
+$=12$ latent positions, so the state the final decode attends to is bounded by
+\[
+12 \times 458{,}752 = 5{,}505{,}024 \approx 5.5\times10^{6}\ \text{bits}
+\]
+of latent working memory --- and, critically, \emph{it is not re-encoded}. The
+successor sees the predecessor's actual tensors, not a reconstruction from
+prose.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+$5.5\times 10^{6}$ bits of directly attendable state, versus a
+$1.5\times 10^{4}$-bit ceiling on everything a separate-call pipeline can pass
+between two stages: a factor of roughly $355$.
+}}
+\end{center}
+
+\subsection{What this proves, and --- importantly --- what it does not}
+\label{sec:honest-capacity}
+
+\begin{remark}[the comparison is between a bound and an exact value, in the right direction]
+Corollary~\ref{cor:handoff} is an \emph{upper} bound on the text path. The
+$5.5\times10^{6}$ figure is an upper bound on the latent path. Comparing two
+upper bounds proves nothing in general. What rescues the argument here is that
+the latent path's transfer is \emph{exact}: no re-encoding step exists, so
+$I(H;H'_{\text{latent}}) = H(H)$ identically, whereas the text path is capped at
+$L\log_2|V|$ regardless of what $H$ contained. The claim ``the text handoff is
+strictly lossy whenever $H(H) > L\log_2|V|$'' is therefore sound; the claim
+``the latent path actually carries $5.5$ million bits of useful reasoning'' is
+not proven and is not claimed.
+\end{remark}
+
+\begin{remark}[the aligned embedding is itself a narrower channel]
+Section~\ref{sec:align} introduces $\mathrm{align}(h)$, the map that turns a
+hidden state back into something usable as an \emph{input} embedding. In its
+default \texttt{soft\_embed} form this restricts to the top $k=32$ logits and
+returns a convex combination of $32$ embedding rows. That is a deterministic
+function of $h$, so by the same DPI it can only lose information --- it carries
+roughly the identity of $32$ tokens plus $31$ free probabilities, on the order
+of $10^{3}$ bits, not $10^{5}$.
+
+This is not a contradiction: $\mathrm{align}(h)$ is the input at the \emph{next}
+position, and it is a genuinely narrow pipe. The wide channel is the KV cache,
+which the successor attends to in parallel and which nothing compresses. Both
+statements are true simultaneously, and stating only the flattering one would be
+dishonest. \texttt{align="identity"} makes the narrow pipe lossless too, and is
+implemented; it is not the default because a raw hidden state is out of
+distribution as an input embedding and empirically produced degenerate output.
+\end{remark}
+
+\begin{remark}[capacity is not use]
+Nothing above shows the model \emph{fills} the latent channel with independent,
+useful reasoning rather than $12$ near-copies of the same state. That question
+belongs to training, where the guarantees are far weaker
+(Part~\ref{part:optimiser}, Part~\ref{part:grpo}).
+\end{remark}
+
+\section{The second, different argument: superposition and search}
+\label{sec:superposition}
+
+The DPI argument above compares (a) with (c). It says nothing about (b), a
+single-model chain-of-thought that keeps its KV cache. For that comparison there
+is a different mechanism, and it is the one Coconut's own experiments identify.
+
+Return to the toy example of Part~\ref{part:token}: a state with
+$p \approx (0.44, 0.40, 0.07, 0.06)$ over $\{A,B,C,D\}$. In architecture (b) the
+next input must be one of the four fixed vectors $e(A),\dots,e(D)$. The model
+must \emph{commit}. In architecture (c) the next input is
+\[
+\mathrm{align}(h) \approx 0.44\,e(A) + 0.40\,e(B) + 0.07\,e(C) + 0.06\,e(D),
+\]
+a point strictly between them that no token corresponds to. Both hypotheses
+survive into the next step.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Committing to a token is a \emph{greedy} search step. Passing a mixture keeps a
+\emph{frontier}. The first is depth-first with no backtracking; the second is
+closer to breadth-first.
+}}
+\end{center}
+
+\begin{example}[why postponing helps, concretely]
+Suppose two candidate schema linkings, $A$ and $B$, are near-equally plausible
+given the question alone, but only one survives once the query is actually
+written. A token-committed chain picks $A$ at the linking step, and every later
+step conditions on $A$; if $A$ was wrong, nothing downstream can recover, because
+the evidence that would have discriminated arrives \emph{after} the commitment.
+A latent chain carries $0.44A + 0.40B$ forward, and the later step --- which now
+has the evidence --- can still resolve toward $B$.
+\end{example}
+
+Coconut measures exactly this on a planning benchmark: probing the latent state
+shows the model assigning high value to a node it did \emph{not} rank first at
+the previous step, i.e. behaving non-greedily, and the gap between the top-1 and
+top-3 cumulative values is wide at the first latent step and narrows at the
+second --- broad exploration first, then commitment. This is the concrete
+content of the phrase ``latent reasoning explores a broader search space''.
+
+\begin{remark}[status of this argument]
+This is a mechanism plus published empirical support on a different task, not a
+theorem about our system. We have not probed our own latent states for
+superposition. It is stated here as the motivation it is.
+\end{remark}
+
+\newpage
+\part{The continuous thought}
+\label{part:coconut}
+
+We now build the mechanism itself, in four steps, each using only the previous
+one.
+
+\section{Step 1: latent mode}
+
+\begin{definition}[Language mode and latent mode]
+A model in \textbf{language mode} at position $t$ does
+\[
+h_t \ \to\ \mathrm{softmax}(W_{\mathrm{out}}h_t)\ \to\ x_{t+1}\ \to\ e(x_{t+1}),
+\]
+i.e. equation (2.3). A model in \textbf{latent mode} skips the middle entirely:
+\[
+\boxed{\ \text{next input embedding} \ =\ \mathrm{align}(h_t)\ }
+\tag{4.1}
+\]
+No token is sampled, no token is emitted, and the position contributes nothing
+to the output text.
+\end{definition}
+
+Coconut states the same thing as a modification of the input matrix. If latent
+mode runs between positions $i$ and $j$, then for $i < t < j$,
+\[
+E_t = \big[e(x_1),\dots,e(x_i),\ h_i,\ h_{i+1},\dots,h_{t-1}\big],
+\]
+and once latent mode ends the input reverts to ordinary embeddings:
+\[
+E_t = \big[e(x_1),\dots,e(x_i),\ h_i,\dots,h_{j-1},\ e(x_j),\dots,e(x_t)\big].
+\]
+The vector $h_t$ produced in latent mode is called a \textbf{continuous
+thought}. The quantity $p(x_{t+1}\mid x_{\le t})$ is simply not defined at those
+positions: nothing is being predicted there. (One \emph{can} still compute
+$\mathrm{softmax}(W_{\mathrm{out}}h_t)$ for diagnostic purposes, which is how
+Coconut probes what a latent state is ``thinking''; nothing in training uses it.)
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+A latent step costs \textbf{one forward pass} and emits \textbf{zero tokens}.
+That is the entire efficiency claim, and it is exact, not statistical.
+}}
+\end{center}
+
+\section{Step 2: the alignment map}
+\label{sec:align}
+
+Equation (4.1) has an \texttt{align} in it. Why not feed $h_t$ back directly?
+
+Because $h_t$ and $e(x)$ live in the same space $\mathbb{R}^d$ but are not the
+same \emph{kind} of object. $e(x)$ is a row of $W_{\mathrm{in}}$: it comes from a
+set of $152{,}064$ specific vectors that the first transformer layer has seen
+during all of pretraining. $h_t$ is an output of the last layer after final
+normalisation. Feeding one where the other is expected is an
+\emph{out-of-distribution} input. The project measured this: with the identity
+map the model produced degenerate token soup at evaluation.
+
+Three constructions are implemented in
+\texttt{latentsql/distill/latent.py::build\_aligner}.
+
+\subsection{Construction 1: identity (Coconut's own choice)}
+\[
+\mathrm{align}(h) = h.
+\]
+Kept for ablation. It is the only construction that is information-lossless in
+the narrow-pipe sense of Section~\ref{sec:honest-capacity}.
+
+\subsection{Construction 2: linear}
+The natural way to get from hidden space back to input space is to go through
+the vocabulary and come back:
+\[
+h \ \xrightarrow{\ W_{\mathrm{out}}\ }\ \text{logits} \in \mathbb{R}^{|V|}
+\ \xrightarrow{\ W_{\mathrm{in}}\ }\ \mathbb{R}^{d}.
+\]
+Composing the two matrices once, up front, gives a single $d\times d$ matrix:
+\[
+W_a = W_{\mathrm{out}}^{\top}W_{\mathrm{in}} \in \mathbb{R}^{d\times d},
+\qquad
+\mathrm{align}(h) = h\,W_a.
+\tag{4.2}
+\]
+
+\begin{remark}[a scale problem, and the fix]
+$W_a$ sums over all $152{,}064$ vocabulary entries, so $hW_a$ has a norm orders
+of magnitude away from that of a real token embedding --- feeding it in directly
+would present the model with either a near-zero or an exploding input. The code
+therefore rescales once at construction time:
+\[
+W_a \ \leftarrow\ W_a \cdot
+\frac{\overline{\|W_{\mathrm{in}}[v,:]\|}}
+     {\overline{\|z W_a\|}},\qquad z\sim\mathcal{N}(0,I),
+\]
+i.e. it measures the average norm of a real input embedding, measures the
+average norm $W_a$ produces on random probes, and scales so the two agree.
+\end{remark}
+
+\begin{remark}[relation to the published form]
+LatentMAS writes the alignment as $W_a \approx W_{\mathrm{out}}^{+}W_{\mathrm{in}}$
+with a pseudo-inverse. With the shape convention
+$\mathrm{logits} = hW_{\mathrm{out}}^\top$ used here, the composition that
+actually maps hidden $\to$ vocabulary $\to$ embedding is
+$W_{\mathrm{out}}^{\top}W_{\mathrm{in}}$, which is what is implemented. The two
+agree up to a logit temperature.
+\end{remark}
+
+\subsection{Construction 3: soft embedding (the default)}
+Rather than a first-order linear surrogate, take the token distribution the
+hidden state actually encodes, restricted to its top $k$ entries, and return the
+corresponding convex combination of embedding rows:
+\[
+\ell = W_{\mathrm{out}}h,\qquad
+\mathcal{K} = \operatorname{top-}k(\ell),\qquad
+\pi_v = \frac{\exp(\ell_v/\tau)}{\sum_{u\in\mathcal{K}}\exp(\ell_u/\tau)}\ (v \in \mathcal{K}),
+\]
+\[
+\boxed{\ \mathrm{align}_{\mathrm{soft}}(h) \;=\; \sum_{v\in\mathcal{K}} \pi_v\, W_{\mathrm{in}}[v,:]\ }
+\tag{4.3}
+\]
+with $k=32$ and $\tau=1$ by default.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Equation (4.3) is precisely the ``keep the frontier'' object of
+Section~\ref{sec:superposition}, written down. It is a weighted blend of the $32$
+tokens the model currently considers plausible --- a point in embedding space
+that no single token occupies --- and it is guaranteed in distribution, because
+it is a convex combination of real rows of $W_{\mathrm{in}}$.
+}}
+\end{center}
+
+\begin{example}[the toy model again]
+With $\ell = (2.0, 1.9, 0.1, 0.0)$ over $\{A,B,C,D\}$ and $k=2$:
+\[
+\pi_A = \frac{e^{2.0}}{e^{2.0}+e^{1.9}} = \frac{7.389}{7.389+6.686}=0.5250,
+\qquad \pi_B = 0.4750,
+\]
+so
+\[
+\mathrm{align}_{\mathrm{soft}}(h) = 0.5250\,e(A) + 0.4750\,e(B).
+\]
+Greedy decoding would have produced $e(A)$ and discarded $B$ entirely.
+\end{example}
+
+\subsubsection*{A definition needed before the lemma: convex combination and convex hull}
+
+The lemma below uses two terms that are not assumed known. Both are simple, and
+both are worth building from a picture rather than a formula first.
+
+\begin{definition}[Convex combination]
+\label{def:convex-combo}
+A \textbf{convex combination} of points $p_1,\dots,p_K$ is any weighted average
+\[
+w_1p_1 + w_2p_2 + \cdots + w_Kp_K,
+\qquad w_i \ge 0,\qquad \sum_{i=1}^{K}w_i = 1.
+\]
+\end{definition}
+
+The two conditions on the weights matter individually. Take two points $A$ and
+$B$ on a page. If the weights must be non-negative and sum to $1$, the only
+points you can reach by mixing $A$ and $B$ are the ones \emph{on the straight
+line segment between them} --- $0.5A+0.5B$ is the midpoint, $0.9A+0.1B$ is a
+point close to $A$, and so on. Drop the ``non-negative'' requirement and you
+could take a weight of $-0.5$ on $B$, which points \emph{away} from $B$ and
+shoots straight past $A$ out the far side --- off the segment entirely. Drop
+the ``sum to $1$'' requirement and $2A+2B$ scales the whole thing outward,
+again leaving the segment. Both restrictions together are exactly what keeps a
+weighted mix trapped between the points, never past them.
+
+\begin{definition}[Convex hull]
+The \textbf{convex hull} of a set of points is every point reachable as a
+convex combination of some (or all) of them.
+\end{definition}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Picture a handful of dots scattered on a page, and a rubber band stretched
+around the outermost ones and let snap tight, as drawn below. Every point
+trapped inside the band --- the dots themselves and everything between them
+--- is the convex hull. A dot already surrounded by others adds nothing new;
+the band only bends around the outermost ones. And this is not just an
+analogy: it is exactly what Definition~\ref{def:convex-combo} says
+algebraically --- non-negative weights summing to $1$ is precisely what keeps
+a mix from escaping the band.
+}}
+\end{center}
+
+\begin{lstlisting}
+    . dot                  ___________
+                           /     .     \
+    .        .    --->    |   .      . |    <- rubber band, snapped tight
+                           \___________/
+         .
+\end{lstlisting}
+
+Now scale the picture up. Instead of a handful of dots on a 2-number page, our
+vocabulary gives $152{,}064$ ``dots'' (one embedding row per token), each
+described by $3584$ numbers instead of $2$. The idea does not change --- there
+is still an (imaginary, $3584$-dimensional) rubber band stretched around all
+$152{,}064$ of them, and the region it traps is
+$\text{the convex hull of } \{W_{\mathrm{in}}[v,:] : v \in V\}$: precisely
+\emph{the neighbourhood every real token embedding lives in}, plus every point
+reachable by non-negative-weighted mixes of them.
+
+\begin{lemma}[the soft embedding is always in the convex hull]
+$\mathrm{align}_{\mathrm{soft}}(h)$ lies in the convex hull of
+$\{W_{\mathrm{in}}[v,:] : v \in V\}$.
+\end{lemma}
+\begin{proof}
+The $\pi_v$ are non-negative and sum to $1$ by construction of the softmax, so
+(4.3) is by definition a convex combination of points of that set.
+\end{proof}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Why this is the whole point, spelled out.} \texttt{identity} mode
+(Construction 1) feeds the raw hidden state $h$ back directly. $h$ is computed
+by the model's \emph{last} layer, after final normalisation --- a different
+part of the network, built a different way, from the $152{,}064$ real
+embeddings the \emph{first} layer has been trained on since the start of
+pretraining. Nothing guarantees $h$ lands anywhere near that trained-on
+neighbourhood: it could sit anywhere at all in the full $3584$-number space,
+territory the first layer has literally never received an input from. That is
+what ``out of distribution'' means here, made concrete --- \emph{outside the
+rubber band} --- and it is exactly what was measured: \texttt{identity} mode
+produced degenerate token soup at evaluation.\\[6pt]
+The Lemma is the proof that \texttt{soft\_embed} cannot do that. Because its
+weights are softmax weights --- always non-negative, always summing to $1$ ---
+$\mathrm{align}_{\mathrm{soft}}(h)$ is \emph{mathematically guaranteed} to stay
+inside the same neighbourhood the $152{,}064$ real embeddings occupy, no matter
+what $h$ was. It may land at an unusual \emph{spot} inside that neighbourhood
+--- a blend of two or three plausible tokens rather than one, as in the
+worked example above --- but ``an odd spot inside familiar territory'' and
+``possibly anywhere, with no guarantee of familiarity at all'' are very
+different risks. That gap is why \texttt{soft\_embed} is the default and
+\texttt{identity} is kept only for ablation.
+}}
+\end{center}
+
+\section{Step 3: latent working memory (the KV cache)}
+\label{sec:kv}
+
+A transformer is causal, so when position $t+1$ is computed, the keys and values
+of positions $1..t$ are unchanged. They are cached rather than recomputed. That
+cache is
+\[
+\mathcal{C}_t = \big\{(K^{(\ell)}_{1:t},\,V^{(\ell)}_{1:t})\big\}_{\ell=1}^{28},
+\]
+one key/value pair per layer per position.
+
+In our chain we carry $\mathcal{C}$ across role boundaries. That is exactly the
+statement that role $k+1$ attends to role $k$'s actual representations rather
+than to a re-encoding of role $k$'s prose. It is the wide channel of
+Section~\ref{sec:honest-capacity}.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\texttt{share\_working\_memory: true} keeps $\mathcal{C}$ across roles.\\
+\texttt{share\_working\_memory: false} resets it at each role boundary --- the
+ablation that simulates a separate-call pipeline.
+}}
+\end{center}
+
+\subsection{A subtlety the code had to solve: cache mutation under checkpointing}
+
+This subsection can be skipped on a first reading, but it is the kind of detail
+that determines whether the gradients are correct.
+
+To fit training in memory, the $m$ latent steps of a role are wrapped in
+\texttt{torch.utils.checkpoint}: their intermediate activations are not stored,
+they are \emph{recomputed} during the backward pass. Non-reentrant checkpointing
+therefore calls the wrapped function \textbf{twice} --- once now, once during
+backward.
+
+The problem: the KV cache is mutated \emph{in place}. Each
+\texttt{model(..., use\_cache=True)} appends to it. A blind second call would
+append the same $m$ steps again, so the cache length would be wrong for every
+role that already ran on top of it.
+
+The fix, at \texttt{latent.py:220}, is one line at the top of the checkpointed
+function:
+\begin{lstlisting}
+past_key_values.crop(start_len)   # no-op first call; undoes 2nd call's own append
+\end{lstlisting}
+\texttt{crop} is a plain tensor slice, hence differentiable, and a true no-op
+when the cache is already at that length. So:
+
+\begin{itemize}
+\item \textbf{First (real) call:} the cache is already at \texttt{start\_len};
+  cropping does nothing; $m$ steps are appended.
+\item \textbf{Second (backward-time) call:} forward has completed, so the cache
+  is at \texttt{start\_len}$+m$; cropping removes exactly this role's own
+  extension, and the $m$ steps are then redone identically.
+\end{itemize}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+The property being restored is \textbf{idempotence}: running the block once and
+running it twice must leave the same state. That is what non-reentrant
+checkpointing requires, and it is verified in \texttt{tests/test\_core.py} by
+comparing LoRA gradients computed with and without checkpointing --- they agree
+to float32 tolerance.
+}}
+\end{center}
+
+\section{Step 4: the cost accounting}
+
+Let $R$ be the number of latent roles and $m$ the number of latent steps per
+role. Then per question:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+& \textbf{Explicit pipeline} & \textbf{Latent (ours)}\\
+\midrule
+Model calls           & one per stage ($\approx 6$--$12$) & one \\
+Forward passes        & one per generated token, per stage & $Rm$ + one per SQL token \\
+Tokens generated      & $\approx 1339$ (measured)          & $\approx 61$ (measured) \\
+Tokens read           & each stage re-reads the schema     & schema read once \\
+Cross-stage channel   & text, $\le L\log_2|V|$ bits        & KV cache, no re-encoding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+With $R = 6$ and $m = 2$ this is $12$ latent forward passes --- fewer than the
+cost of generating $12$ tokens, and it replaces roughly $1280$ of them.
+
+\begin{remark}[what the token counts in this document mean]
+\texttt{Avg tokens} is $\text{prompt\_tokens} + \text{completion\_tokens}$.
+Latent steps are \emph{not} counted as completion tokens, because they are not
+tokens; they are tracked separately as \texttt{extra.latent\_steps}. Anywhere a
+comparison could be read as hiding the latent cost, both numbers are given.
+\end{remark}
+
+\newpage
+\part{From a multi-agent pipeline to a chain of latent slots}
+\label{part:roles}
+
+Part~\ref{part:coconut} built one latent step. This Part says what the latent
+steps are \emph{for}.
+
+\section{The role chain}
+
+We take CHESS's decomposition and write it as an ordered list of six roles plus
+a terminator:
+\[
+\rho = \big(\underbrace{r_1,\ r_2,\ r_3,\ r_4,\ r_5,\ r_6}_{\text{latent-trainable}},\ \textsf{consensus}\big)
+\]
+with
+\begin{center}
+\begin{tabular}{clp{0.55\textwidth}}
+\toprule
+$k$ & role $r_k$ & what this stage does \\
+\midrule
+1 & \texttt{information\_retriever} & find literal values from the question that occur in the database \\
+2 & \texttt{schema\_linker}         & select the relevant tables and columns \\
+3 & \texttt{query\_classifier}      & label the query easy / non-nested / nested \\
+4 & \texttt{candidate\_generator}   & write a first candidate query \\
+5 & \texttt{query\_fixer}           & run it, read the error, correct it \\
+6 & \texttt{unit\_tester}           & check the corrected query answers the question \\
+\midrule
+-- & \texttt{consensus}             & \emph{not} a reasoning stage; the marker after which SQL is emitted \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+$\textsf{consensus}$ is a punctuation mark, not an agent. It is the token that
+says ``deliberation is over; the next thing you produce is the query''. Almost
+everything in Part~\ref{part:collapse} turns on whether the model still believes
+that.
+}}
+\end{center}
+
+\section{The tag vocabulary, and why it is load-bearing}
+
+Each role is announced by a literal string:
+\[
+\textsf{tag}(r) = \texttt{<|agent }r\texttt{|>},
+\qquad
+\textsf{tag}(\textsf{consensus}) = \texttt{<|consensus|>}.
+\]
+
+These are not decoration. IMAD is explicit on the point: without structure tags,
+``the distinction between agents becomes difficult to make'', and IMAD's own
+activation-space analysis (Part~\ref{part:activation}) finds that models trained
+\emph{without} the tags show measurably less separable agent subspaces.
+
+The mechanism is straightforward once stated. A latent step's content is
+entirely determined by the state it starts from. The tag is what sets that
+state: it is the anchor that tells the model \emph{which} of the six jobs the
+next $m$ vectors are supposed to be doing. Remove the tag and all six latent
+blocks start from indistinguishable states and there is no reason for them to
+specialise.
+
+\section{The sequence, written out}
+
+Let $c$ be the rendered chat prompt (system message $+$ user message containing
+the schema, the question, any evidence, and retrieved value hints), and let
+$y^\star$ be the gold SQL target. Write $\bullet$ for one latent position.
+
+The \textbf{fully latent} sequence, which is what evaluation runs, is
+\[
+\underbrace{c}_{\text{prompt}}
+\ \big\|\ \textsf{tag}(r_1)\ \underbrace{\bullet\bullet}_{m=2}
+\ \big\|\ \textsf{tag}(r_2)\ \bullet\bullet
+\ \big\|\ \cdots
+\ \big\|\ \textsf{tag}(r_6)\ \bullet\bullet
+\ \big\|\ \texttt{<|consensus|>}
+\ \big\|\ y^\star .
+\tag{5.1}
+\]
+
+Only the last block is decoded. The six tags are fed as text but not generated
+(they are teacher-forced in training and inserted by the runner at evaluation);
+the twelve $\bullet$ positions emit nothing at all.
+
+\begin{example}[what a real prediction looks like]
+Input: a Spider question over a museum database. Output --- the \emph{entire}
+generated text, $61$ tokens:
+\begin{lstlisting}
+```sql
+SELECT T2.name FROM visit AS T1 JOIN visitor AS T2
+  ON T1.visitor_id = T2.visitor_id
+GROUP BY T1.visitor_id HAVING COUNT(*) > 1;
+```
+\end{lstlisting}
+No schema-linking prose, no candidate discussion, no unit tests. All six of
+those stages happened; none of them were written down.
+\end{example}
+
+\section{The curriculum: stage $k$}
+\label{sec:curriculum}
+
+Asking a model that has only ever written prose to jump straight to (5.1) does
+not work; the project measured that too. Coconut's answer, inherited from iCoT
+(Deng et al.), is a \textbf{curriculum}: hide the roles one at a time.
+
+\begin{definition}[Stage $k$]
+\label{def:stage}
+At stage $k \in \{0,1,\dots,6\}$, the first $k$ roles are latent and the rest
+are dropped. The sequence is
+\[
+c \ \big\|\ \textsf{tag}(r_1)\,\bullet\bullet \ \big\|\ \cdots \ \big\|\ \textsf{tag}(r_k)\,\bullet\bullet
+\ \big\|\ \texttt{<|consensus|>} \ \big\|\ y^\star .
+\tag{5.2}
+\]
+\end{definition}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Read Definition~\ref{def:stage} twice.} The roles after the $k$-th are
+not written out as text. They are \textbf{dropped entirely}. Stage $k$ trains
+``after $k$ latent roles, emit the SQL''. This is a deliberate choice ---
+\texttt{chain-format: chess\_steps}, called ``SQL-direct'' --- and it is not
+what Coconut does. Coconut keeps the remaining reasoning steps as text. The
+consequences of this difference are the entire subject of
+Part~\ref{part:collapse}.
+}}
+\end{center}
+
+\begin{example}[stage 3 versus stage 4, side by side]
+\begin{lstlisting}
+stage 3:  prompt | r1 oo | r2 oo | r3 oo |               <|consensus|> | SQL
+stage 4:  prompt | r1 oo | r2 oo | r3 oo | r4 oo |       <|consensus|> | SQL
+stage 5:  prompt | r1 oo | r2 oo | r3 oo | r4 oo | r5 oo | <|consensus|> | SQL
+\end{lstlisting}
+Each stage adds one tag and two latent positions. Nothing else changes: the
+prompt is the same, the target is the same, and the number of supervised tokens
+is the same.
+\end{example}
+
+\subsection{How the curriculum is scheduled in practice}
+
+Two mechanisms exist in the code:
+
+\begin{enumerate}
+\item \textbf{In-process ramp.} With \texttt{curriculum=True} and no override,
+  the depth is a linear function of the step index:
+  \[
+  \mathrm{frac} = \frac{\text{step}}{\max(1, n_{\text{steps}}-1)},\qquad
+  k = \mathrm{round}(\mathrm{frac}\cdot R).
+  \]
+\item \textbf{Chain mode (what actually ran).} One training \emph{process} per
+  batch, with the stage passed in explicitly by the shell runner via
+  \texttt{--force-n-latent-roles}. This exists because a long-lived process was
+  observed to corrupt CUDA/checkpoint state after an out-of-memory event; a
+  fresh process per batch sidesteps it.
+\end{enumerate}
+
+Chain mode has a consequence that matters later: a brand new \texttt{AdamW} is
+constructed in every process. The runner therefore saves and restores the
+optimiser state (\texttt{--optim-state}) so that momentum is continuous across
+the chain --- \emph{except} at stage boundaries, where the runner deliberately
+deletes it:
+\begin{lstlisting}
+if [ "$ep_start" -eq 1 ]; then
+  rm -f "$OPTIM_STATE"
+fi
+\end{lstlisting}
+This follows Coconut, which also resets the optimiser at each stage switch.
+Proposition~\ref{prop:adam-first-step} explains why that reset is more dangerous
+than it looks.
+
+\newpage
+\part{Activation space: why any of this can work}
+\label{part:activation}
+
+There is a question that should be nagging by now. We are asking one set of
+weights to behave, in sequence, like six different specialists. Why should a
+single model be able to hold six distinct ``personas'' at all, rather than
+averaging them into one mush?
+
+IMAD answers this question empirically, and the answer is the theoretical
+foundation this project rests on. This Part states it, and proves the one piece
+of mathematics it depends on.
+
+\section{The residual stream and the linear representation hypothesis}
+
+A transformer layer does not overwrite its input; it \emph{adds} to it:
+\[
+h^{(\ell+1)} = h^{(\ell)} + \mathrm{Attn}^{(\ell)}\big(h^{(\ell)}\big) + \mathrm{MLP}^{(\ell)}\big(h^{(\ell)}\big).
+\]
+The running sum $h^{(\ell)}$ is called the \textbf{residual stream}. Because
+every layer contributes additively, the stream behaves like a shared vector
+workspace that layers read from and write to.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{Linear representation hypothesis.} Many human-interpretable properties
+of a model's state --- ``this text is harmful'', ``this is code'', ``this is
+agent 3 speaking'' --- are encoded approximately as \emph{directions} in the
+residual stream: there is a vector $v$ such that the property's presence
+corresponds to a large value of $v\cdot h$.
+}}
+\end{center}
+
+This is a hypothesis, not a theorem. Its evidence is that interventions built on
+it work, which is what the next two sections are about.
+
+\section{Difference-in-means, and a proof that it is the right direction}
+
+\begin{definition}[Difference-in-means]
+\label{def:diff-in-means}
+Given activations from two classes at a fixed layer $\ell$ --- positives
+$h^+_1,\dots,h^+_N$ and negatives $h^-_1,\dots,h^-_N$ --- the
+\textbf{difference-in-means} direction is
+\[
+d = \mu_+ - \mu_-,\qquad
+\mu_\pm = \frac{1}{N}\sum_{i=1}^{N}h^{\pm}_i,
+\qquad
+\hat d = \frac{d}{\|d\|}.
+\tag{6.1}
+\]
+\end{definition}
+
+This is what \texttt{latentsql/steering/caa.py} computes, and it is IMAD's
+equation (3):
+\[
+v_i = \frac{1}{|\mathcal{D}|}\sum_{(p,c)\in\mathcal{D}}
+\Big[h_\ell(p, c_i) - h_\ell(p, c_{\neg i})\Big],
+\]
+where the context $p$ is held \emph{identical} and only the continuation varies:
+$c_i$ is agent $i$'s real response, $c_{\neg i}$ the average over the other
+agents' responses in the same slot.
+
+Why the difference of means, out of every direction in a $3584$-dimensional
+space? Because under one clean assumption it is provably optimal.
+
+\begin{assumption}[isotropic noise]
+\label{ass:iso}
+Model class-$+$ activations as $h = \mu_+ + \varepsilon$ and class-$-$
+activations as $h = \mu_- + \varepsilon$, with the noise $\varepsilon$ having
+the same spread in every direction:
+\[
+\mathbb{E}\big[(w\cdot\varepsilon)^2\big] = \sigma^2
+\quad\text{for every unit vector } w.
+\]
+\end{assumption}
+
+\begin{lemma}[Cauchy--Schwarz]
+\label{lem:cs}
+For any vectors $a,b$: $|a\cdot b| \le \|a\|\|b\|$, with equality exactly when
+$a$ and $b$ are parallel.
+\end{lemma}
+\begin{proof}
+For any real $t$, a squared length is non-negative:
+\[
+0 \le \|a - tb\|^2 = \|a\|^2 - 2t(a\cdot b) + t^2\|b\|^2 .
+\]
+This is a quadratic in $t$ that is never negative, so its discriminant is
+$\le 0$:
+\[
+\big(2(a\cdot b)\big)^2 - 4\|a\|^2\|b\|^2 \le 0
+\ \Longrightarrow\ (a\cdot b)^2 \le \|a\|^2\|b\|^2 .
+\]
+Taking square roots gives the inequality. Equality forces $\|a-tb\|^2=0$ for
+some $t$, i.e. $a = tb$.
+\end{proof}
+
+\begin{theorem}[Difference-in-means is the optimal linear probe under Assumption~\ref{ass:iso}]
+\label{thm:dim}
+Among all unit directions $w$, the one maximising Fisher's separation score
+\[
+J(w) = \frac{\big(w\cdot\mu_+ - w\cdot\mu_-\big)^2}{\mathrm{Var}(w\cdot h)}
+\]
+is $w^\star = \hat d = (\mu_+-\mu_-)/\|\mu_+-\mu_-\|$.
+\end{theorem}
+
+\begin{proof}
+By Assumption~\ref{ass:iso} the denominator equals $\sigma^2$ for
+\emph{every} unit $w$; it is therefore a constant of the optimisation and can be
+dropped. The numerator is $(w\cdot d)^2$ with $d = \mu_+-\mu_-$. By
+Lemma~\ref{lem:cs}, for unit $w$,
+\[
+|w\cdot d| \le \|w\|\,\|d\| = \|d\|,
+\]
+with equality exactly when $w \parallel d$, i.e. $w = d/\|d\|$. Hence
+\[
+\boxed{\ w^\star = \hat d\ }
+\]
+maximises $(w\cdot d)^2$ and therefore $J(w)$.
+\end{proof}
+
+\begin{remark}[what breaks without the assumption]
+Real residual streams are not isotropic: some directions carry systematically
+more variance, and directions are correlated. Under a general shared covariance
+$\Sigma$ the Fisher-optimal direction is
+\[
+w^\star \propto \Sigma^{-1}(\mu_+-\mu_-),
+\]
+a whitened difference-in-means that down-weights noisy directions. Estimating
+and inverting a $3584\times3584$ covariance from a few hundred contrastive
+examples is ill-posed, which is the practical reason both this project's
+\texttt{caa.py} and the published steering work use the raw difference. This is
+a real gap between the theorem and the code, and it is stated rather than
+papered over.
+\end{remark}
+
+\section{Steering: using the direction}
+
+\begin{definition}[Contrastive activation addition]
+At inference, hook layer $\ell$ and add a multiple of the direction to its
+output:
+\[
+h_\ell \ \longleftarrow\ h_\ell + \alpha\,v_i .
+\tag{6.2}
+\]
+$\alpha > 0$ amplifies the property, $\alpha < 0$ suppresses it, $\alpha=0$ is
+the unmodified model.
+\end{definition}
+
+This is implemented as a forward hook in \texttt{caa.py::steer\_layer}, at layer
+$-8$ (eight from the end) by default.
+
+\section{IMAD's finding, and what it licenses}
+
+IMAD trains a model to internalise a three-agent debate where each agent has a
+deliberately distinct style (chain-of-thought, self-critique,
+program-of-thought), extracts $v_1, v_2, v_3$ by (6.1), and then steers by (6.2)
+while measuring how closely the steered output resembles that agent's real
+responses.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Result.} The internalised model is steerable toward each individual
+agent \emph{substantially better than the base model is}: ROUGE-L AUC $0.802
+\to 0.903$, a $12.7\%$ improvement, with per-agent, per-metric gains from
+$6.1\%$ to $25.0\%$ and an average of $15.4\%$. At $\alpha=0$ the two models are
+by construction identical, so the entire effect is attributable to
+internalisation having created structure that steering can find.
+}}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{The interpretation, and the foundation of this project:}
+internalising a multi-agent system does not blend the agents into an
+undifferentiated policy. It creates \emph{agent subspaces} --- separable
+directions in activation space, one per role. The agents survive
+internalisation as geometry.
+}}
+\end{center}
+
+That is the answer to the question this Part opened with. One model \emph{can}
+hold six specialists, because the specialists occupy different directions in a
+$3584$-dimensional space and there is plenty of room. It also explains why the
+role tags matter (Part~\ref{part:roles}): the tag is what selects which subspace
+the following latent steps operate in.
+
+IMAD tests the claim in the other direction too, which is a stronger test than
+the positive one: they deliberately instil a \emph{malicious} agent through the
+same pipeline, then apply \emph{negative} steering ($\alpha<0$) to that agent's
+direction. Suppression is more effective after internalisation than on the base
+model, and costs less general capability --- on GSM8K the internalised model
+stays stable across the full steering range while the base model's accuracy
+collapses at extreme coefficients. A behaviour that has been given its own
+direction is a behaviour you can find and remove.
+
+\section{What this does and does not establish for LatentSQL}
+
+\begin{center}
+\begin{tabular}{p{0.45\textwidth}p{0.45\textwidth}}
+\toprule
+\textbf{Established} & \textbf{Not established} \\
+\midrule
+Internalised multi-agent training produces separable per-agent directions, in
+IMAD's setting, measured by steering.
+& That \emph{our} six CHESS-role latent slots occupy separable subspaces. We
+have the extraction code and have not run the measurement on the CHESS-step
+student. \\[6pt]
+Difference-in-means is the optimal linear probe under isotropic noise
+(Theorem~\ref{thm:dim}).
+& That residual-stream noise is isotropic. It is not. \\[6pt]
+Structure tags improve subspace separation (IMAD, ablation).
+& The size of that effect for CHESS roles specifically. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{remark}[a use beyond interpretability]
+If the six directions are real, steering toward
+\texttt{candidate\_generator} with different $\alpha$ is a cheap diversity knob:
+it recovers some of CHASE-SQL's multi-path candidate generation from a
+\emph{single} model at one forward pass per candidate. That is a stated
+motivation in \texttt{caa.py} and an untested idea, not a result.
+\end{remark}
+
+\newpage
+\part{The training objective}
+\label{part:objective}
+
+\section{Cross-entropy, from scratch}
+
+Training a language model means making the correct next token more probable.
+The standard way to say that numerically is \textbf{cross-entropy loss}.
+
+\begin{definition}[Per-token cross-entropy]
+If the model assigns probability $p_t = p(x_{t+1}=x^\star_{t+1}\mid x_{\le t})$
+to the correct next token, the loss at that position is
+\[
+\mathcal{L}_t = -\log p_t .
+\]
+\end{definition}
+
+Read it as a surprise meter. If the model was certain and right, $p_t = 1$ and
+$\mathcal{L}_t = -\log 1 = 0$: no surprise, no loss, nothing to learn. If it was
+certain and wrong, $p_t \to 0$ and $\mathcal{L}_t \to \infty$. If it had no idea
+at all among $|V|$ options, $p_t = 1/152064$ and
+$\mathcal{L}_t = \log 152064 \approx 11.93$.
+
+\begin{example}[the numbers to keep in mind]
+\begin{center}
+\begin{tabular}{rll}
+\toprule
+$\mathcal{L}_t$ & $p_t$ & interpretation\\
+\midrule
+$11.93$  & $1/152064$ & uniform guess \\
+$1.0$    & $0.368$    & plausible but unsure \\
+$0.1$    & $0.905$    & confident \\
+$0.01$   & $0.990$    & very confident \\
+$0.0008$ & $0.9992$   & \textbf{memorised} \\
+\bottomrule
+\end{tabular}
+\end{center}
+The last row is not hypothetical. It is the measured mean training loss at stage
+$4$, and Part~\ref{part:collapse} is about what it means.
+\end{example}
+
+\begin{definition}[Masked sequence loss]
+Given a label vector $z_1,\dots,z_T$ where $z_t = -100$ marks ``do not
+supervise this position'',
+\[
+\mathcal{L} = \frac{1}{|\mathcal{S}|}\sum_{t \in \mathcal{S}} -\log p(x_{t+1} = z_t \mid \cdot),
+\qquad
+\mathcal{S} = \{t : z_t \neq -100\}.
+\tag{7.1}
+\]
+The average is over supervised positions only.
+\end{definition}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+$|\mathcal{S}|$ --- how many positions are graded --- is the quantity to watch.
+It determines what the loss can and cannot see.
+}}
+\end{center}
+
+\section{The COCONUT sequence loss, exactly as the code computes it}
+
+We can now write down the training loss precisely. Fix a training record: a
+prompt $c$, a gold SQL $y^\star$ with token ids $(g_1,\dots,g_n)$, and a stage
+$k$.
+
+The function \texttt{\_coconut\_sequence\_loss}
+(\texttt{latentsql/distill/latent\_sft.py}) builds a list of input
+\emph{embeddings} --- not token ids, because latent positions have no token id
+--- together with a parallel label list. In order:
+
+\begin{enumerate}
+\item \textbf{Prompt.} Append $e(c_1),\dots,e(c_{|c|})$, all labelled $-100$.
+\item \textbf{For each role $r_j$, $j=1,\dots,k$:}
+  \begin{enumerate}
+  \item append the embeddings of $\textsf{tag}(r_j)$, labelled $-100$;
+  \item repeat $m$ times: run the model on everything built so far, take the
+    last-layer last-position hidden state $h$, append $\mathrm{align}(h)$ as the
+    next input embedding, and append the label $-100$.
+  \end{enumerate}
+\item \textbf{Consensus.} Append the embeddings of \texttt{<|consensus|>},
+  labelled $-100$.
+\item \textbf{Target.} Append $e(g_1),\dots,e(g_n)$, labelled
+  $g_1,\dots,g_n$ --- \emph{the only supervised positions}.
+\end{enumerate}
+
+One final teacher-forced forward pass over the assembled sequence produces
+(7.1). Writing $\Phi_k$ for the assembled prefix at stage $k$:
+\[
+\boxed{\
+\mathcal{L}^{\mathrm{main}}_k
+= -\frac{1}{n}\sum_{i=1}^{n}\log p_\theta\big(g_i \,\big|\, \Phi_k,\ g_{<i}\big)
+\ }
+\tag{7.2}
+\]
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+$|\mathcal{S}| = n \approx 62$ for every record, at \emph{every} stage. The
+prompt is not graded. The tags are not graded. The latent positions are not
+graded --- they cannot be, they have no target. The number of graded positions
+does not change as the curriculum deepens.
+}}
+\end{center}
+
+\subsection{Why the latent positions get gradients anyway}
+
+A natural objection: if latent positions are not supervised, how does anything
+about them get trained?
+
+Through the chain rule. The gold SQL's probability depends on the state the
+model is in when it starts decoding, that state is a function of the latent
+vectors, and each latent vector is a differentiable function of the model's
+parameters (it is $\mathrm{align}$ of a hidden state that the model produced).
+So
+\[
+\frac{\partial \mathcal{L}^{\mathrm{main}}_k}{\partial\theta}
+= \underbrace{\frac{\partial\mathcal{L}}{\partial\Phi_k}}_{\text{how the prefix should change}}
+\cdot
+\underbrace{\frac{\partial\Phi_k}{\partial\theta}}_{\text{through all $km$ latent steps}}
+\ +\ \text{direct paths}.
+\]
+Nothing forces the latent vectors to \emph{mean} anything in particular. They
+are shaped only by the pressure ``make the correct SQL likely at the end''. This
+is Coconut's own framing: the objective ``does not encourage the continuous
+thought to compress the removed language thought, but rather to facilitate the
+prediction of future reasoning''.
+
+\begin{remark}[training does $km+1$ forward passes]
+The latent steps are sequential --- each needs the previous one's output as its
+input --- so a stage-$k$ record costs $km$ forward passes to build the prefix
+plus one more for the loss. At $k=6$, $m=2$ that is $13$. This is why training
+is slow and why the code uses \texttt{use\_cache=False} in this path: the
+memory-safer shape at the cost of recomputation.
+\end{remark}
+
+\section{The SQL-readiness probe}
+\label{sec:probe}
+
+Equation (7.2) grades exactly one thing: the SQL, at the very end. The
+\textbf{SQL-readiness probe} is an auxiliary term that grades the same thing at
+an \emph{earlier} point in the sequence.
+
+\begin{definition}[The probe]
+\label{def:probe}
+Fix a role index $j^\star$ (the parameter \texttt{SQL\_READY\_ROLE}) and a token
+budget $\kappa$ (\texttt{SQL\_READY\_TOKENS}). During the loop of step 2 above,
+immediately after finishing role $j^\star$'s latent steps, build a
+\emph{second}, temporary sequence:
+\[
+\Phi_{j^\star} \ \big\|\ \texttt{<|consensus|>} \ \big\|\ (g_1,\dots,g_\kappa),
+\]
+supervise only the $\kappa$ target tokens, and record its loss
+\[
+\mathcal{L}^{\mathrm{probe}}
+= -\frac{1}{\kappa}\sum_{i=1}^{\kappa}\log p_\theta\big(g_i \mid \Phi_{j^\star}, g_{<i}\big).
+\tag{7.3}
+\]
+The total objective is
+\[
+\boxed{\ \mathcal{L}_k = \mathcal{L}^{\mathrm{main}}_k + \lambda\,\mathcal{L}^{\mathrm{probe}}\ }
+\tag{7.4}
+\]
+with $\lambda = $ \texttt{SQL\_READY\_WEIGHT} $= 0.5$.
+\end{definition}
+
+The intent, in one sentence: \emph{teach the model that \texttt{<|consensus|>}
+means ``start writing SQL now'' regardless of how many latent roles preceded
+it.}
+
+\subsection{A degeneracy: why $j^\star = k$ does nothing}
+\label{sec:degenerate}
+
+\begin{proposition}
+\label{prop:probe-degenerate}
+If $j^\star = k$ --- the probe fires after the \emph{last} latent role of the
+current stage --- then $\mathcal{L}^{\mathrm{probe}}$ is a truncated copy of
+$\mathcal{L}^{\mathrm{main}}_k$, and (7.4) reduces to a reweighting of the main
+loss rather than adding any new constraint.
+\end{proposition}
+
+\begin{proof}
+The probe's prefix is $\Phi_{j^\star}$ followed by \texttt{<|consensus|>}. When
+$j^\star = k$, $\Phi_{j^\star} = \Phi_k$, which is exactly the main sequence's
+prefix; the main sequence also continues with \texttt{<|consensus|>}. The two
+sequences are therefore token-for-token and vector-for-vector identical up to
+that point. The probe then supervises $(g_1,\dots,g_\kappa)$; the main loss
+supervises $(g_1,\dots,g_n)$ with $\kappa \le n$. So
+$\mathcal{L}^{\mathrm{probe}}$ is the mean of the first $\kappa$ of the same
+$n$ per-token terms that $\mathcal{L}^{\mathrm{main}}_k$ averages, computed at
+the same positions from the same states. It contributes no gradient direction
+that $\mathcal{L}^{\mathrm{main}}_k$ does not already contain.
+\end{proof}
+
+Visually, at stage $4$ with $j^\star=4$:
+\begin{lstlisting}
+probe :  prompt | r1 oo | r2 oo | r3 oo | r4 oo | <|consensus|> | SQL[:16]
+main  :  prompt | r1 oo | r2 oo | r3 oo | r4 oo | <|consensus|> | SQL
+         ^--------------- identical ---------------^
+\end{lstlisting}
+
+\subsection{Why $j^\star = k-1$ is not degenerate}
+
+Set $j^\star = 3$. At stage $4$:
+\begin{lstlisting}
+probe :  prompt | r1 oo | r2 oo | r3 oo |         <|consensus|> | SQL[:24]
+main  :  prompt | r1 oo | r2 oo | r3 oo | r4 oo | <|consensus|> | SQL
+                                        ^ probe cuts in one role early
+\end{lstlisting}
+Now the probe's prefix is a sequence the main loss never evaluates. In one
+optimisation step the model is graded on producing the same SQL from
+\emph{two different prefix lengths}. It cannot satisfy both by memorising one
+positional pattern; the only representation that satisfies both is the general
+rule ``\texttt{<|consensus|>} means SQL, whatever preceded it''.
+
+There is a second reason to prefer $j^\star = 3$: it is stage-independent. The
+probe is active only when $k \ge j^\star$ (the \texttt{sql\_ready\_active} gate
+in the code), so
+\begin{center}
+\begin{tabular}{cccc}
+\toprule
+$j^\star$ & stage 4 & stage 5 & stage 6 \\
+\midrule
+$4$ & degenerate & mid-prefix & mid-prefix \\
+$3$ & mid-prefix & mid-prefix & mid-prefix \\
+\bottomrule
+\end{tabular}
+\end{center}
+With $j^\star=4$ the probe was a genuine constraint at exactly the two stages
+that were not broken, and a no-op at the one that was.
+
+\begin{remark}[honest note, carried forward]
+Proposition~\ref{prop:probe-degenerate} shows $j^\star = 4$ was the wrong
+setting. It does \emph{not} show that fixing it is what repaired stage 4.
+Measured values of $\mathcal{L}^{\mathrm{probe}}$ during the retrain were of
+order $10^{-4}$ (Table~\ref{tab:retrain-loss}) --- as saturated as the main loss
+--- so its gradient contribution was tiny. This is picked up in
+Section~\ref{sec:attribution}.
+\end{remark}
+
+\newpage
+\part{The optimiser, and one uncomfortable fact about Adam}
+\label{part:optimiser}
+
+The loss of Part~\ref{part:objective} has to be turned into weight updates. How
+that is done turns out to matter as much as the loss itself, so it gets its own
+Part.
+
+\section{What is actually being trained: LoRA}
+
+We do not update all $7\times10^{9}$ parameters. We use \textbf{LoRA} (Low-Rank
+Adaptation): for a selected weight matrix $W_0 \in \mathbb{R}^{a\times b}$,
+freeze it and learn a low-rank correction,
+\[
+W = W_0 + \frac{\alpha}{r}\,BA,
+\qquad
+B \in \mathbb{R}^{a\times r},\ A\in\mathbb{R}^{r\times b},\ r \ll \min(a,b).
+\tag{8.1}
+\]
+Only $A$ and $B$ are trainable. Our settings are $r=32$, $\alpha=64$ (so the
+scaling factor is $\alpha/r = 2$), applied to
+\texttt{q\_proj, k\_proj, v\_proj, o\_proj, gate\_proj, up\_proj, down\_proj} in
+every layer.
+
+\begin{remark}
+LoRA matters here for a reason beyond memory: because $W_0$ is frozen, whatever
+the base model already believed is still fully present. It has not been
+overwritten, only offset. Mechanism 3 of Part~\ref{part:collapse} is exactly a
+case of the frozen base's prior reasserting itself.
+\end{remark}
+
+\section{Adam, derived}
+
+Plain gradient descent takes $\theta \leftarrow \theta - \eta g$ with
+$g = \nabla_\theta \mathcal{L}$. Its weakness is that a single global $\eta$ must
+suit parameters whose gradients differ in scale by orders of magnitude. Adam
+fixes this by giving each parameter its own effective step size, estimated from
+its own gradient history.
+
+\begin{definition}[Adam]
+With $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$, and moments
+initialised to zero, at step $t$:
+\[
+\begin{aligned}
+m_t &= \beta_1 m_{t-1} + (1-\beta_1)g_t & &\text{(momentum: a running mean of $g$)}\\
+v_t &= \beta_2 v_{t-1} + (1-\beta_2)g_t^2 & &\text{(a running mean of $g^2$)}\\
+\hat m_t &= \frac{m_t}{1-\beta_1^{\,t}},\qquad
+\hat v_t = \frac{v_t}{1-\beta_2^{\,t}} & &\text{(bias correction)}\\
+\theta_t &= \theta_{t-1} - \eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}. & &
+\end{aligned}
+\tag{8.2}
+\]
+\end{definition}
+
+The bias correction exists because $m_0 = v_0 = 0$ drags the early averages
+toward zero; dividing by $1-\beta^t$ removes that bias exactly.
+
+\subsection{The normalisation, and what it costs}
+
+Look at the update direction in (8.2):
+\[
+\Delta\theta = -\eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}.
+\]
+$\hat m_t$ is an average of $g$; $\sqrt{\hat v_t}$ is (roughly) the root-mean-square
+of $g$. Their ratio is \emph{scale-free}: multiply every gradient by $1000$ and
+both numerator and denominator scale by $1000$, leaving $\Delta\theta$ unchanged.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Adam does not take smaller steps when the gradient is small.} It takes
+steps of size set by $\eta$, in the direction the gradient points, essentially
+regardless of the gradient's magnitude. A gradient of $10^{-4}$ moves the
+weights about as far as a gradient of $10^{-1}$.
+}}
+\end{center}
+
+This is a feature when the small gradient is a genuine, consistent signal. It is
+a hazard when the small gradient is \emph{noise} --- which is exactly the
+situation when the loss has saturated.
+
+\begin{proposition}[the first step after a moment reset is a pure sign step]
+\label{prop:adam-first-step}
+Immediately after the moments are reset to zero, the first Adam update is
+\[
+\Delta\theta = -\eta\,\frac{g}{|g|+\varepsilon} \ \approx\ -\eta\,\mathrm{sign}(g),
+\]
+independently of $\|g\|$.
+\end{proposition}
+
+\begin{proof}
+Set $t=1$ with $m_0 = v_0 = 0$. From (8.2),
+\[
+m_1 = (1-\beta_1)g,\qquad v_1 = (1-\beta_2)g^2 .
+\]
+Bias correction divides by $1-\beta_1^{1} = 1-\beta_1$ and
+$1-\beta_2^{1} = 1-\beta_2$ respectively, which cancels those factors exactly:
+\[
+\hat m_1 = \frac{(1-\beta_1)g}{1-\beta_1} = g,
+\qquad
+\hat v_1 = \frac{(1-\beta_2)g^2}{1-\beta_2} = g^2 .
+\]
+Hence $\sqrt{\hat v_1} = |g|$ and
+\[
+\Delta\theta = -\eta\,\frac{g}{|g|+\varepsilon},
+\]
+which for $|g| \gg \varepsilon$ is $-\eta\,\mathrm{sign}(g)$: a step of length
+exactly $\eta$ per coordinate, whatever the gradient's size.
+\end{proof}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+Combine Proposition~\ref{prop:adam-first-step} with the curriculum's design
+choice of resetting the optimiser at every stage boundary
+(Section~\ref{sec:curriculum}) and the consequence is immediate: \textbf{the
+first update of every stage is a full-size step in whatever direction the
+residual gradient happens to point}, even if that gradient is pure noise from
+an already-memorised objective.
+}}
+\end{center}
+
+\section{Gradient accumulation, and how few steps there really are}
+
+Gradients are accumulated over several records before an update:
+\begin{lstlisting}
+(loss / cfg.grad_accum).backward()
+...
+if n_acc % cfg.grad_accum == 0:
+    torch.nn.utils.clip_grad_norm_(params, 1.0)
+    optim.step()
+    optim.zero_grad(set_to_none=True)
+\end{lstlisting}
+This is mathematically the gradient of the mean loss over
+\texttt{grad\_accum} records --- a larger effective batch at constant memory.
+
+The runner sets \texttt{--grad-accum "\$limit"}, i.e. equal to the batch size.
+So one process $=$ one batch $=$ \emph{exactly one} optimiser step.
+
+\begin{example}[the real step budget]
+\label{ex:step-budget}
+With $N = 94$ usable records, \texttt{BATCH\_SIZE} $= 16$ and
+\texttt{EPOCHS\_PER\_STAGE} $= 3$:
+\[
+\left\lceil \frac{94}{16}\right\rceil = 6\ \text{batches per epoch},
+\qquad
+6 \times 3 = \boxed{18\ \text{optimiser steps per stage}} .
+\]
+Meanwhile $94\times3 = 282$ forward/backward passes are logged per stage, which
+matches the step-record counts exactly.
+\end{example}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+$18$ steps is very few. Under Proposition~\ref{prop:adam-first-step} the first
+of them is a full-$\eta$ sign step, and with $\beta_1 = 0.9$ the momentum is
+still far from equilibrium for several more. At $\eta = 5\times10^{-5}$ and
+LoRA's $\alpha/r = 2$ amplification, this is real movement in the adapter, in a
+direction chosen by whichever one or two of $16$ records still had non-trivial
+loss.
+}}
+\end{center}
+
+Gradient clipping to norm $1.0$ is applied before every step. Note what it does
+and does not do: it bounds the update when gradients are \emph{large}. It has no
+effect at all when they are small, which is the regime that causes trouble here.
+
+\newpage
+\part{A worked failure: the stage-4 collapse}
+\label{part:collapse}
+
+Everything in Parts~\ref{part:objective} and~\ref{part:optimiser} was set up so
+that this Part can be read as a derivation rather than a story. A real
+curriculum run broke in a specific, reproducible way; the cause turned out to
+be a consequence of the objective's shape and the optimiser's normalisation,
+both of which have now been stated precisely.
+
+\section{The symptom}
+
+The CHESS-step curriculum was run for six stages. After each stage the
+checkpoint was probed on a fixed $30$-question held-out sample.
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+stage $k$ & train loss (mean) & probe EX (\%) & avg output tokens \\
+\midrule
+1 & $0.1332$ & $66.67$ & $62.7$ \\
+2 & $0.0186$ & $66.67$ & $67.8$ \\
+3 & $0.0019$ & $63.33$ & $61.0$ \\
+\textbf{4} & $\mathbf{0.0008}$ & $\mathbf{26.67}$ & $\mathbf{125.7}$ \\
+5 & $0.0015$ & $56.67$ & $72.4$ \\
+6 & $0.0014$ & $63.33$ & $67.4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Stage $4$ loses $36.66$ points of execution accuracy and doubles its output
+length.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+The project's own earlier documentation described this as ``an
+optimization/representation instability''. That was wrong, and the table above
+is the refutation: \textbf{stage 4 has the lowest mean loss and the lowest
+maximum loss of any stage} ($\max = 0.1265$, versus $0.9836$ at stage 1). There
+is no instability. Training went better at stage 4 than anywhere else.
+}}
+\end{center}
+
+\section{What the failures actually looked like}
+
+$14$ of the $30$ stage-4 predictions were unparseable, and all $14$ failed the
+same way --- schema-linking prose after the consensus marker, repeated until the
+$200$-token generation cap:
+
+\begin{lstlisting}
+<|consensus|>Tables:
+Tables: visitor, visit, museum
+Tables:
+Tables: visitor, visit, museum
+... (to the cap)
+\end{lstlisting}
+
+The doubled output length is the same fact seen from the other side: those are
+not longer queries, they are cap-length loops.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+The model has not forgotten SQL. It has forgotten that
+\texttt{<|consensus|>} means ``emit SQL''. It has reverted to a different,
+older belief about what follows a role tag.
+}}
+\end{center}
+
+\section{Mechanism 1: the objective is saturated by stage 3}
+
+Recall (7.2): $|\mathcal{S}| = n \approx 62$ supervised tokens per record, and
+$N = 94$ records, run for $3$ epochs per stage.
+
+By stage $3$ the mean per-token cross-entropy is $0.0019$; by stage $4$ it is
+$0.0008$, i.e. $p_t \approx 0.9992$ on the correct next token.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+$94$ SQL strings, seen $3$ times each per stage across six stages, at a per-token
+loss of $8\times10^{-4}$. They are \textbf{memorised}. There is essentially no
+learning signal left in $\mathcal{L}^{\mathrm{main}}$.
+}}
+\end{center}
+
+The reason this happens so completely is the SQL-direct format
+(Definition~\ref{def:stage}). Look again at the code:
+
+\begin{lstlisting}
+add_text(chat, supervise=False)
+for idx, role in enumerate(cfg.roles):
+    if role == "consensus":
+        break
+    if idx >= n_latent_roles:
+        break            # <-- latent_sft.py:113
+    ...
+add_text(T_CONSENSUS_OPEN, supervise=False)
+add_token_ids(target_ids, supervise=True)
+\end{lstlisting}
+
+Line 113 \texttt{break}s out of the loop for every role past the current stage.
+It does not fall through to a branch that appends those roles as \emph{text}.
+There is no such branch on this path. Confirmation from the logs:
+\texttt{text\_loss} is \texttt{null} in all $1908$ step records of the run.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{This is where LatentSQL departs from Coconut.} Coconut replaces the
+first $k$ reasoning steps with latents \emph{and keeps the remaining steps as
+supervised text}, so the supervision set shrinks gradually as $k$ grows. Here
+the remaining steps are deleted, so the supervision set is a constant $\approx
+62$ SQL tokens at every stage. The curriculum's difficulty ramps; the
+objective's difficulty does not.
+}}
+\end{center}
+
+\section{Mechanism 2: Adam steps into the noise at full size}
+
+Now apply Part~\ref{part:optimiser}. Per Example~\ref{ex:step-budget} there are
+$18$ optimiser steps per stage, and the runner deletes
+\texttt{optim\_state.pt} at each stage boundary, so every stage begins from zero
+momentum.
+
+By Proposition~\ref{prop:adam-first-step}, the first step of stage $4$ is
+\[
+\Delta\theta = -\eta\,\mathrm{sign}(g),\qquad \eta = 5\times10^{-5},
+\]
+a full-magnitude step regardless of the fact that $\|g\|$ is now tiny. And by
+the scale-freeness of (8.2), the following steps are not much smaller.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{The two mechanisms compose badly.} Mechanism 1 says the gradient carries
+almost no information. Mechanism 2 says Adam will nonetheless move the weights
+the full distance $\eta$ in whatever direction that near-zero gradient points.
+The adapter drifts, driven by whichever one or two of $16$ records in a batch
+still have non-trivial loss.
+}}
+\end{center}
+
+\section{Mechanism 3: where the drift lands}
+
+Drift alone would be harmless if the weights had nowhere bad to go. They do.
+
+The curriculum starts from \texttt{sft\_7b\_bf16}, an adapter trained by ordinary
+SFT on \emph{full written debate transcripts} --- schema-linking blocks that
+literally begin \texttt{Tables: ...}, candidate discussions, unit tests. In
+those transcripts, the thing that follows a role tag is prose.
+
+By (8.1) that belief was never deleted: $W_0$ is frozen and the LoRA correction
+merely offsets it. The latent curriculum trains a competing behaviour --- ``after
+the tags, emit SQL'' --- but only on the $94$ training records, where the model
+already gets it right and therefore is never penalised for the old prior. On any
+held-out question the two behaviours compete, and a few full-size Adam steps in a
+noise direction are enough to tip the balance.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+This is a \textbf{generalisation} failure, not an optimisation one, and it is
+invisible to the training objective by construction. The objective is evaluated
+on exactly the distribution where the failure does not occur.
+}}
+\end{center}
+
+\begin{proposition}[the failure is unobservable to the objective]
+Let $\mathcal{D}_{\mathrm{tr}}$ be the $94$ training records and
+$\mathcal{D}_{\mathrm{ho}}$ the held-out set. Suppose parameters $\theta$ satisfy
+$\mathcal{L}(\theta;\,x) < \epsilon$ for all $x\in\mathcal{D}_{\mathrm{tr}}$ while
+the model's greedy continuation after \texttt{<|consensus|>} on some
+$x'\in\mathcal{D}_{\mathrm{ho}}$ is not SQL. Then no quantity computed from
+$\{\mathcal{L}(\theta;x)\}_{x\in\mathcal{D}_{\mathrm{tr}}}$ --- its mean, maximum,
+variance, or trajectory --- can distinguish $\theta$ from a $\theta'$ that
+generalises correctly.
+\end{proposition}
+\begin{proof}
+Immediate: the hypothesis fixes the values of every such quantity on
+$\mathcal{D}_{\mathrm{tr}}$ to be within $\epsilon$ of the same numbers for both
+$\theta$ and $\theta'$, while the behaviour that differs is evaluated only on
+$\mathcal{D}_{\mathrm{ho}}$, which those quantities do not depend on.
+\end{proof}
+
+This is why the per-stage held-out probe exists in the runner at all, and why it
+caught something a loss curve never would.
+
+\section{The bonus finding: the fix that was already configured did nothing}
+
+The run had \texttt{SQL\_READY\_ROLE=4} set, precisely to anchor the
+``consensus means SQL'' rule. By
+Proposition~\ref{prop:probe-degenerate}, at stage $4$ with $j^\star=4$ the probe
+is a truncated duplicate of the main loss.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+The auxiliary constraint was a genuine mid-prefix anchor at stages $5$ and $6$
+--- which were never the problem --- and a no-op at stage $4$, which was.
+}}
+\end{center}
+
+\section{The repair}
+
+Two changes, applied from stage $4$ onward, resuming from the stage-3 checkpoint
+into a fresh run directory (\texttt{chess\_coconut\_sql\_direct\_s4fix}) so the
+original run and the downstream GRPO adapter were left untouched:
+
+\begin{center}
+\begin{tabular}{lccl}
+\toprule
+knob & before & after & targets \\
+\midrule
+learning rate, stage $\ge 4$ & $5\times10^{-5}$ & $1\times10^{-5}$ & mechanism 2 \\
+\texttt{SQL\_READY\_ROLE} & $4$ & $3$ & mechanism 3 \\
+\texttt{SQL\_READY\_WEIGHT} & $0.5$ & $0.5$ & --- \\
+\texttt{SQL\_READY\_TOKENS} & $16$ & $24$ & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The learning-rate change reduces the size of every drift step by $5\times$. The
+probe change makes (7.4) a real constraint at stages $4$, $5$ and $6$
+(Section~\ref{sec:degenerate}).
+
+\begin{remark}[what was deliberately not changed]
+The obvious structural fix --- restore Coconut's remaining-steps-as-text
+supervision, so that $|\mathcal{S}|$ grows with the curriculum and the objective
+never saturates --- was \emph{not} attempted. It changes the format the
+downstream GRPO stage and the evaluation harness both assume. It is recorded as
+the next lever if a hyperparameter fix had failed.
+\end{remark}
+
+\section{Result of the retrain}
+
+\begin{center}
+\begin{tabular}{rrrrrr}
+\toprule
+stage & EX old & EX new & unparseable & hit $200$-cap & out tokens \\
+\midrule
+4 & $26.67$ & $\mathbf{66.67}$ & $14 \to \mathbf{0}$ & $14\to\mathbf{0}$ & $125.7\to\mathbf{61.6}$ \\
+5 & $56.67$ & $\mathbf{66.67}$ & $3 \to \mathbf{0}$  & $2\to\mathbf{0}$  & $72.4\to\mathbf{61.2}$ \\
+6 & $63.33$ & $63.33$          & $0 \to 0$           & $1\to\mathbf{0}$  & $67.4\to\mathbf{62.2}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The collapse is gone ($+40.00$ EX at stage 4) and the \texttt{Tables:} loop is
+eliminated outright. Note also what the table reveals about the \emph{original}
+run: stage 5's apparent ``recovery'' was never complete --- it still carried $3$
+unparseable predictions and a $72.4$-token average. Stages 5 and 6 had been
+partly spending their capacity undoing stage 4's damage.
+
+On the full held-out set:
+
+\begin{center}
+\begin{tabular}{lrrrrrrr}
+\toprule
+run & $n$ & EX & bird & spider & out tok & unparseable & latency \\
+\midrule
+stage 6, original          & $90$ & $52.22$ & $33.33$ & $71.11$ & $67.5$ & $4$ & $2.212$\,s \\
+stage 6, \textbf{retrained} & $90$ & $\mathbf{57.78}$ & $\mathbf{37.78}$ & $\mathbf{77.78}$ & $\mathbf{61.2}$ & $\mathbf{0}$ & $\mathbf{2.073}$\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$+5.56$ EX, improving on \emph{both} benchmarks, output length down $9.3\%$,
+latency down $6.3\%$, every unparseable prediction eliminated.
+
+\begin{remark}[probe optimism]
+The $n=30$ stage-6 probe is flat between the two runs ($63.33$ both times); the
+advantage appears only on the full $n=90$ set. A $30$-question probe has a
+standard error of roughly $9$ points, so it can rank two nearby checkpoints
+incorrectly. It is a smoke detector, not a scoreboard.
+\end{remark}
+
+\section{Training loss during the retrain, and the attribution caveat}
+\label{sec:attribution}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+stage & steps & $\mathcal{L}^{\mathrm{main}}$ mean & $\mathcal{L}^{\mathrm{main}}$ max & $\mathcal{L}^{\mathrm{probe}}$ mean\\
+\midrule
+4 & $311$ & $0.00030$ & $0.0252$ & $2.39\times10^{-4}$\\
+5 & $282$ & $0.00118$ & $0.3388$ & $1.44\times10^{-3}$\\
+6 & $282$ & $0.00003$ & $0.0001$ & $8.15\times10^{-6}$\\
+\bottomrule
+\end{tabular}
+\caption{Retrained stages. Both loss terms are saturated throughout.}
+\label{tab:retrain-loss}
+\end{table}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Two knobs moved at once. This is not a clean ablation.}\\[5pt]
+The evidence favours the learning rate doing nearly all the work:
+$\mathcal{L}^{\mathrm{probe}}$ logged $\sim10^{-4}$ throughout, i.e. the
+auxiliary term was as saturated as the main one and contributed almost no
+gradient.\\[5pt]
+\textbf{Supported claim:} lowering the late-stage learning rate fixes the
+stage-4 collapse.\\
+\textbf{Not supported:} the SQL-readiness probe fixes it.\\[5pt]
+A clean separation requires a third run at $\eta=10^{-5}$ with
+\texttt{SQL\_READY\_WEIGHT}$=0$. It has not been run.
+}}
+\end{center}
+
+Note also that Table~\ref{tab:retrain-loss} independently confirms Mechanism 1:
+at the \emph{lower} learning rate the losses are, if anything, even smaller. A
+saturated objective was never the thing the learning rate fixed --- what it
+fixed was how far the weights travelled while the objective was blind.
+
+\section{Two infrastructure failures worth recording}
+
+Both occurred at a batch boundary, and both trace to one fact: \emph{a process
+exiting does not mean its CUDA context has been released.}
+
+\begin{enumerate}
+\item \textbf{Out of memory.} Two per-batch processes overlapped
+  ($17.47 + 5.91$\,GB against a $22.57$\,GB budget) and the run aborted --- even
+  though the batch's own peak was only $18.5$\,GB. Fix: a \texttt{gpu\_settle}
+  helper that polls \texttt{nvidia-smi} until the card has drained below
+  $1500$\,MiB before each batch and each evaluation.
+
+\item \textbf{A silent CPU downgrade, which was worse.} The next attempt logged
+  \emph{zero} training steps in $48$ minutes while burning $1$h$53$m of CPU time
+  at $18.3$\,GB resident, with the GPU idle at $40$\,MiB.
+  \texttt{torch.cuda.is\_available()} had returned \texttt{False} transiently,
+  \texttt{resolve\_device("auto")} therefore returned \texttt{"cpu"}, and a 7B
+  model in \texttt{bfloat16} trained happily in host RAM roughly $500\times$ too
+  slowly \emph{without raising anything}.
+\end{enumerate}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+An out-of-memory error at least fails loudly. A silent device downgrade produces
+a ``successful'' run, exit code $0$, days later, with a checkpoint trained on
+nothing. The fix is a guard that converts the silent fallback into an immediate
+error, shown below; the runner sets \texttt{LATENTSQL\_REQUIRE\_CUDA=1} on every
+batch and every evaluation, and retries each batch once after $20$\,s, since
+both failure modes clear within seconds.
+}}
+\end{center}
+
+\begin{lstlisting}
+if torch.cuda.is_available():
+    return "cuda"
+if os.environ.get("LATENTSQL_REQUIRE_CUDA", "").strip() not in ("", "0", "false", "False"):
+    raise RuntimeError(
+        "LATENTSQL_REQUIRE_CUDA is set but torch.cuda.is_available() is False - "
+        "refusing to fall back to CPU.")
+\end{lstlisting}
+
+\newpage
+\part{Reinforcement learning: internalisation with GRPO}
+\label{part:grpo}
+
+Curriculum SFT (Parts~\ref{part:objective}--\ref{part:collapse}) teaches the
+model to \emph{produce} a latent-then-SQL sequence that imitates the teacher's
+structure. It never once optimises for \emph{correctness} directly, and it
+never rewards brevity. That is IMAD's stage 2.
+
+\section{Group Relative Policy Optimisation, from the policy-gradient theorem}
+
+\begin{definition}[The objective]
+Let $\pi_\theta(y\mid x)$ be the probability the current model assigns to
+generating completion $y$ given input $x$. Training wants to maximise expected
+reward,
+\[
+J(\theta) = \mathbb{E}_{y\sim\pi_\theta(\cdot\mid x)}\big[R(x,y)\big]
+= \sum_y \pi_\theta(y\mid x)\,R(x,y).
+\]
+\end{definition}
+
+\begin{theorem}[Policy gradient]
+\label{thm:pg}
+\[
+\nabla_\theta J(\theta) = \mathbb{E}_{y\sim\pi_\theta}\big[\nabla_\theta\log\pi_\theta(y\mid x)\cdot R(x,y)\big].
+\]
+\end{theorem}
+\begin{proof}
+Since $R$ does not depend on $\theta$,
+$\nabla_\theta J = \sum_y \nabla_\theta\pi_\theta(y\mid x)\,R(x,y)$.
+Using the log-derivative identity
+$\nabla_\theta\pi_\theta = \pi_\theta\,\nabla_\theta\log\pi_\theta$ (chain rule
+on $\log$), this becomes
+$\sum_y \pi_\theta(y\mid x)\,\nabla_\theta\log\pi_\theta(y\mid x)\,R(x,y)$,
+which is by definition an expectation under $\pi_\theta$.
+\end{proof}
+
+This is what makes RL on a language model tractable at all: the intractable sum
+over every possible SQL query is replaced by sampling a handful of actual
+completions and averaging.
+
+\begin{proposition}[a baseline is free]
+\label{prop:baseline}
+For any $b$ not depending on $y$,
+$\mathbb{E}_{y\sim\pi_\theta}[\nabla_\theta\log\pi_\theta(y\mid x)\cdot b] = 0$.
+\end{proposition}
+\begin{proof}
+The left side equals $b\cdot\nabla_\theta\sum_y\pi_\theta(y\mid x)$. But
+$\sum_y \pi_\theta(y\mid x)=1$ identically (it is a probability distribution),
+and the derivative of a constant is $0$.
+\end{proof}
+
+So subtracting any $y$-independent quantity leaves the expected gradient
+unchanged while reducing its variance — which licenses GRPO's construction.
+
+\begin{definition}[GRPO advantage]
+\label{def:grpo-adv}
+For a group of $G$ rollouts $y_1,\dots,y_G$ sampled at the same $x$, with
+$r_i = R(x,y_i)$,
+\[
+A_i = \frac{r_i - \bar r}{s},\qquad \bar r = \mathrm{mean}(r_1,\dots,r_G),
+\quad s = \mathrm{std}(r_1,\dots,r_G).
+\tag{9.1}
+\]
+\end{definition}
+
+\begin{corollary}[a saturated group has zero gradient]
+\label{cor:zero-grp}
+If $r_1=\cdots=r_G$, then $A_i=0$ for every $i$, and the resulting gradient
+estimate $\frac1G\sum_i A_i\,\nabla_\theta\log\pi_\theta(y_i\mid x)$ is exactly
+the zero vector.
+\end{corollary}
+\begin{proof}
+$\bar r = r_1$ makes every numerator $r_i-\bar r=0$, so every $A_i=0$
+regardless of how $s=0$ is handled.
+\end{proof}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+This is not a hand-wave — it is exactly what \texttt{grpo.py} logs as
+\texttt{adv\_nonzero\_frac} $= 0$: a group where every sampled rollout agrees on
+reward (all correct, or all wrong) contributes \emph{nothing} to that step. It
+is the single most common failure mode this project's own diagnostics recorded
+for GRPO.
+}}
+\end{center}
+
+\section{The clipped surrogate and the KL penalty}
+
+The code (\texttt{grpo.py}) does not apply (9.1) directly to
+$\log\pi_\theta$; it uses PPO's clipped surrogate, with importance ratio
+$\rho = \exp(\log\pi_\theta(y\mid x) - \log\pi_{\theta_{\mathrm{old}}}(y\mid x))$
+(here $=1$ on the very step it is sampled from, since $\theta = \theta_{\mathrm{old}}$
+at that instant):
+\[
+\mathcal{L}^{\mathrm{PG}}_i = -\min\big(\rho_i A_i,\ \mathrm{clip}(\rho_i, 1-\epsilon, 1+\epsilon)\,A_i\big),
+\qquad
+\mathrm{KL} \approx e^{\delta} - \delta - 1,\ \ \delta = \log\pi_\theta - \log\pi_{\mathrm{ref}},
+\]
+\[
+\mathcal{L} = \mathcal{L}^{\mathrm{PG}} + \beta_{\mathrm{KL}}\cdot\mathrm{KL},
+\qquad \epsilon = 0.2,\ \ \beta_{\mathrm{KL}} = 0.02.
+\]
+The clip bounds how far one step can trust a single sample; the KL term
+(an always-non-negative estimator of the divergence from a frozen reference
+policy) discourages the policy from drifting arbitrarily far in pursuit of
+reward alone — exactly the kind of unconstrained drift
+Section~\ref{prop:adam-first-step} showed Adam is willing to take.
+
+\section{IMAD's reward, specialised to SQL execution}
+
+IMAD's reward (its eq. 1) is
+\[
+r(x,y) = w_{\mathrm{fmt}}\,R_{\mathrm{fmt}} + w_{\mathrm{clip}}\,R(y;l),
+\qquad
+R(y;l) = \begin{cases}1 & y^\star \text{ appears in the first } l \text{ tokens of } y\\ 0 & \text{else.}\end{cases}
+\tag{9.2}
+\]
+Two schedules anneal over training:
+\[
+w_{\mathrm{fmt}}: 1.0 \to 0.05,\qquad l: l_0 \to l^\star .
+\]
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{The mechanism, in one sentence:} the decaying format reward removes the
+incentive to \emph{verbalise} the debate; the shrinking length limit makes
+verbalising it \emph{impossible} while still earning the correctness reward. The
+only strategy left is to do the multi-perspective analysis internally and
+answer directly.
+}}
+\end{center}
+
+For Text-to-SQL, ``correct'' is redefined as execution match
+(Definition~\ref{def:ex}) rather than string containment, so $R(y;l)$ actually
+runs the clipped SQL against the database. Two shaping terms are added, small so
+IMAD's two terms still dominate: $w_{\mathrm{exec\_ok}}$ (the query parses and
+runs) and $w_{\mathrm{tag\_order}}$ (structure tags in the canonical order).
+
+\subsection{Dense partial credit, for when GRPO would otherwise learn nothing}
+
+Corollary~\ref{cor:zero-grp} is not hypothetical here: a rollout group that is
+\emph{entirely wrong} has zero variance under (9.2), and by
+Proposition~\ref{prop:baseline}/Corollary~\ref{cor:zero-grp} contributes no
+gradient. Two extra terms, awarded \emph{only to incorrect rollouts}, break the
+tie between a near-miss and a badly-wrong one:
+\[
+w_{\mathrm{atomic}}\cdot R_{\mathrm{atomic}}(y,y^\star)
+\ +\ w_{\mathrm{memory}}\cdot R_{\mathrm{memory}}(y)
+\]
+where $R_{\mathrm{atomic}}$ scores atomic-SQL-operator overlap with the gold
+query and $R_{\mathrm{memory}}$ scores similarity to previously-verified
+reasoning traces (annealed on $w_{\mathrm{fmt}}$'s schedule, so it fades exactly
+as the incentive to reason in prose fades).
+
+\subsection{Brevity, for when a group is entirely correct}
+
+The mirror problem: a group where every rollout is already correct
+\emph{also} has zero variance, and — since the entire purpose of
+internalisation is to stop verbalising — this is precisely the case where
+GRPO most needs to say something. Among correct rollouts only,
+\[
+R_{\mathrm{brevity}}(y) = \max\!\Big(0,\ 1 - \frac{|y|}{\text{ref}}\Big),
+\]
+so a terse correct answer outscores a verbose correct answer, giving the group
+non-zero variance again and restoring a gradient.
+
+\section{Latent rollouts}
+
+With \texttt{latent\_rollouts: true}, GRPO samples SQL not from a plain-text
+prompt but from the latent prefix of Part~\ref{part:roles} — the KV cache
+already primed by the role tags and their latent steps — and backpropagates
+\emph{through} those latent steps, exactly as in curriculum SFT
+(Section~\ref{sec:kv}'s checkpointing discussion applies identically here). When
+this is active, there is no debate text to anneal away, so
+$w_{\mathrm{fmt},\text{start}}=w_{\mathrm{fmt},\text{end}}=0$ and correctness
+alone drives the reward.
+
+\section{What GRPO measurably did}
+
+Fifty GRPO steps, fifty hard prompts, brevity enabled, starting from the
+\emph{original} (pre-repair) stage-6 checkpoint, evaluated on the same held-out
+$n=90$ mix:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & SFT (pre-GRPO) & after GRPO & $\Delta$ \\
+\midrule
+EX ($n=90$)         & $52.22\%$ & $\mathbf{58.89\%}$ & $+6.67$ \\
+bird EX              & $33.33\%$ & $\mathbf{37.78\%}$ & $+4.45$ \\
+spider EX            & $71.11\%$ & $\mathbf{80.00\%}$ & $+8.89$ \\
+avg output tokens    & $67.5$    & $\mathbf{61.9}$     & $-5.6$ \\
+unparseable          & $4$       & $\mathbf{0}$        & $-4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Accuracy rose while output length fell — the brevity reward doing exactly what
+it was shaped to do — and every one of the $90$ generations stayed parseable,
+so the latent $\to$ \texttt{<|consensus|>} $\to$ SQL format survived GRPO
+intact. The gain concentrates on Spider; GRPO's training prompts were drawn
+from the same length-filtered pool as the eval split, so the Spider number is
+the more independently-earned half of this result.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{These two levers must not be added.} GRPO's $+6.67$ was measured
+starting from a stage-6 checkpoint whose curriculum \emph{had} the stage-4
+collapse in its history (Part~\ref{part:collapse}). The repaired curriculum
+alone reaches $57.78\%$ EX with \emph{no} GRPO at all
+(Table in \S\ref{part:collapse}'s result section) — nearly the same place, from
+a different lever. The correct next experiment, not yet run, is GRPO starting
+from the repaired stage-6 adapter.
+}}
+\end{center}
+
+\newpage
+\part{Does GRPO sharpen the agent subspaces, or not?}
+\label{part:grpo-activation}
+
+Part~\ref{part:activation} showed SFT builds separable per-agent directions.
+Part~\ref{part:grpo} added a second stage on top: GRPO. This Part asks the
+question those two leave open, and answers it the same way the rest of this
+document does: build it from one small fact, then check that fact against
+this project's own code and four papers read for this section
+(\texttt{pdfs/rl/}).
+
+\section{The one fact everything else follows from}
+
+Recall two things already proved earlier in this document.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{Fact 1 (Definition~\ref{def:grpo-adv}).} GRPO grades a \emph{group} of
+$G$ attempts at the same question and compares them to each other:
+$A_i = (r_i - \bar r)/s$.\\[6pt]
+\textbf{Fact 2 (Corollary~\ref{cor:zero-grp}).} If all $G$ attempts score the
+same, every $A_i = 0$, and the gradient is exactly zero. \textbf{No
+disagreement inside the group $\Rightarrow$ nothing is learned.}
+}}
+\end{center}
+
+So the whole question ``does GRPO reshape the latent thoughts?'' reduces to
+one much smaller question:
+
+\begin{center}
+\fbox{\parbox{0.85\textwidth}{
+\textbf{When GRPO samples $G$ attempts at one question, do the $G$ latent
+thoughts actually differ from each other?}
+}}
+\end{center}
+
+If yes, GRPO has something to compare and can push the latent thoughts apart
+or together. If no, it cannot --- by Fact 2, with nothing to be zero exactly.
+
+\section{A die you roll versus a die you average}
+\label{sec:dice}
+
+Here is the entire idea, before any formula. Take a fair six-sided die.
+
+\begin{itemize}
+\item \textbf{Roll it twice.} You might get $3$, then $5$. Two different
+  numbers --- \emph{disagreement}, something to compare.
+\item \textbf{Compute its average twice.} $(1+2+3+4+5+6)/6 = 3.5$. Then do the
+  same arithmetic again: $3.5$. \textbf{Every single time, no exceptions.} An
+  average has no randomness in it at all --- it is one fixed number, not a
+  draw from six possible ones.
+\end{itemize}
+
+\begin{center}
+\fbox{\parbox{0.85\textwidth}{
+\textbf{Rolling produces disagreement. Averaging never does, no matter how
+many times you repeat it.} This is not a subtle statistical point --- it is
+just what the word ``average'' means.
+}}
+\end{center}
+
+Now recall equation (4.3), this project's own recipe for a continuous
+thought:
+\[
+\mathrm{align}_{\mathrm{soft}}(h) \;=\; \sum_{v\in\mathcal{K}} \pi_v\, W_{\mathrm{in}}[v,:].
+\]
+Read the right-hand side out loud: it is a weighted \emph{average} of $32$
+embedding rows. Not a roll. An average. Two independent facts confirm this is
+not a coincidence of wording:
+
+\begin{enumerate}
+\item \textbf{The identical formula appears, independently, in a 2026 GRPO
+  paper.} Deng et al., \emph{Latent-GRPO} (arXiv:2604.27998, their eq.~1),
+  define a latent token exactly the same way:
+  \[
+  s_t \;=\; \sum_{i=1}^{K} p_{t,i}\, e_{t,i},
+  \]
+  a weighted average of the top-$K$ embeddings by their softmax probability
+  --- the same construction as our (4.3), reached independently for the same
+  reason (efficiency, no extra teacher forward pass). Two unrelated projects
+  landing on the same formula is good evidence it is the natural default, not
+  evidence that it is stochastic --- it still is not.
+\item \textbf{Nothing in \texttt{\_latent\_steps} or \texttt{align\_soft}
+  draws a random number.} Read the code (Part~\ref{part:coconut}): $h$ goes
+  in, one fixed vector comes out. Run it on the same $h$ a thousand times, get
+  the same vector a thousand times.
+\end{enumerate}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{This is the whole answer, stated plainly.} Our continuous thought is
+the ``average die'' from the analogy above, not the ``rolled die''. Sample a
+GRPO group of $G$ attempts at the same question with the same weights, and the
+$G$ latent thoughts are the same computation on the same input, $G$ times ---
+so they come out identical, every time, for the same reason $3.5=3.5$.
+}}
+\end{center}
+
+\subsection{Turning that into a one-line proof}
+\label{sec:grpo-shared-latent}
+
+Now state it as a proof, so ``the same reason $3.5=3.5$'' is not left as a
+slogan. Write $\Phi_k(\theta,x)$ for the latent prefix --- the state after
+$k$ role tags and their latent steps (Part~\ref{part:roles}) --- and write
+$\Phi_k(\theta,x)_i$ for the copy of it that rollout $i$ of a GRPO group
+actually used.
+
+\begin{proposition}[the GRPO group shares one latent trajectory]
+\label{prop:shared-latent}
+For every rollout $i=1,\dots,G$ in one GRPO step, at one prompt $x$ and one
+$\theta$: $\Phi_k(\theta,x)_i = \Phi_k(\theta,x)$, identically. The only
+random variable that differs across $i$ is the decoded completion $y_i$.
+\end{proposition}
+\begin{proof}
+$\Phi_k$ is a pure function of $(\theta,x)$ --- no random draw anywhere inside
+it (\S\ref{sec:dice}, point 2). \texttt{grpo.py::\_sample\_group\_latent}
+(l.236--299) computes it \emph{once} and \texttt{\_clone\_cache}s the result
+into all $G$ rollouts (l.269--271); a clone of a fixed value is that same
+value, $G$ times. \texttt{grpo.py::\_latent\_loss\_inner} (l.331--369)
+instead \emph{recomputes} it once per rollout via
+\texttt{build\_prefix(...,grad=True)} (l.338--341) --- but every rollout in
+one step shares the same $\theta$ (no \texttt{optim.step()} has run yet) and
+the same $x$, so a pure function fed the same input twice returns the same
+output twice: $3.5=3.5$, again. Either code path, $\Phi_k$ is constant in
+$i$; only $y_i$, built from each rollout's own \texttt{completion\_ids}, is
+not.
+\end{proof}
+
+\begin{corollary}[the latent-path gradient is blind to plan quality]
+\label{cor:latent-blind}
+The gradient of the latent-path loss with respect to the parameters that
+produce $\Phi_k$ can only be informed by comparing completions $y_1,\dots,y_G$
+conditioned on \emph{one shared} $\Phi_k$ --- never by comparing $\Phi_k$
+against a different latent trajectory for the same $x$.
+\end{corollary}
+\begin{proof}
+By Proposition~\ref{prop:shared-latent}, $\Phi_k$ does not vary with $i$. The
+only $i$-dependent terms in the loss are the advantage $A_i$ and
+$\log\pi_\theta(y_i\mid\cdot)$, both functions of $y_i$ conditioned on the
+shared $\Phi_k$; there is no term built from two different values of $\Phi_k$
+for the gradient to use.
+\end{proof}
+
+\section{Two published fixes, and their actual formulas}
+\label{sec:grpo-lit}
+\label{sec:published-fixes}
+
+If a rolled die gives disagreement and an averaged die does not, the obvious
+fix is: \textbf{stop averaging, start rolling.} Two 2026 papers do exactly
+this, in two different places, and both prove their fix is mathematically
+sound rather than just plausible.
+
+\subsection{Fix 1 --- roll inside the formula (Soft-GRPO / Latent-GRPO)}
+
+Deng et al.\ (arXiv:2604.27998, building on Zheng and Lee's Soft-GRPO)
+add \textbf{Gumbel noise} $\xi_i$ to the log-probabilities \emph{before} the
+softmax that builds the mixture weights:
+\[
+g'_{t,i} = \log p_{t,i} + \xi_i,
+\qquad
+\alpha_{t,i} = \frac{\exp(g'_{t,i}/\tau_g)}{\sum_{u=1}^K \exp(g'_{t,u}/\tau_g)},
+\qquad
+s_t = \sum_{i=1}^K \alpha_{t,i}\, e_{t,i}.
+\tag{10.2}
+\]
+Because $\xi_i$ is freshly random for every rollout, $\alpha_{t,i}$ --- and
+therefore $s_t$ --- now differs from rollout to rollout, even for the same
+$h$: a rolled die, not an averaged one. Crucially, this is not just noise
+bolted on for its own sake: the Gumbel perturbation has a known, exact
+log-density (their eq.~3),
+\[
+\log \pi_\theta(s_t) = \sum_{i=1}^K \Big[-(g'_{t,i}-\log p_{t,i}) - \exp(-(g'_{t,i}-\log p_{t,i}))\Big],
+\]
+which is exactly what a policy-gradient method needs --- the same role
+$\log\pi_\theta(y_{t+1}\mid\cdots)$ plays for an ordinary sampled token
+(Part~\ref{part:grpo}). With this in hand, the latent step can be treated by
+the \emph{same} clipped-PPO-ratio machinery Part~\ref{part:grpo} already
+derived for text tokens, just piecewise-defined across the latent segment and
+the decoded segment (their eq.~5). Latent-GRPO then adds three further,
+narrower fixes on top of this base construction --- \emph{Invalid Sample
+Advantage Masking} (drop truncated/off-manifold rollouts from the group
+statistics before normalising), \emph{One-sided Noise Sampling} (only allow
+$\xi_i \ge 0$, so a positive-advantage rollout's probability mass is never
+accidentally pushed the wrong way), and \emph{Optimal Correct-Path First-Token
+Selection} (avoid averaging together two different correct latent paths into
+one invalid blended state) --- because unconstrained two-sided noise on its
+own is unstable in practice; the base idea, however, is just: \textbf{put a
+real random draw inside the formula that builds the latent token.}
+
+\subsection{Fix 2 --- roll the weights instead of the output (Dropout-GRPO)}
+
+Jung (arXiv:2606.10184) takes the opposite route: instead of perturbing the
+\emph{output} of each latent step, perturb the \emph{weights} that compute it.
+Draw one Bernoulli dropout mask $\xi$ per rollout and hold it fixed across all
+$T$ latent recurrence steps of that rollout:
+\[
+h_t = f_{\tilde\theta(\xi)}(h_{t-1}),\qquad t=1,\dots,T,
+\tag{10.3}
+\]
+where $\tilde\theta(\xi)$ is the dropout-perturbed weights and $f_\theta$ is
+one transformer block. Because $\xi$ is drawn afresh per rollout, $h_T$ (and
+so the latent prefix) genuinely differs across the $G$ rollouts of a group ---
+again, a roll rather than an average. Jung then proves, rather than just
+argues, that this is the right thing to do:
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{Theorem (Jung 2026, Theorem 3, restated).} With the mean-only
+advantage $A^{(k)} = r^{(k)} - \bar r$ and the mask replayed at update time,
+\[
+\mathbb{E}\big[\nabla_\theta\mathcal{L}_{\mathrm{surr}}(\theta)\big]_{\theta=\theta_{\mathrm{old}}}
+= \Big(1 - \tfrac1K\Big)\,\nabla_\theta J(\theta)\Big|_{\theta_{\mathrm{old}}},
+\]
+where $J(\theta)$ is the expected reward of the \emph{mask-averaged} policy.
+The surrogate gradient is an unbiased estimate of the true gradient, up to a
+known, constant scale factor $(1-1/K)$ --- not an approximation with unknown
+error.
+}}
+\end{center}
+
+On GSM8K they report a Coconut baseline improving from $27.29\%$ to $29.01\%$
+pass@1 once this fix is applied --- direct evidence that giving the latent
+step somewhere to disagree turns GRPO from stalled into working, on a
+Coconut-style model closely related in spirit to this project's own latent
+mechanism.
+
+\section{Neither fix is in this project's code}
+\label{sec:neither-fix}
+
+Neither (10.2) nor (10.3) appears anywhere in \texttt{latentsql/}. The latent
+step (Part~\ref{part:coconut}) is exactly $\mathrm{align}_{\mathrm{soft}}(h)$,
+computed once, with no injected randomness of any kind. So the averaged-die
+picture of \S\ref{sec:dice} is the literal, exact situation here, not an
+analogy that only approximately applies --- confirming
+Proposition~\ref{prop:shared-latent} and Corollary~\ref{cor:latent-blind} a
+second, independent way: not just by reading the sampling code, but by
+checking the mechanism against the two published recipes for the alternative
+and finding neither one present.
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{In one sentence:} whatever this project's GRPO run changed, it did not
+change it by comparing one plan against a different plan for the same
+question --- because every rollout in every group was handed the exact same
+plan.
+}}
+\end{center}
+
+\section{So why did our own run still move the numbers?}
+
+Part~\ref{part:grpo} measured $+6.67$ EX from GRPO. If the latent step never
+disagrees within a group, where did that gradient come from?
+
+\textbf{From the one place that still rolls: the SQL decode.} After the shared
+latent prefix, this project's own \texttt{\_sample\_group\_latent}
+(l.276--291) samples the actual SQL tokens with
+$\texttt{torch.multinomial}$ at $\texttt{temperature=1.0}$ --- a real die roll,
+every rollout, every token. Two rollouts starting from the \emph{identical}
+latent state can still decode to two \emph{different} queries, one correct and
+one not, and Fact 2 (\S\ref{sec:grpo-shared-latent}) needs exactly that kind of
+disagreement to produce a nonzero gradient. So the group's advantage was not
+forced to zero the way Jung's Coconut baseline was --- but the resulting
+gradient could only ever be shaped like ``write better SQL from this plan'',
+never ``pick a better plan.'' This is a plausible mechanism consistent with
+the measured numbers, not a controlled test of it: no run at
+\texttt{temperature=0} has been made for comparison.
+
+\section{A separate question: did SFT even need to \emph{create} the subspaces?}
+
+One more complication, about Part~\ref{part:activation} rather than about
+GRPO. IMAD's own number: base-model steering AUC $= 0.802$, not $\approx 0.5$
+(chance). That is already well above chance \emph{before} any internalisation.
+Two 2026 papers, read for this section, suggest why that might be:
+
+\begin{itemize}
+\item \textbf{Persona Vectors} (Chen, Arditi et al., arXiv:2507.21509) extract
+  trait directions by the exact same difference-in-means recipe as
+  Definition~\ref{def:diff-in-means}, and find that a model's finetuning-induced
+  \emph{behaviour} shift on a trait correlates strongly with its
+  finetuning-induced \emph{activation} shift along that trait's own vector
+  ($r=0.76$--$0.97$ across traits tested) --- finetuning genuinely moves
+  activations along directions a linear probe already finds.
+\item \textbf{Tracing Persona Vectors Through Pretraining} (Moskvoretskii et
+  al., arXiv:2605.13329) trace \emph{when} such directions first appear, and
+  find they form \emph{``within $0.22\%$ of OLMo-3 pretraining''} --- almost
+  the very start --- and remain usable through the entire post-trained model.
+\end{itemize}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{The honest, revised claim.} ``Internalisation creates agent subspaces
+from nothing'' overstates it. ``Internalisation makes directions --- which may
+already exist from pretraining --- more reliably separable and steerable'' is
+what $0.802\to0.903$ and the two papers above jointly support.
+Theorem~\ref{thm:dim} is unaffected either way: difference-in-means is still
+the optimal linear probe for whatever separation exists, whenever in training
+it first appeared.
+}}
+\end{center}
+
+\section{Summary}
+
+\begin{center}
+\begin{tabular}{p{0.31\textwidth}p{0.32\textwidth}p{0.29\textwidth}}
+\toprule
+\textbf{Proven here} & \textbf{Cited, correctly scoped} & \textbf{Open} \\
+\midrule
+The GRPO group shares one latent trajectory --- proved by reading
+\texttt{grpo.py} (Proposition~\ref{prop:shared-latent}) and by checking that
+neither published randomness-fix is present (\S\ref{sec:neither-fix}).
+&
+Two published, proved fixes exist: Gumbel noise in the formula
+(Latent-GRPO, eq.~10.2), or a shared dropout mask in the weights
+(Dropout-GRPO, eq.~10.3, exact $(1-1/K)$ unbiasedness).
+&
+Whether \texttt{05\_steering.py} run before/after \texttt{03\_grpo.py} would
+show the per-role subspaces sharpening, unchanged, or degrading.
+\\[8pt]
+By Fact 2, this means the latent-path gradient can never compare two plans
+for the same question --- only two completions of the same plan.
+&
+IMAD's base-model AUC ($0.802$) is high enough to be consistent with
+pretraining-era structure the persona-tracing paper documents.
+&
+Whether applying either published fix to this project's own latent path
+would change training stability or the resulting geometry.
+\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\newpage
+\part{Complete map from equation to code}
+\label{part:code}
+
+\begin{center}
+\footnotesize
+\begin{longtable}{@{}p{0.19\textwidth}p{0.30\textwidth}p{0.43\textwidth}@{}}
+\toprule
+Equation & What it is & Where it lives \\
+\midrule
+\endhead
+(2.1)--(2.2) & transformer, LM head, softmax & standard HF model internals \\
+(4.1) & latent-mode input substitution & \texttt{\seqsplit{latent.py::\_latent\_steps}}, l.219--244 \\
+(4.2) & linear alignment $W_a=W_{\mathrm{out}}^\top W_{\mathrm{in}}$ & \texttt{\seqsplit{latent.py::build\_aligner}}, \texttt{mode="linear"} \\
+(4.3) & soft-embedding alignment & \texttt{\seqsplit{latent.py::build\_aligner}}, \texttt{align\_soft} \\
+$\mathcal{C}_t$ cache carry & \texttt{\seqsplit{share\_working\_memory}} & \texttt{\seqsplit{latent.py::build\_prefix}}, l.509--535 \\
+crop no-op/undo & checkpoint-safe cache mutation & \texttt{latent.py:220,359} \\
+(5.1)--(5.2) & role loop, stage $k$ & \texttt{\seqsplit{latent\_sft.py::\_coconut\_sequence\_loss}}, l.104--130 \\
+\texttt{\seqsplit{idx >= n\_latent\_roles: break}} & Definition~\ref{def:stage}, the SQL-direct cut & \texttt{latent\_sft.py:113} \\
+(7.1)--(7.2) & masked cross-entropy, main loss & \texttt{latent\_sft.py}, final \texttt{\seqsplit{model(...,labels=...)}} call, l.157--163 \\
+(7.3)--(7.4) & SQL-readiness probe & \texttt{latent\_sft.py:130--150} \\
+Proposition~\ref{prop:probe-degenerate} & \texttt{\seqsplit{idx + 1 == sql\_ready\_role}} & \texttt{latent\_sft.py:130} \\
+\texttt{\seqsplit{sql\_ready\_active}} gate & $k \ge j^\star$ requirement & \texttt{latent\_sft.py}, l.500--506 \\
+(8.1) & LoRA & \texttt{configs/*.yaml}: \texttt{\seqsplit{sft.lora\_r=32, lora\_alpha=64}} \\
+(8.2) & Adam & \texttt{latent\_sft.py:407}, \texttt{\seqsplit{torch.optim.AdamW(params, lr=cfg.lr)}} \\
+grad-accum $=$ batch size & Example~\ref{ex:step-budget} & \texttt{\seqsplit{run\_chess\_coconut\_sql\_direct.sh}}, \texttt{\seqsplit{--grad-accum "\$limit"}} \\
+optimiser reset at stage boundary & moment wipe & \texttt{\seqsplit{run\_chess\_coconut\_sql\_direct.sh}}, \texttt{\seqsplit{rm -f "\$OPTIM\_STATE"}} \\
+\texttt{\seqsplit{clip\_grad\_norm\_(params, 1.0)}} & gradient clipping & \texttt{latent\_sft.py:597} \\
+\texttt{gpu\_settle} & CUDA-context-release wait & \texttt{\seqsplit{run\_chess\_coconut\_sql\_direct.sh}} \\
+\texttt{\seqsplit{LATENTSQL\_REQUIRE\_CUDA}} & silent-CPU-fallback guard & \texttt{\seqsplit{hf\_local.py::resolve\_device}} \\
+(9.1) & GRPO group advantage & \texttt{\seqsplit{rewards.py::group\_advantages}} \\
+clipped surrogate + KL & PPO-style GRPO loss & \texttt{grpo.py}, l.425--444 \\
+(9.2) & IMAD reward eq. (1) & \texttt{\seqsplit{rewards.py::DebateReward.\_\_call\_\_}} \\
+$w_{\mathrm{fmt}}, l$ anneal & \texttt{RewardSchedule} & \texttt{\seqsplit{rewards.py::anneal, RewardSchedule}} \\
+dense partial credit & atomic/memory terms & \texttt{rewards.py}, l.235--251 \\
+brevity term & correct-only tie-breaker & \texttt{rewards.py}, l.224--233 \\
+(6.1)/IMAD eq.(3) & difference-in-means & \texttt{caa.py}, steering-vector extraction \\
+(6.2) & activation addition & \texttt{\seqsplit{caa.py::steer\_layer}} \\
+Definition~\ref{def:ex} & EX and ordered/unordered match & \texttt{\seqsplit{latentsql/db/execute.py}} \\
+Part~\ref{part:grpo-activation} & GRPO's effect on agent subspaces & \texttt{\seqsplit{05\_steering.py --compare-base}}, run before/after \texttt{03\_grpo.py} \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{The end-to-end pipeline, as five scripts}
+
+\begin{enumerate}
+\item \texttt{01\_build\_traces.py} --- run the teacher MAS, produce
+  \texttt{DebateTrace} objects, filter for consensus/correctness/execution.
+\item \texttt{02\_sft.py} / \texttt{02c\_latent\_sft.py} --- stage 1 (structure
+  learning) or the curriculum latent path of this document.
+\item \texttt{03\_grpo.py} --- stage 2, Part~\ref{part:grpo}.
+\item \texttt{04\_eval.py} --- execution accuracy on held-out BIRD/Spider,
+  Definition~\ref{def:ex}.
+\item \texttt{05\_steering.py} --- extract and apply the directions of
+  Part~\ref{part:activation}.
+\end{enumerate}
+
+Section 3 of the project README gives the exact commands for both the combined
+BIRD+Spider config and BIRD alone; \texttt{scripts/run\_chess\_coconut\_sql\_\allowbreak
+direct.sh} is the driver for the specific curriculum this document derives.
+
+\newpage
+\part{Results, reported honestly, including where the method loses}
+\label{part:results}
+
+\section{The two tests that actually define success}
+
+Every number below answers one of two questions, and they must not be
+conflated.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Test A (internalisation).} Does the internalised student reach the same
+accuracy as the SFT student it started from, while its \emph{output tokens}
+collapse? Reference: the SFT checkpoint. This is a test of compression.\\[6pt]
+\textbf{Test B (the thesis).} Does the internalised student match or beat the
+explicit multi-agent system \emph{at the same model size}, at a fraction of the
+tokens? Reference: the explicit pipeline on the same backbone --- not the larger
+teacher that generated the training traces.
+}}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{What is explicitly not the target.} A student beating the 7B teacher
+that generated its training data is not the claim: the teacher is a ceiling on
+trace quality, not a bar to clear. Recorded teacher EX on an early panel run was
+$64.2\%$; a $3$B student scoring below that is not a failure of this method.
+}}
+\end{center}
+
+\subsection{An earlier, text-mode arm: Test A never passed}
+
+Before the CHESS-step SQL-direct curriculum of Part~\ref{part:roles}, an
+earlier arm trained IMAD's original text-mode internalisation (write the full
+debate, then anneal it away by length-clipping). Across three configurations of
+that arm, generated length moved $1024 \to 922$ tokens --- essentially flat.
+Three causes were diagnosed and are recorded for completeness, since they
+motivate why the length-clip mechanism was abandoned in favour of the
+architectural cut of Definition~\ref{def:stage}:
+
+\begin{enumerate}
+\item the length clip $l$ was annealed \emph{below} the natural trace length
+  from the first step, so the pressure to shorten was present from step 1 with
+  no headroom to explore first;
+\item \texttt{max\_new\_tokens} sat below $l_{\mathrm{start}}$, so $16$ of $24$
+  logged steps had every rollout truncated to an identical length --- nothing
+  left to reward for being shorter (a direct instance of
+  Corollary~\ref{cor:zero-grp});
+\item only $24$ GRPO steps were run; IMAD-scale internalisation used hundreds.
+\end{enumerate}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+This is why the project moved to the architectural approach of
+Part~\ref{part:roles}: rather than \emph{annealing away} verbalisation with a
+reward schedule, the SQL-direct curriculum \emph{deletes the option to
+verbalise} by construction --- Definition~\ref{def:stage}'s \texttt{break}
+never gives later roles any text to write. This sidesteps causes 1--2 entirely,
+at the cost of introducing the saturated-objective failure mode of
+Part~\ref{part:collapse}. Neither approach is free.
+}}
+\end{center}
+
+\section{Test B on the earlier arm, before the architectural change}
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+reference & EX & output tokens \\
+\midrule
+CHESS @ 3B (the bar) & $48.89\%$ & $1009$ \\
+ours, SFT-only @ 3B  & $52.22\%$ & $1242$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Half-passed: accuracy clears the bar ($+3.3$ points), tokens do not
+($1242$ vs.\ $1009$) --- and the token axis is the entire point of the method,
+so this arm did not establish the thesis on its own.
+
+\section{The CHESS-step SQL-direct curriculum: the number that matters}
+
+This is the architecture Parts~\ref{part:roles}--\ref{part:grpo} derive, on the
+$7$B backbone, $n=90$ held-out BIRD+Spider mix, six latent roles,
+$m=2$ latent steps per role ($12$ latent forward passes before decoding):
+
+\begin{center}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+run & EX & bird & spider & avg out tokens & unparseable\\
+\midrule
+Previous full-text SFT student & $56.67\%$ & $31.11\%$ & $82.22\%$ & $1339.3$ & --\\
+Curriculum, stage 6 (original)   & $52.22\%$ & $33.33\%$ & $71.11\%$ & $67.5$ & $4$\\
+Curriculum, stage 6, \textbf{retrained} & $\mathbf{57.78\%}$ & $\mathbf{37.78\%}$ & $\mathbf{77.78\%}$ & $\mathbf{61.2}$ & $\mathbf{0}$\\
+Curriculum, stage 6 $+$ GRPO (from original) & $\mathbf{58.89\%}$ & $37.78\%$ & $\mathbf{80.00\%}$ & $61.9$ & $0$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+Output tokens fell $\mathbf{95\%}$ ($1339.3 \to 61.2$--$67.5$) while accuracy on
+the retrained/GRPO rows \emph{exceeded} the full-text SFT student's bird EX
+($37.78\%$ vs.\ $31.11\%$), though bird still trails the collapsed-curriculum
+row on overall EX by less than a point once the repair is applied. This is the
+strongest evidence in the project that the compression Test A asks for and the
+accuracy Test B asks for can be had \emph{together} --- on this later
+architecture, unlike the earlier text-mode arm above.
+}}
+\end{center}
+
+\section{Cost}
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+& greedy, latent path & explicit multi-agent (measured elsewhere in this doc) \\
+\midrule
+Output tokens/question & $61$--$68$ & $\approx 1339$ \\
+Latency/sample & $2.07$--$2.21$\,s & (multiple sequential LLM calls) \\
+Peak GPU & $15.9$\,GB & -- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Speculative decoding: measured, and a dead end on this path}
+
+Speculative decoding drafts several tokens with a small model and verifies them
+in one pass of the target, provably preserving the target's exact output
+distribution at greedy temperature (verification is lossless). It was measured
+at three draft sizes on the retrained-lineage GRPO checkpoint:
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+draft & EX & latency/sample & total & vs.\ greedy & acceptance length \\
+\midrule
+none (greedy) & $58.89\%$ & $2.09$\,s & $188$\,s & $1.00\times$ & -- \\
+Coder-0.5B bf16 & $57.78\%$ & $2.99$\,s & $269$\,s & $0.70\times$ & $2.26$ \\
+Coder-3B bf16 & $57.78\%$ & $3.39$\,s & $305$\,s & $0.62\times$ & $2.37$ \\
+Coder-7B 4bit & $57.78\%$ & $4.26$\,s & $383$\,s & $0.49\times$ & $2.34$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Speculation is slower at every draft size measured}, and the reason is
+structural rather than a matter of tuning: acceptance length stays flat
+($2.26$--$2.37$) across a $14\times$ range of draft size, while wall-clock
+improves only $1.42\times$ over that same range --- fixed per-round overhead
+dominates, not draft quality. The draft model cannot see the target's latent
+prefix (it conditions on the plain-text prompt), so it must re-prefill the
+whole $\approx1570$-token prompt to cover only $\approx62$ generated tokens ---
+speculation needs long generations to amortise its overhead, and this
+architecture's entire point is emitting few tokens. \textbf{Practical guidance:
+use greedy decoding for the latent path.}
+
+\section{Smoke-test coverage (verifies mechanism, not accuracy)}
+
+Two tiers, run CPU-only, no GPU, no data, no API key. Tier 1 (standard library
+only) builds two SQLite databases, runs the teacher and all four baselines, and
+checks trace format and every reward term. Tier 2 (needs torch) loads a tiny
+model and runs one real step of SFT, one GRPO step with a genuine
+execution-based reward, latent generation through all three aligners
+(Section~\ref{sec:align}), latent working memory, and steering-vector
+extraction and hooking. All $28$ smoke checks and all $25$ unit tests pass.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Tier 2 verifies shapes, masks, caches, hooks, and schedules --- \emph{not}
+model quality. A tiny model cannot write correct SQL; the point is only that
+nothing in the mechanism is broken before a GPU-week is spent on it.
+}}
+\end{center}
+
+\newpage
+\part{What is not established}
+\label{part:limits}
+
+Honesty about limits is part of the mathematics of this document, not an
+afterthought, so it gets its own Part rather than a footnote.
+
+\section{Required ablations, not yet run}
+
+\begin{center}
+\begin{tabular}{p{0.3\textwidth}p{0.32\textwidth}p{0.3\textwidth}}
+\toprule
+Ablation & How to run it & The objection it answers \\
+\midrule
+Full trace vs.\ final answer only & \texttt{02\_sft.py --consensus-only} & is the debate transcript doing anything, or only the final answers (DebateGPT, IMAD Table 1)? \\
+Debate panel vs.\ one structured format & \texttt{mas.agents: [query\_plan]} & is a single execution-plan chain-of-thought already enough? \\
+GRPO from base, no teacher & \texttt{03\_grpo.py --from-examples bird --sft /nonexistent} & is the multi-agent teacher earning its cost over a pure execution-reward RL run? \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The third is uncomfortable and must be reported even if unflattering: published
+execution-reward-only pipelines reach $68.9\%$ BIRD dev (Arctic-Text2SQL-R1-7B)
+and $67.1\%$ (SLM-SQL-1.5B) without any teacher at all. The honest external bar
+for this project is those numbers, not the explicit CHESS baseline.
+
+\section{The attribution gap in the stage-4 repair}
+\label{sec:attrib-recap}
+
+Restated from Section~\ref{sec:attribution} because it is the single largest
+open question this document leaves: two knobs (learning rate, probe role)
+moved together in the retrain. The measured $\mathcal{L}^{\mathrm{probe}}
+\sim 10^{-4}$ throughout (Table~\ref{tab:retrain-loss}) makes the learning-rate
+explanation far more likely than the probe explanation, but the clean
+experiment --- $\eta=10^{-5}$ with \texttt{SQL\_READY\_WEIGHT}$=0$ --- has not
+been run.
+
+\section{What Part~\ref{part:activation} does not establish for this system}
+
+Theorem~\ref{thm:dim} and IMAD's steering result establish that internalised
+multi-agent debate \emph{can} produce separable per-agent subspaces, in IMAD's
+own three-persona arithmetic setting. Whether the six CHESS-role latent slots of
+this project occupy separable subspaces has not been measured: the extraction
+code (\texttt{caa.py}) exists and applies unchanged, but
+\texttt{05\_steering.py} has not been run against the CHESS-step student.
+
+\section{What Part~\ref{part:grpo-activation} does not establish}
+
+Restated from that Part's closing table because it is the largest open
+question the GRPO discussion leaves: Proposition~\ref{prop:shared-latent} and
+Corollary~\ref{cor:latent-blind} prove a structural limit on what the
+latent-path GRPO gradient can use as signal \emph{within one step}; they do
+not show what happens to the agent-subspace geometry \emph{across} the full
+GRPO run reported in Part~\ref{part:grpo}. That requires running
+\texttt{05\_steering.py} once on the pre-GRPO stage-6 adapter and once on the
+post-GRPO adapter and comparing steering AUC --- the same measurement IMAD
+performed for SFT, never yet performed here for RL. Separately, whether the
+CHESS-role subspaces are linearly separable \emph{at all}, before any RL stage,
+is itself unmeasured (previous section) and is a precondition for the GRPO
+question to even be well-posed.
+
+\section{What Part~\ref{part:bottleneck}'s capacity argument does not establish}
+
+Restated from Section~\ref{sec:honest-capacity}: the DPI argument bounds what a
+\emph{separate-call} pipeline can transmit and shows the latent channel's
+theoretical ceiling is far higher. It does not show the model's training
+actually fills that ceiling with independent, useful reasoning rather than
+near-duplicate copies of one state across the $12$ latent positions. That
+question is empirical and belongs to whatever a future subspace-separability or
+probing measurement would answer.
+
+\section{What Part~\ref{part:grpo} does not establish}
+
+Section~\ref{part:grpo}'s closing box already states the central caveat: GRPO's
+$+6.67$\,EX and the curriculum repair's $+5.56$\,EX were measured from
+\emph{different} starting checkpoints and must not be summed. GRPO from the
+repaired stage-6 adapter --- the experiment that would tell us whether the two
+gains compound, are redundant, or interact --- has not been run.
+
+\section{Infrastructure and scale limits}
+
+\begin{itemize}
+\item The teacher's own quality bounds the student's: with a local $7$B
+  teacher, traces are weaker than a GPT-4-class teacher would produce. The
+  execution-based filter discards wrong traces but cannot manufacture correct
+  ones.
+\item GRPO rollouts are the throughput bottleneck --
+  $\text{group\_size}\times\text{prompts}$ generations per step, each executed
+  against a real database; the \texttt{ExecutionOracle} cache is what makes
+  this tractable at all.
+\item \texttt{latent} mode decodes token-by-token in Python with no
+  KV-cache fast path through \texttt{generate()}, so it is slower per decoded
+  token than plain text mode even though it emits far fewer tokens overall.
+\item The mock LLM backend's numbers are plumbing checks only, never cited as
+  results.
+\item Every result in Part~\ref{part:results} comes from one fixed $n=90$
+  held-out mix and a rolling $n=30$ stage probe. A $30$-question probe has a
+  standard error on the order of $9$ percentage points --- Section~9's own
+  finding that the stage-6 probe was flat while the full set moved $+5.56$
+  points is a direct demonstration of that noise floor, not an anomaly.
+\end{itemize}
+
+\newpage
+\part{Every formula in one place}
+\label{part:formulas}
+
+\subsection*{Level 0 --- the model as a function of vectors}
+\[
+H_t = \mathrm{Transformer}(E_t),\qquad
+h_t = H_t[t,:],\qquad
+p(x_{t+1}\mid x_{\le t}) = \mathrm{softmax}(W_{\mathrm{out}}h_t)
+\]
+
+\subsection*{Level 1 --- the decode bottleneck}
+\[
+I(H;T) \ge I(H;H') \quad\text{(DPI)},\qquad
+I(H;T) \le L\log_2|V| \quad\text{(ceiling)}
+\]
+
+\subsection*{Level 2 --- the continuous thought}
+\[
+\text{latent mode: next input} = \mathrm{align}(h_t),\qquad
+\mathrm{align}_{\mathrm{soft}}(h) = \sum_{v\in\mathrm{top}_k(W_{\mathrm{out}}h)} \pi_v W_{\mathrm{in}}[v,:]
+\]
+
+\subsection*{Level 3 --- the role chain and curriculum}
+\[
+\text{stage } k:\quad c \,\|\, \mathrm{tag}(r_1)\bullet^m \,\|\,\cdots\,\|\,\mathrm{tag}(r_k)\bullet^m \,\|\, \texttt{<|consensus|>} \,\|\, y^\star
+\]
+
+\subsection*{Level 4 --- difference-in-means}
+\[
+d = \mu_+-\mu_-,\qquad \hat d = d/\|d\|,\qquad
+w^\star = \arg\max_{\|w\|=1} J(w) = \hat d \ \text{(under isotropic noise)}
+\]
+
+\subsection*{Level 5 --- the training loss}
+\[
+\mathcal{L}^{\mathrm{main}}_k = -\frac1n\sum_{i=1}^n \log p_\theta(g_i\mid \Phi_k,g_{<i}),\qquad
+\mathcal{L}_k = \mathcal{L}^{\mathrm{main}}_k + \lambda\,\mathcal{L}^{\mathrm{probe}}
+\]
+
+\subsection*{Level 6 --- the optimiser}
+\[
+\theta_t = \theta_{t-1} - \eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon},\qquad
+\text{step 1 after reset: } \Delta\theta \approx -\eta\,\mathrm{sign}(g)
+\]
+
+\subsection*{Level 7 --- LoRA}
+\[
+W = W_0 + \frac{\alpha}{r}BA
+\]
+
+\subsection*{Level 8 --- the RL objective}
+\[
+\nabla_\theta J(\theta) = \mathbb{E}_{y\sim\pi_\theta}\big[\nabla_\theta\log\pi_\theta(y\mid x)R(x,y)\big],\qquad
+A_i = \frac{r_i-\bar r}{s}
+\]
+
+\subsection*{Level 9 --- the reward}
+\[
+r(x,y) = w_{\mathrm{fmt}}R_{\mathrm{fmt}} + w_{\mathrm{clip}}R(y;l),\qquad
+R(y;l)=\mathbb{1}[y^\star \in \mathrm{clip}(y,l)]
+\]
+
+\subsection*{Level 10 --- the metric}
+\[
+\mathrm{EX}(y,y^\star,D) = \mathbb{1}\big[\mathrm{exec}(y,D)=\mathrm{exec}(y^\star,D)\big]
+\]
+
+\section{The one-paragraph version}
+
+A multi-agent Text-to-SQL pipeline works but forces every intermediate result
+through a hard bottleneck: writing it as text, which a proven inequality bounds
+above by $L\log_2|V|$ bits regardless of what the state actually held. LatentSQL
+trades that bottleneck for a continuous one --- a hidden state fed back as the
+next input, carrying a strictly larger channel and never re-encoded --- and
+teaches a single small model to run through six such states, one per pipeline
+role, via a difference-of-means-separable internal geometry that IMAD shows
+internalisation actually creates. Training that curriculum with only the final
+SQL supervised is workable but has one sharp failure mode, proven and then
+observed: once a stage's objective saturates, Adam's scale-free update still
+takes a full step in whatever direction a near-zero, noisy gradient points, and
+with no penalty for reverting to the frozen base model's older habits, a
+mid-curriculum stage can silently collapse while its own training loss looks
+best of all. Lowering the late-stage learning rate repaired it, recovering
+$+5.56$ points of execution accuracy and eliminating every unparseable
+prediction on the full held-out set, independent of and complementary to the
+further $+6.67$ points GRPO adds through reinforcement learning proper. Neither
+lever, nor the architecture as a whole, is a free lunch: the honest external bar
+is stated, the untested ablations are named, and the one measurement that would
+separate ``the learning rate fixed it'' from ``the probe fixed it'' has not yet
+been run.
+
+\end{document}
