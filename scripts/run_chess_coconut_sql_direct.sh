@@ -34,6 +34,28 @@ SQL_READY_ROLE=${20:-4}
 SQL_READY_WEIGHT=${21:-0.5}
 SQL_READY_TOKENS=${22:-16}
 
+# Each training batch and each eval is a fresh process, and the runner launches
+# the next one the moment the previous shell command returns. Process exit does
+# not mean the CUDA context is torn down: a predecessor can still hold several
+# GB for a second or two while it releases. The successor then prefills into
+# whatever is left of the 0.96 budget and dies with OOM -- observed on the
+# stage-4 restart, where batch 1 hit "Process <pid> has 5.91 GiB memory in use"
+# and aborted a run whose own peak was only 18.5 GB. Wait for the card to
+# actually drain before handing it to the next process.
+gpu_settle() {
+  local want=${LATENTSQL_GPU_SETTLE_MB:-1500}
+  local used=""
+  local tries=0
+  while [ "$tries" -lt 60 ]; do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [ -z "$used" ] && return 0
+    [ "$used" -lt "$want" ] && return 0
+    sleep 2
+    tries=$((tries + 1))
+  done
+  echo "[chess_coconut] warning: GPU still holding ${used}MiB after 120s; launching anyway" | tee -a "$LOG"
+}
+
 ROLES="information_retriever,schema_linker,query_classifier,candidate_generator,query_fixer,unit_tester,consensus"
 OUT="$RUNDIR/latent_sft"
 OPTIM_STATE="$RUNDIR/optim_state.pt"
@@ -121,7 +143,15 @@ for stage in $(seq "$START_STAGE" "$N_STEPS"); do
       limit=$BATCH_SIZE
       [ "$remaining" -lt "$BATCH_SIZE" ] && limit=$remaining
       [ "$limit" -le 0 ] && break
+      # Retry once on failure: the two failure modes seen at a batch boundary
+      # (predecessor's CUDA context not yet released -> OOM, or
+      # torch.cuda.is_available() transiently False -> LATENTSQL_REQUIRE_CUDA
+      # abort) are both transient and both clear within seconds.
+      code=1
+      for attempt in 1 2; do
+      gpu_settle
       LATENTSQL_GPU_FRACTION=$GPU_FRACTION LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
+      LATENTSQL_REQUIRE_CUDA=1 \
       python3 scripts/02c_latent_sft.py \
         --config "$CONFIG" \
         --data "$DATA" \
@@ -139,6 +169,10 @@ for stage in $(seq "$START_STAGE" "$N_STEPS"); do
         --offset "$offset" --limit "$limit" --epochs 1 --grad-accum "$limit" --save-steps "$limit" \
         >> "$LOG" 2>&1
       code=$?
+      [ $code -eq 0 ] && break
+      echo "stage $stage epoch $epoch batch $b attempt $attempt failed (exit $code)" | tee -a "$LOG"
+      [ $attempt -lt 2 ] && sleep 20
+      done
       echo "stage $stage epoch $epoch batch $b exit code: $code" | tee -a "$LOG"
       if [ $code -ne 0 ]; then
         echo "!!! stage $stage epoch $epoch batch $b FAILED - stopping CHESS COCONUT run" | tee -a "$LOG"
@@ -149,7 +183,9 @@ for stage in $(seq "$START_STAGE" "$N_STEPS"); do
   done
 
   echo "=== [$(date +%H:%M:%S)] CHESS eval after stage $stage (n=$EVAL_N) ===" | tee -a "$LOG" "$EVAL_LOG"
+  gpu_settle
   LATENTSQL_GPU_FRACTION=$GPU_FRACTION LATENTSQL_CPU_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  LATENTSQL_REQUIRE_CUDA=1 \
   python3 scripts/04_eval.py \
     --config "$CONFIG" \
     --methods latent \

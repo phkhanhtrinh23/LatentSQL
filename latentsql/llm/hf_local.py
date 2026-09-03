@@ -16,12 +16,32 @@ from .base import LLMBackend, Usage
 
 
 def resolve_device(spec: str = "auto") -> str:
+    """Pick the compute device, optionally refusing a silent CPU downgrade.
+
+    ``torch.cuda.is_available()`` can transiently return False - e.g. while a
+    predecessor process is still tearing down its CUDA context - and the
+    "auto" path then quietly returns "cpu". Nothing downstream notices: a 7B
+    bf16 model loads into ~18 GB of host RAM and trains, just ~500x slower.
+    Observed on the 2026-09-03 stage-4 retrain, where a batch burned 1h53m of
+    CPU time without logging a single step before it was killed.
+
+    Set ``LATENTSQL_REQUIRE_CUDA=1`` (the training/eval runners do) to turn
+    that silent downgrade into an immediate, loud failure instead.
+    """
+    import os
+
     import torch
 
     if spec and spec != "auto":
         return spec
     if torch.cuda.is_available():
         return "cuda"
+    if os.environ.get("LATENTSQL_REQUIRE_CUDA", "").strip() not in ("", "0", "false", "False"):
+        raise RuntimeError(
+            "LATENTSQL_REQUIRE_CUDA is set but torch.cuda.is_available() is False - "
+            "refusing to fall back to CPU. This is usually transient (a previous "
+            "process still releasing its CUDA context); retry the batch."
+        )
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"

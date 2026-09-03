@@ -1239,3 +1239,134 @@ For the two earlier arms only the optimizer state was dropped, never the
 weights. `traces/` and all 40 eval-result directories were kept — they are ~1 MB
 each and hold the recorded numbers, including the predictions behind the 63.33%
 (n=30) probe figure whose adapter is now gone.
+
+## 20. Why stage 4 of the latent curriculum collapsed (2026-09-03)
+
+Section 11-era results recorded the CHESS-step curriculum dropping to **26.67 EX
+at stage 4**, between a 63.33 EX stage 3 and a 56.67 EX stage 5, and called it "an
+optimization/representation instability". That was wrong. The training log says
+the opposite: **stage 4 has the lowest mean loss and the lowest max loss of any
+stage.**
+
+| n_latent_roles | train loss (mean) | probe EX (n=30) | avg output tokens |
+|---:|---:|---:|---:|
+| 1 | 0.1332 | 66.67 | 62.7 |
+| 2 | 0.0186 | 66.67 | 67.8 |
+| 3 | 0.0019 | 63.33 | 61.0 |
+| **4** | **0.0008** | **26.67** | **125.7** |
+| 5 | 0.0015 | 56.67 | 72.4 |
+| 6 | 0.0014 | 63.33 | 67.4 |
+
+Three things compound, none of which the objective can see:
+
+**1. The objective is saturated by stage 3.** `text_loss` is `null` in all 1908
+step records - the SQL-direct format supervises *only* the ~62 gold-SQL tokens
+after `<|consensus|>`, because `_coconut_sequence_loss` breaks out of the role
+loop at `idx >= n_latent_roles` and never re-adds the remaining roles as text
+([`latentsql/distill/latent_sft.py:113`](latentsql/distill/latent_sft.py)). At 94
+records x 3 epochs, a per-token cross-entropy of 8e-4 means those 94 SQL strings
+are memorised. Stage 4 has no signal left to learn from.
+
+**2. Adam steps into that noise at full size.** `grad_accum` equals the batch
+size, so there are only **18 optimizer steps per stage**, and the runner wipes the
+momentum at each stage boundary. Adam divides by `sqrt(v_hat)`, so a 1e-4 gradient
+moves the weights just as far as a 1e-1 one - and freshly reset moments make the
+first steps exactly `lr * sign(g)`. At `lr=5e-5` that is real LoRA drift in a
+direction set by whichever one or two of 16 records still have non-trivial loss.
+
+**3. The drift lands on the base model's transcript prior.** 14 of 30 stage-4
+predictions were unparseable, all the same way - `schema_linker` body text after
+the consensus marker, looped to the 200-token cap:
+
+```text
+<|consensus|>Tables:
+Tables: visitor, visit, museum
+Tables:
+Tables: visitor, visit, museum
+... (to the cap)
+```
+
+The starting adapter `sft_7b_bf16` was trained on full debate transcripts, so
+"after a role tag comes `Tables: ...`" is baked into the weights. Latent training
+never penalises it, because on the *training* records the model does emit SQL
+correctly. The prior only fires off-distribution - which is precisely why the loss
+curve looks perfect while the held-out probe craters. The doubled output length is
+the same fact from the other side: cap-length loops, not longer queries.
+
+**The fix that was already wired in did nothing at the stage it targeted.** The
+`SQL_READY_ROLE=4` auxiliary probe fires on `idx + 1 == sql_ready_role`, so at
+stage 4 it fires after the *last* latent role - identical prefix, same gold SQL, a
+weighted duplicate of the main loss. It only became a genuine mid-curriculum
+anchor at stages 5 and 6, which were never the problem.
+
+**Retrain in flight.** Resumed from the stage-3 checkpoint into a new run dir
+`chess_coconut_sql_direct_s4fix`, leaving the original run and the GRPO checkpoint
+untouched: `lr` at stage >= 4 lowered **5e-5 -> 1e-5** (mechanism 2) and
+`SQL_READY_ROLE` moved **4 -> 3** so the probe is a real mid-prefix anchor at all
+of stages 4/5/6 (mechanism 3). Caveat recorded up front: `sql_ready_loss` is
+logging ~1e-4, i.e. saturated too, so the lower learning rate is doing nearly all
+the work. If stage 4 still collapses the next lever is structural, not a
+hyperparameter.
+
+Two unrelated infrastructure failures had to be fixed to get the retrain running,
+both at a batch boundary and both traceable to the same fact - a process exiting
+does not mean its CUDA context is released:
+
+1. **OOM.** Two per-batch processes overlapped (17.47 + 5.91 GB against a
+   22.57 GB budget) and the run aborted. The runner now has a `gpu_settle` helper
+   that waits for the card to drain before each batch and each eval.
+2. **A silent CPU downgrade, which was worse.** The next attempt logged zero
+   steps in 48 minutes while burning 1h53m of CPU time - `torch.cuda.is_available()`
+   was transiently False, `resolve_device("auto")` returned `"cpu"`, and the 7B
+   trained in host RAM ~500x too slowly without erroring. An OOM at least aborts
+   loudly; this would have quietly produced a "successful" run days later.
+   `LATENTSQL_REQUIRE_CUDA=1` now makes that path raise, the runner sets it
+   everywhere, and each batch retries once after 20 s.
+
+Full detail, including the loss tables and code references, is in
+[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
+
+## 21. Stage-4 retrain — results (2026-09-03)
+
+Stages 4–6 were retrained from the stage-3 checkpoint with the two changes from
+section 20 (`lr` 5e-5 → 1e-5 for stage ≥ 4, `SQL_READY_ROLE` 4 → 3), into a new
+run directory `chess_coconut_sql_direct_s4fix`. The original run and the GRPO
+adapter were left untouched.
+
+**Stage probes (n=30):**
+
+| Stage | EX old | EX new | unparseable | hit 200-cap | out tokens |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 26.67 | **66.67** | 14 → **0** | 14 → **0** | 125.7 → **61.6** |
+| 5 | 56.67 | **66.67** | 3 → **0** | 2 → **0** | 72.4 → **61.2** |
+| 6 | 63.33 | 63.33 | 0 → 0 | 1 → **0** | 67.4 → **62.2** |
+
+The collapse is gone (+40.00 EX at stage 4) and the `Tables:` loop failure mode is
+eliminated outright. Note also that the old run's stage-5 "recovery" was never
+complete — it still carried 3 unparseable predictions and a 72.4-token output
+length, i.e. stages 5 and 6 were partly spending capacity undoing stage-4 damage.
+
+**Full held-out latent eval (n=90) — the number that matters:**
+
+| Run | n | EX | bird | spider | Avg out tokens | Unparseable | Latency/sample |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stage 6, original | 90 | 52.22 | 33.33 | 71.11 | 67.5 | 4 | 2.212 s |
+| stage 6, **retrained 4–6** | 90 | **57.78** | **37.78** | **77.78** | **61.2** | **0** | **2.073 s** |
+
+**+5.56 EX**, improving on both datasets, with output length down 9.3%, latency
+down 6.3%, and every unparseable prediction eliminated. The n=30 probe is flat at
+stage 6 (63.33 both runs) — the advantage only shows on the full set, which is the
+same probe-optimism already documented for the original run.
+
+**Attribution caveat.** Two knobs moved at once, so this is not a clean ablation.
+The evidence favours the learning rate: `sql_ready_loss` logged ~1e-4 throughout,
+i.e. the auxiliary probe was as saturated as the main objective and contributed
+almost no gradient. The supported claim is "lowering the late-stage learning rate
+fixes the stage-4 collapse", not "the SQL-readiness probe fixes it".
+
+**Relationship to section 17.** GRPO lifted the *original* stage-6 adapter from
+52.22 to 58.89 EX. The retrained stage-6 adapter reaches 57.78 EX **with no GRPO
+at all** — essentially the same place from a curriculum fix rather than a
+reinforcement stage. These are independent levers and the numbers must not be
+added: GRPO's +6.67 was measured from a base with a broken stage 4 in its history.
+The correct next experiment is GRPO from the new stage-6 adapter.
