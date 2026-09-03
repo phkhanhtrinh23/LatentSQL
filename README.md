@@ -1370,3 +1370,131 @@ at all** — essentially the same place from a curriculum fix rather than a
 reinforcement stage. These are independent levers and the numbers must not be
 added: GRPO's +6.67 was measured from a base with a broken stage 4 in its history.
 The correct next experiment is GRPO from the new stage-6 adapter.
+
+## 22. What the SQL-readiness probe is, explained from scratch
+
+Sections 20 and 21 refer to moving `SQL_READY_ROLE` from 4 to 3 and call the
+original setting "a weighted duplicate of the main loss". That is compressed to
+the point of being useless if you have not read the training code. This section
+builds the idea up from nothing. No prior knowledge of this repo is assumed.
+
+### Step 1 — What the model is actually trained on
+
+The teacher pipeline has six reasoning steps, then a final answer:
+
+```
+information_retriever → schema_linker → query_classifier
+   → candidate_generator → query_fixer → unit_tester → <|consensus|> → SQL
+```
+
+In ordinary text training you would write all six steps out as words, then the
+SQL. COCONUT-style latent training replaces a step's *words* with a small number
+of **vectors** — numbers the model passes to itself, that never get turned into
+text. We use 2 vectors per step.
+
+So one training example looks like this, where `●` is one latent vector:
+
+```
+[the question + database schema]  <|schema_linker|> ● ●  ...  <|consensus|> SELECT ...
+ └──────── plain text ─────────┘  └── tag + 2 latent vectors ──┘  └─ the answer ─┘
+```
+
+Only the SQL at the end is graded. Everything before it is context the model
+reads but is not scored on. That single fact drives everything below.
+
+### Step 2 — What "stage 4" means
+
+The curriculum hides one more step per stage. At stage *k*, the **first k steps**
+become latent vectors, and any step after that is dropped from the sequence
+entirely. So:
+
+```
+stage 3:  prompt │ r1 ●● │ r2 ●● │ r3 ●●         │ <|consensus|> │ SQL
+stage 4:  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
+                                                                   ↑
+                                                        the only graded part
+```
+
+`r1…r4` are the first four pipeline steps. Stage 4 is just stage 3 with one more
+tag and two more vectors inserted.
+
+### Step 3 — What went wrong at stage 4
+
+The model stopped writing SQL after `<|consensus|>` and instead wrote schema
+notes, over and over, until it hit the output limit:
+
+```
+<|consensus|>Tables:
+Tables: visitor, visit, museum
+Tables:
+Tables: visitor, visit, museum
+... (repeats until cut off)
+```
+
+14 of 30 test questions failed this way. The model had lost the rule
+**"`<|consensus|>` means: start writing SQL now."**
+
+### Step 4 — What the probe is supposed to do
+
+The probe is a second, cheaper question asked during the same training step. It
+takes the sequence built *so far*, tacks `<|consensus|>` onto it, and grades the
+model on just the first ~20 tokens of SQL:
+
+```
+probe:  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ <|consensus|> │ SELECT name FROM ...
+                                                          └── graded, ~24 tokens ──┘
+```
+
+Its purpose is to drill the rule directly: *whenever you see `<|consensus|>`,
+SQL comes next* — so the rule survives even as more steps get hidden.
+
+`SQL_READY_ROLE` decides **where** to insert that probe: after which step.
+
+### Step 5 — Why `SQL_READY_ROLE=4` did nothing
+
+At stage 4, "after step 4" is the same place the real answer already starts.
+Compare:
+
+```
+probe (role=4):  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL[:16]
+main loss:       prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
+```
+
+Identical sequence, identical position, identical target — the probe is just a
+shorter copy of the grading that already happens. It teaches the model nothing
+new; it only counts the same thing twice.
+
+This is why the fix, as originally configured, could not have helped stage 4. It
+only landed somewhere new at stages 5 and 6 — which were never the problem.
+
+### Step 6 — Why `SQL_READY_ROLE=3` works
+
+Put the probe one step earlier and it lands somewhere the main loss never looks:
+
+```
+probe (role=3):  prompt │ r1 ●● │ r2 ●● │ r3 ●●         │ <|consensus|> │ SQL[:24]
+main loss:       prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
+                                          ↑ probe cuts in here, one step early
+```
+
+Now the model is graded on starting SQL from **two different prefix lengths** in
+the same training step. It can no longer rely on "SQL follows this one exact
+sequence I have memorised"; it has to learn the general rule "`<|consensus|>`
+means SQL, regardless of what came before".
+
+There is a second benefit. The probe sits at step 3, while stages 4, 5 and 6 use
+4, 5 and 6 latent steps — so it stays *earlier than the end* in all three stages,
+and keeps drilling the rule throughout the rest of the curriculum. At `=4` it
+would have been a duplicate at stage 4 and only become useful later.
+
+### Step 7 — The honest part
+
+Moving the probe was one of two changes; the other was lowering the learning rate
+5e-5 → 1e-5 (see section 20 for why that matters). **The learning rate almost
+certainly did nearly all the work.** During the retrain the probe's own loss
+measured about 1e-4, meaning the model was already answering it essentially
+perfectly, so it pushed the weights very little.
+
+The reasoning above explains why `=3` is the *correct* setting and `=4` was a
+no-op. It does not prove `=3` is what produced the +40 EX. Establishing that
+would need one more run at `lr=1e-5` with the probe switched off.
