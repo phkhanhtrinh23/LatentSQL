@@ -924,38 +924,116 @@ $\text{the convex hull of } \{W_{\mathrm{in}}[v,:] : v \in V\}$: precisely
 \emph{the neighbourhood every real token embedding lives in}, plus every point
 reachable by non-negative-weighted mixes of them.
 
-\begin{lemma}[the soft embedding is always in the convex hull]
-$\mathrm{align}_{\mathrm{soft}}(h)$ lies in the convex hull of
-$\{W_{\mathrm{in}}[v,:] : v \in V\}$.
+\paragraph{Setup, so the lemmas below are about $h$ and $W_{\mathrm{in}}$ explicitly.}
+Fix a hidden state $h\in\mathbb{R}^d$. It determines a logit vector
+$\ell = W_{\mathrm{out}}h \in \mathbb{R}^{|V|}$, a top-$k$ index set
+$\mathcal{K} = \mathcal{K}(h) = \operatorname{top-}k(\ell)$, and hence a
+\emph{finite, $h$-dependent} candidate set of embedding rows
+\[
+S_h \;:=\; \{\,W_{\mathrm{in}}[v,:] \;:\; v \in \mathcal{K}(h)\,\} \subset \mathbb{R}^d,
+\qquad |S_h| = k = 32.
+\]
+By (4.3), $\mathrm{align}_{\mathrm{soft}}(h) = \sum_{v\in\mathcal{K}}\pi_v\,W_{\mathrm{in}}[v,:]$
+is a convex combination of exactly the $32$ points of $S_h$ --- \emph{not} of
+all $152{,}064$ rows of $W_{\mathrm{in}}$. That distinction is what the weak
+lemma below misses and the two lemmas after it repair.
+
+\begin{lemma}[weak containment]
+\label{lem:hull-weak}
+$\mathrm{align}_{\mathrm{soft}}(h) \in \mathrm{conv}\big(\{W_{\mathrm{in}}[v,:]:v\in V\}\big)$.
 \end{lemma}
 \begin{proof}
-The $\pi_v$ are non-negative and sum to $1$ by construction of the softmax, so
-(4.3) is by definition a convex combination of points of that set.
+The $\pi_v$ are non-negative and sum to $1$ (softmax), so (4.3) is a convex
+combination of the points of $S_h$; and $S_h \subseteq \{W_{\mathrm{in}}[v,:]:v\in V\}$,
+so $\mathrm{conv}(S_h)\subseteq\mathrm{conv}\big(\{W_{\mathrm{in}}[v,:]:v\in V\}\big)$
+by monotonicity of the convex-hull operator under set inclusion.
+\end{proof}
+
+This says only ``inside the rubber band around all $152{,}064$ tokens''. With
+$|V|=152{,}064 \gg d=3584$, that hull is generically full-dimensional --- it
+fills essentially the entire $3584$-number space --- so Lemma~\ref{lem:hull-weak}
+alone rules out almost nothing. The next two lemmas use the actual value of
+$h$, not just its existence, to say something much smaller.
+
+\begin{lemma}[sharp containment: a $31$-simplex, not the whole hull]
+\label{lem:hull-sharp}
+$\mathrm{align}_{\mathrm{soft}}(h) \in \mathrm{conv}(S_h)$, and generically
+(when the $32$ points of $S_h$ are affinely independent, the typical case
+since $d=3584\gg k-1=31$) this set is a $31$-dimensional simplex --- the
+convex hull of exactly $32$ vertices, an object of dimension $31$ sitting
+inside a $3584$-dimensional ambient space.
+\end{lemma}
+\begin{proof}
+Let $E_h\in\mathbb{R}^{d\times k}$ be the matrix whose $i$-th column is the
+$i$-th row of $S_h$, and let $\Delta^{k-1}=\{w\in\mathbb{R}^k: w_i\ge0,\sum_iw_i=1\}$
+be the standard simplex. The map $\phi_h:\Delta^{k-1}\to\mathbb{R}^d$,
+$\phi_h(w) = E_hw$, is linear and, by definition of a convex hull,
+$\phi_h(\Delta^{k-1}) = \mathrm{conv}(S_h)$. The softmax weight vector
+$\pi=(\pi_v)_{v\in\mathcal{K}}$ satisfies $\pi\in\Delta^{k-1}$ (non-negative,
+sums to $1$), and $\mathrm{align}_{\mathrm{soft}}(h) = \phi_h(\pi)$ by (4.3).
+So $\mathrm{align}_{\mathrm{soft}}(h)\in\phi_h(\Delta^{k-1})=\mathrm{conv}(S_h)$.
+$\Delta^{k-1}$ has affine dimension $k-1=31$; an injective linear map
+preserves affine dimension, and $32$ points in general position in
+$\mathbb{R}^{3584}$ are affinely independent (a codimension-$0$, i.e.\
+generic, condition), so $\phi_h$ is injective and $\mathrm{conv}(S_h)$ has
+dimension $31$.
+\end{proof}
+
+\begin{lemma}[genuine mixing, not a corner]
+\label{lem:hull-interior}
+For any finite temperature $\tau>0$, every $\pi_v>0$ strictly, so
+$\mathrm{align}_{\mathrm{soft}}(h)$ lies in the \emph{relative interior} of
+$\mathrm{conv}(S_h)$ --- never on a face, edge, or vertex of the simplex.
+\end{lemma}
+\begin{proof}
+$\pi_v = \exp(\ell_v/\tau)/\sum_{u\in\mathcal{K}}\exp(\ell_u/\tau)$, and
+$\exp(x)>0$ for every finite real $x$, so every $\pi_v>0$. A convex
+combination with a strictly positive coefficient on \emph{every} vertex of a
+simplex is, by definition, in that simplex's relative interior (a point on a
+proper face has coefficient exactly $0$ on at least one vertex).
+\end{proof}
+
+\begin{lemma}[quantitative localisation: how far from the model's own top guess]
+\label{lem:hull-dist}
+Let $v^\star = \arg\max_{v\in\mathcal{K}}\pi_v$ be the single most likely
+token. Then
+\[
+\big\|\,\mathrm{align}_{\mathrm{soft}}(h) - W_{\mathrm{in}}[v^\star,:]\,\big\|
+\;\le\; \max_{v\in\mathcal{K}} \big\|\,W_{\mathrm{in}}[v,:] - W_{\mathrm{in}}[v^\star,:]\,\big\|.
+\]
+\end{lemma}
+\begin{proof}
+Since $\sum_{v\in\mathcal{K}}\pi_v=1$, subtract $W_{\mathrm{in}}[v^\star,:]$
+from (4.3) using $\pi_v W_{\mathrm{in}}[v^\star,:]$ summed over $v$ equal to
+$W_{\mathrm{in}}[v^\star,:]$:
+\[
+\mathrm{align}_{\mathrm{soft}}(h) - W_{\mathrm{in}}[v^\star,:]
+= \sum_{v\in\mathcal{K}}\pi_v\big(W_{\mathrm{in}}[v,:]-W_{\mathrm{in}}[v^\star,:]\big).
+\]
+Apply the triangle inequality, then $\pi_v\ge0$ and $\sum_v\pi_v=1$:
+\[
+\big\|\mathrm{align}_{\mathrm{soft}}(h) - W_{\mathrm{in}}[v^\star,:]\big\|
+\le \sum_{v\in\mathcal{K}}\pi_v\big\|W_{\mathrm{in}}[v,:]-W_{\mathrm{in}}[v^\star,:]\big\|
+\le \Big(\max_{v\in\mathcal{K}}\big\|W_{\mathrm{in}}[v,:]-W_{\mathrm{in}}[v^\star,:]\big\|\Big)\sum_{v\in\mathcal{K}}\pi_v,
+\]
+and the last sum is $1$.
 \end{proof}
 
 \begin{center}
 \fbox{\parbox{0.95\textwidth}{
-\textbf{Why this is the whole point, spelled out.} \texttt{identity} mode
-(Construction 1) feeds the raw hidden state $h$ back directly. $h$ is computed
-by the model's \emph{last} layer, after final normalisation --- a different
-part of the network, built a different way, from the $152{,}064$ real
-embeddings the \emph{first} layer has been trained on since the start of
-pretraining. Nothing guarantees $h$ lands anywhere near that trained-on
-neighbourhood: it could sit anywhere at all in the full $3584$-number space,
-territory the first layer has literally never received an input from. That is
-what ``out of distribution'' means here, made concrete --- \emph{outside the
-rubber band} --- and it is exactly what was measured: \texttt{identity} mode
-produced degenerate token soup at evaluation.\\[6pt]
-The Lemma is the proof that \texttt{soft\_embed} cannot do that. Because its
-weights are softmax weights --- always non-negative, always summing to $1$ ---
-$\mathrm{align}_{\mathrm{soft}}(h)$ is \emph{mathematically guaranteed} to stay
-inside the same neighbourhood the $152{,}064$ real embeddings occupy, no matter
-what $h$ was. It may land at an unusual \emph{spot} inside that neighbourhood
---- a blend of two or three plausible tokens rather than one, as in the
-worked example above --- but ``an odd spot inside familiar territory'' and
-``possibly anywhere, with no guarantee of familiarity at all'' are very
-different risks. That gap is why \texttt{soft\_embed} is the default and
-\texttt{identity} is kept only for ablation.
+\textbf{What the four lemmas jointly say.} $\mathrm{align}_{\mathrm{soft}}(h)$
+is not merely ``somewhere in the $152{,}064$-token hull''
+(Lemma~\ref{lem:hull-weak}, weak). It is a specific, strictly-interior point
+(Lemma~\ref{lem:hull-interior}) of a $31$-dimensional simplex spanned by only
+the $32$ embeddings $h$ \emph{itself} finds most plausible
+(Lemma~\ref{lem:hull-sharp}), at a distance from the model's own greedy
+top-$1$ choice that never exceeds the local spread of those same $32$
+candidates (Lemma~\ref{lem:hull-dist}). \texttt{identity} mode
+(Construction~1) has none of these guarantees: $h$ is the \emph{last}
+layer's output, unrelated by construction to the $152{,}064$ rows of
+$W_{\mathrm{in}}$ the \emph{first} layer was trained on, so no lemma above
+applies to it at all --- consistent with the degenerate token soup measured
+at evaluation.
 }}
 \end{center}
 
