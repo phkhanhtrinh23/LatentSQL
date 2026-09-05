@@ -2992,6 +2992,153 @@ would change training stability or the resulting geometry.
 \end{tabular}
 \end{center}
 
+\section{A sibling project, and a genuinely different fix to a shared problem: SERL-SQL}
+\label{sec:serl-sql}
+
+One more comparison is worth making precisely, against a 2026 Text-to-SQL GRPO
+paper read specifically for this section: \textbf{SERL-SQL} (Liu, Feng, Li et
+al., arXiv:2608.00485, ``Selective Hindsight Distillation for Text-to-SQL
+Reinforcement Agentic Learning''). It targets the exact coarseness this
+document's own GRPO derivation has (Definition~\ref{def:grpo-adv}), but fixes
+it a completely different way, in a completely different architecture.
+
+\subsection{The same coarse-credit problem, independently named}
+
+Recall our own advantage (Definition~\ref{def:grpo-adv}): one scalar $A_i$ per
+rollout, and recall from (9.1)/\S\ref{part:grpo} that this single number is
+\emph{broadcast identically} onto every token of that rollout's loss
+(\texttt{per\_token = pg + kl\_beta*kl}, with \texttt{adv} the same $A_i$ at
+every position). SERL-SQL names this exact structure as its starting
+complaint, in their own notation ($A^n$ their per-rollout advantage,
+$m,n$ indexing token/trajectory):
+
+\begin{quote}
+\itshape
+``Although this objective provides a stable reward-aligned update direction,
+its credit assignment remains coarse: decisive SQL actions, reasoning tokens,
+and formatting tokens receive the same trajectory-level advantage.'' \\
+``In standard trajectory-level GRPO, this reward-derived advantage is assigned
+to every action step in the trajectory, i.e.\ $A_t = A^n$.''
+\end{quote}
+
+That second sentence is, symbol for symbol, exactly what our own
+$\texttt{adv}$ broadcast does. Two independent projects, applying GRPO to the
+same task (Text-to-SQL), diagnosed the identical structural fact.
+
+\subsection{Two different fixes to the same complaint}
+
+This document's own fix (Part~\ref{part:grpo-activation}) targets a
+\emph{different} symptom of trajectory-level advantage: that every rollout in
+a group also shares one \emph{latent} prefix
+(Proposition~\ref{prop:shared-latent}), so the gradient cannot compare two
+plans, only two completions of one plan. SERL-SQL's architecture has no latent
+prefix at all --- everything is decoded text --- so it instead targets the
+\emph{token-level} symptom directly: give different tokens \emph{within one
+already-decoded trajectory} different credit.
+
+Their mechanism: a second, \emph{teacher} policy $\pi_T$ re-scores the
+student's own tokens \emph{after} seeing execution feedback the student did
+not have at rollout time (the actual query result, or the actual error
+message) --- information available only in hindsight. The gap between
+teacher and student log-probability at each token,
+\[
+\Delta_{t,i} = \log\pi_T(\cdot) - \log\pi_\theta(\cdot),
+\]
+is converted to a bounded, sign-aware reweighting factor
+\[
+w_{t,i} = \mathrm{clip}\big(\exp(\mathrm{sgn}(A^n)\,\mathrm{sg}[\Delta_{t,i}]),\ w_{\min},\ w_{\max}\big),
+\]
+applied \emph{only} to SQL/tool-action tokens via a mask $m_{t,i}$ (formatting
+and reasoning tokens keep weight $1$):
+\[
+\bar w_{t,i} = (1-m_{t,i}) + m_{t,i}\,w_{t,i},
+\qquad
+\widetilde A_{t,i} = A^n\big[(1-\alpha_k) + \alpha_k\,\bar w_{t,i}\big],
+\]
+with $\alpha_k$ decaying so the teacher's influence fades over training. The
+sign-preserving clip keeps the update direction fixed by $A^n$ while the
+\emph{magnitude and locality} of credit is reshaped by hindsight --- a genuine
+per-token fix, orthogonal to ours.
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{Neither fix solves the other's problem.} SERL-SQL's token reweighting
+cannot address Proposition~\ref{prop:shared-latent}, because it has no shared
+latent prefix to begin with. Our fix (a lower late-stage learning rate,
+Part~\ref{part:collapse}) says nothing about \emph{which token} inside a
+decoded SQL query deserves more credit than another --- it never
+distinguishes tokens within a rollout at all. The two problems just happen to
+both trace back to the same root cause named in
+Definition~\ref{def:grpo-adv}: one scalar advantage per rollout, applied
+uniformly wherever it is used.
+}}
+\end{center}
+
+\subsection{A speculative bridge (unimplemented, stated as such)}
+
+SERL-SQL's core idea --- score a token using information unavailable at
+rollout time, then convert that into a bounded reweighting factor --- is
+architecture-agnostic in principle. One could imagine an analogous
+\emph{hindsight latent critic}: after decoding the final SQL and learning
+whether it executed correctly, re-score each of the $k=6$ latent role-steps
+(Part~\ref{part:roles}) for how much it contributed, and reweight
+Corollary~\ref{cor:latent-blind}'s single shared-prefix gradient unevenly
+across those $6$ positions instead of leaving it uniform. \textbf{This is not
+built, not tested, and not in \texttt{latentsql/} anywhere} --- it is recorded
+here only because SERL-SQL's mechanism is the first concrete published
+template for what such a fix could look like, should
+Part~\ref{part:grpo-activation}'s open question (does GRPO reshape the
+subspace geometry?) turn out to need one.
+
+\subsection{The one architectural difference that is not open to interpretation}
+
+Beyond credit assignment, SERL-SQL and LatentSQL make opposite bets about
+\emph{where reasoning lives at inference time}, and this part is not
+speculative --- it follows directly from how each system is described.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\textwidth}p{0.36\textwidth}p{0.36\textwidth}@{}}
+\toprule
+& \textbf{SERL-SQL} & \textbf{LatentSQL (ours)} \\
+\midrule
+Where does reasoning happen & explicit text, every turn decoded and
+  readable & latent vectors, zero tokens decoded per role (Part~\ref{part:coconut}) \\
+Does inference re-execute against the database & yes --- the deployed policy
+  runs its own ``think, act, and observe'' loop each turn, querying the
+  database live & no --- the query-fixer role's ``see an error, correct it''
+  behaviour is distilled into weights once, during SFT
+  (\texttt{chess\_step\_turns\_for}, Part~\ref{part:roles}); nothing is
+  executed before the final SQL is produced \\
+Number of decoding turns per question & multi-turn (generate, execute,
+  revise, repeat) & one (a single forward pass through $6$ latent role-slots,
+  then decode) \\
+Model scale reported & $7$B / $14$B / $32$B & $7$B backbone (student), no
+  $32$B configuration run \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+SERL-SQL keeps the execution-feedback loop \emph{live}, at the cost this
+document has argued against throughout (Part~\ref{part:problem}'s cost table,
+Part~\ref{part:token}'s decode-bottleneck argument): every deployed question
+pays for one or more real database round-trips and however many decoded
+tokens the think/act/observe turns require. LatentSQL bets the opposite way
+--- that the \emph{lesson} of an execution-feedback correction can be baked
+into weights once, at training time, so that no live loop is needed at all.
+Neither bet is proven superior here: SERL-SQL reports higher absolute EX
+($75$--$77\%$ BIRD-Dev) than this project's own headline numbers
+(Part~\ref{part:results}, $57.78\%$ on a smaller, mixed BIRD+Spider $n=90$
+set) --- but at $4$--$5\times$ the parameter count, on the full official BIRD
+dev split rather than our $n=90$ sample, and by construction paying the
+live-execution cost this project spends its whole method trying to remove.
+Those are three simultaneous confounds, not a controlled comparison, and none
+of the three is resolved by the numbers alone.
+}}
+\end{center}
+
 \newpage
 \part{Complete map from equation to code}
 \label{part:code}
