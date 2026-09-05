@@ -1132,6 +1132,168 @@ tokens; they are tracked separately as \texttt{extra.latent\_steps}. Anywhere a
 comparison could be read as hiding the latent cost, both numbers are given.
 \end{remark}
 
+\section{Is this beam search? Is it tree search? A precise comparison}
+\label{sec:not-search}
+
+A latent step (4.3) looks at the top-$k$ next-token candidates and reasons
+about several of them at once. That invites a natural question: is this
+secretly beam search, or Monte Carlo Tree Search (MCTS), under a different
+name? \textbf{No, to both} --- and the reason is worth stating precisely,
+since ``explore several options'' and ``search over several options'' sound
+alike but are mechanically opposite.
+
+\subsection{Before any formal definition: the exact same numbers, two ways}
+
+Reuse the worked example from Construction~3 (\S\ref{sec:align}): a hidden
+state $h$ whose top-$2$ candidates are tokens $A$ and $B$, with softmax
+weights $\pi_A=0.525$, $\pi_B=0.475$ (worked out there in full). Trace one
+step forward, the beam-search way and our way, side by side.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.09\textwidth}p{0.44\textwidth}p{0.38\textwidth}@{}}
+\toprule
+\multicolumn{3}{l}{\textbf{Beam search, $K=2$, starting from this exact point}} \\
+\midrule
+Step & What happens & Result \\
+\midrule
+1 & Keep the top $2$ tokens as \textbf{two separate, complete copies} of the
+  sequence so far --- one ending in $A$, one ending in $B$. &
+  Two sequences now exist, each with its own KV cache. \\
+2 & Run the model \textbf{twice}: once continuing from ``$\ldots A$'', once
+  from ``$\ldots B$''. Say this gives $(0.6, 0.4)$ over $\{X,Y\}$ after $A$,
+  and $(0.3, 0.7)$ over $\{X,Y\}$ after $B$. &
+  Four candidate two-token sequences exist: $AX,\,AY,\,BX,\,BY$, each with its
+  own cumulative score. \\
+3 & Score all four, keep only the best $2$ --- say $BY$ and $AX$ win. &
+  $AY$ and $BX$ are \textbf{thrown away for good}. If the best possible
+  completion started with $BX$, it is gone, even though $B$ itself was kept. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.09\textwidth}p{0.44\textwidth}p{0.38\textwidth}@{}}
+\toprule
+\multicolumn{3}{l}{\textbf{Our latent step, at the exact same point}} \\
+\midrule
+Step & What happens & Result \\
+\midrule
+1 & Do not pick $A$ or $B$. Blend them into one vector:
+  $\mathrm{align}_{\mathrm{soft}}(h) = 0.525\,e(A) + 0.475\,e(B)$. &
+  \textbf{One} sequence still exists, one KV cache. \\
+2 & Run the model \textbf{once}, on that one blended vector. &
+  One next-state distribution comes out. There was never a second, separate
+  ``$B$-branch'' sitting around to compare against or discard. \\
+3 & (there is no step 3 --- nothing was kept apart to choose between) &
+  Nothing is ever thrown away, because nothing was ever split off in the
+  first place. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{The whole difference, in one line.} Beam search keeps $A$'s branch and
+$B$'s branch alive as two separate things, extends both, and only \emph{later}
+throws one away. The latent step never lets $A$ and $B$ become separate things
+to begin with --- so there is nothing later to compare, nothing to discard,
+and no second forward pass was ever spent computing the branch that beam
+search would have thrown away anyway.
+}}
+\end{center}
+
+This is exactly what the formal claim below (Proposition~\ref{prop:not-beam})
+says: at no point in the second table does a second copy of anything exist.
+
+\begin{definition}[Beam search]
+Maintain $K$ separate, explicit token sequences (``beams''). At every step,
+extend each of the $K$ beams by its own candidate next tokens, score every
+resulting continuation by cumulative log-probability, and keep only the top
+$K$ continuations for the next step. At the end, the single highest-scoring
+completed sequence is returned.
+\end{definition}
+
+\begin{definition}[Monte Carlo Tree Search]
+Build an explicit tree whose nodes are partial sequences. Repeatedly: descend
+the tree toward promising nodes (\emph{selection}), extend a leaf with a new
+candidate (\emph{expansion}), estimate that candidate's value by rolling
+forward to a full sequence and scoring it (\emph{simulation}), and propagate
+that score back up the tree to update every ancestor's estimate
+(\emph{backpropagation}). After many such iterations, commit to the
+highest-value child at the root.
+\end{definition}
+
+\begin{proposition}[the latent step is neither]
+\label{prop:not-beam}
+At every position in the sequence (4.3), (5.1), there is exactly \textbf{one}
+input embedding, one hidden state, one KV cache. No step in
+\texttt{\_latent\_steps} or \texttt{align\_soft} creates a second copy of the
+sequence, scores two candidates against each other, or discards one in favour
+of another.
+\end{proposition}
+\begin{proof}
+Immediate from the definition of $\mathrm{align}_{\mathrm{soft}}$ (4.3): it is
+a single function $\mathbb{R}^d\to\mathbb{R}^d$, returning one vector
+$\sum_{v\in\mathcal{K}}\pi_v W_{\mathrm{in}}[v,:]$. There is no data structure
+in \texttt{\_latent\_steps} (Part~\ref{part:coconut}) holding more than one
+hypothesis: \texttt{pieces} is a single growing list, \texttt{past\_key\_values}
+a single cache. Beam search and MCTS both require, by their own definitions
+above, more than one candidate to exist \emph{simultaneously} so that they can
+be compared; here only one ever exists.
+\end{proof}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{0.19\textwidth}p{0.23\textwidth}p{0.23\textwidth}p{0.23\textwidth}@{}}
+\toprule
+& \textbf{Beam search / MCTS} & \textbf{GRPO} (Part~\ref{part:grpo}) & \textbf{Latent step (ours)} \\
+\midrule
+When it runs & inference time & training time & inference \emph{and} training \\
+How many sequences exist at once & $K$, kept explicit and compared & $G$ full rollouts, compared \emph{after} decoding & $1$ --- always \\
+What changes as a result & which sequence is \emph{output} & the model's \emph{weights} & nothing is compared; the state itself is a blend \\
+Extra inference cost & $K\times$ or more forward passes & none (training-only) & \textbf{zero} --- same cost as one token \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.95\textwidth}{
+\textbf{The one-sentence answer.} Beam search and MCTS get their exploration
+by keeping $K$ things separate and comparing them; the latent step gets a
+\emph{different} kind of exploration --- Section~\ref{sec:superposition}'s
+superposition --- by keeping exactly $1$ thing and making that one thing a
+blend. It is cheap for exactly the reason it cannot literally be a search:
+there is nothing to compare, because nothing was ever kept apart.
+}}
+\end{center}
+
+\begin{remark}[why not use real search here]
+MCTS-style search at inference would reintroduce precisely the cost this
+project exists to remove: CHESS's own multi-candidate generation
+(Part~\ref{part:problem}) already pays several LLM calls per question for
+exactly this reason. A value estimate for a \emph{partial} SQL query or a
+partial latent state is also not cheaply available the way it is in a board
+game (no partial query can be executed against the database to check if it is
+``winning''), which is the other standard prerequisite MCTS needs and this
+setting does not supply for free.
+\end{remark}
+
+\begin{remark}[and the final SQL decode is not a search either]
+The one place a real, discrete choice \emph{is} made is decoding the SQL
+tokens after \texttt{<|consensus|>} (Part~\ref{part:roles}). Evaluation runs
+this at \texttt{temperature=0} (\texttt{configs/latent\_sft\_1000\_7b\_bf16.yaml}),
+so \texttt{LatentReasoner.generate} takes a plain greedy argmax at every
+position (\texttt{latent.py}, the decode loop after the consensus tag) ---
+one path, no beam, no rescoring. GRPO's \texttt{group\_size} rollouts
+(Part~\ref{part:grpo}) do sample $G$ different SQL completions per prompt, but
+only to \emph{compute a training reward}; by
+Proposition~\ref{prop:shared-latent}, every one of those $G$ completions is
+decoded from the identical shared latent prefix, so even there no search over
+\emph{latent} states occurs --- only the decoded text differs.
+\end{remark}
+
 \newpage
 \part{From a multi-agent pipeline to a chain of latent slots}
 \label{part:roles}
