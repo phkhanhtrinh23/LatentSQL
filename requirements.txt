@@ -3,6 +3,13 @@
 #   the standard library alone. Only pyyaml is needed for the config files.
 pyyaml>=6.0
 
+# optional - spurious-correctness reward (w_spurious > 0, see
+#   latentsql/db/spurious.py). Without it, stress-instance generation falls
+#   back to Method C (random row bootstrap) alone; with it, the stronger
+#   Method A/B (gold query literal boundaries) are also used. w_spurious
+#   defaults to 0 - nothing above needs this unless it is explicitly enabled.
+# sqlglot>=25.0
+
 # tier-2 (distillation: SFT, GRPO, latent thoughts, steering)
 #   install a torch build that matches your CUDA, e.g.
 #     pip install torch --index-url https://download.pytorch.org/whl/cu121

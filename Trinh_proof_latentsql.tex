@@ -1423,6 +1423,7 @@ Part~\ref{part:collapse}.
 \end{center}
 
 \begin{example}[stage 3 versus stage 4, side by side]
+\leavevmode\par\noindent
 \begin{lstlisting}
 stage 3:  prompt | r1 oo | r2 oo | r3 oo |               <|consensus|> | SQL
 stage 4:  prompt | r1 oo | r2 oo | r3 oo | r4 oo |       <|consensus|> | SQL
@@ -2584,6 +2585,7 @@ IMAD's two terms still dominate: $w_{\mathrm{exec\_ok}}$ (the query parses and
 runs) and $w_{\mathrm{tag\_order}}$ (structure tags in the canonical order).
 
 \subsection{Dense partial credit, for when GRPO would otherwise learn nothing}
+\label{sec:dense-partial-credit}
 
 Corollary~\ref{cor:zero-grp} is not hypothetical here: a rollout group that is
 \emph{entirely wrong} has zero variance under (9.2), and by
@@ -2610,6 +2612,185 @@ R_{\mathrm{brevity}}(y) = \max\!\Big(0,\ 1 - \frac{|y|}{\text{ref}}\Big),
 \]
 so a terse correct answer outscores a verbose correct answer, giving the group
 non-zero variance again and restoring a gradient.
+
+\subsection{Spurious correctness: when a group is entirely correct, but shouldn't be}
+\label{sec:spurious}
+
+Brevity fixes one way an all-correct group can be a trap: every rollout is
+right, so there is nothing to teach from. There is a second, nastier way the
+\emph{same} group can look all-correct without actually being so --- and this
+one is not about length at all.
+
+\paragraph{Step 1: the problem, with the smallest possible example.}
+Definition~\ref{def:ex} checks one thing: does the predicted query return the
+same rows as gold, \emph{on the one database the benchmark ships}. That
+database is a single, fixed snapshot of the data. Two queries that mean
+completely different things can still agree on it, purely by accident of what
+values happen to be sitting in the table that day.
+
+\begin{example}[two different queries, one lucky database]
+\label{ex:spurious}
+\leavevmode\par\noindent
+\begin{lstlisting}
+Question:   Which employees work in the Research department?
+Gold:       SELECT name FROM employee WHERE dept = 'Research';
+Candidate:  SELECT name FROM employee WHERE salary BETWEEN 50000 AND 60000;
+\end{lstlisting}
+Suppose, on today's data, every Research employee happens to earn between
+\$50{,}000 and \$60{,}000, and nobody else does. Both queries return the same
+two names. Definition~\ref{def:ex} scores the candidate $1$ --- correct. It is
+not correct: it says nothing about departments at all, and would return the
+wrong names the moment a new employee is added with a salary in that range but
+a different job.
+\end{example}
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{Why this is an RL problem, not just an eval problem.} In GRPO, the
+reward \emph{is} $R_{\mathrm{clip}}$ (eq.~9.2). If a whole group of $G$
+rollouts each independently stumbles onto a different accidentally-matching
+query, the group looks exactly like the saturated, all-correct case
+Brevity was built for (Corollary~\ref{cor:zero-grp}: zero variance, nothing
+to learn) --- except here the group isn't actually all correct. Left alone,
+GRPO has no way to tell a robustly-correct rollout from a lucky one, and
+nothing stops it from reinforcing the lucky kind just as happily as the real
+kind.
+}}
+\end{center}
+
+\paragraph{Step 2: the published fix, and the one piece of it that does not transfer.}
+A project document kept locally
+(\texttt{pool\_text2sql\_crowd\_source\_mixture/main\_pool\_eval.pdf},
+``PoolEvaluator'', Appendix B, ``EX and EX-Ext'', anonymous submission under
+review at ICLR 2027) names exactly Example~\ref{ex:spurious} and fixes it for
+\emph{offline evaluation}: build several modified copies of the database,
+require gold and the prediction to agree on \emph{every} copy, not just the
+original. Their Table 2 does precisely this to Example~\ref{ex:spurious}'s
+pair --- one modified copy adds a Research employee earning outside
+\$50{,}000--\$60{,}000, another adds a non-Research employee earning inside
+that range, and the candidate fails both, correctly exposing it as wrong.
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+Their method picks \emph{which} row to add using an LLM (their GPT-5.4),
+\emph{per query pair} --- it already knows both the gold and the candidate
+query when it designs the row. That does not transfer to a reward function:
+GRPO calls the reward on a brand-new, unforeseen rollout at every single
+training step, so there is no query pair to hand-design a row for in advance.
+Only the \emph{gold} query is known ahead of time. The principle (check
+agreement across several databases, not one) transfers; the mechanism (an LLM
+designs each database) has to be replaced by something automatic that only
+ever looks at gold.
+}}
+\end{center}
+
+\paragraph{Step 3: three automatic ways to build those extra databases.}
+All three take only the gold query as input, so they can run once, offline,
+before training ever starts --- the same stage as building the value index
+(Part~\ref{part:roles}'s \texttt{information\_retriever} role) --- rather than
+once per rollout.
+
+\begin{description}
+\item[Method A --- plant the missing counterexample.] Parse gold's own
+  \texttt{WHERE}/\texttt{HAVING} conditions and read off every
+  \emph{(column, comparison, literal)} triple: in Example~\ref{ex:spurious},
+  \texttt{(dept, =, 'Research')}. For each one, insert two new rows --- one
+  that satisfies it, one that just misses it --- filling every other column
+  with a real sampled value so the row looks ordinary. This is exactly what
+  manufactures Table 2's two counterexample rows, with no human or LLM
+  choosing where to put them: the boundary comes straight out of gold's own
+  literal.
+\item[Method B --- keep only the instances that actually test something.]
+  Not every inserted row is useful; filter by trying a handful of tiny
+  one-edit changes to \emph{gold itself} (flip \texttt{=} to \texttt{!=},
+  nudge a number by $1$, swap \texttt{AND}/\texttt{OR}) and keeping an
+  instance from Method A only if at least one of those edited versions of
+  gold disagrees with gold on it. This is the automatic stand-in for the
+  paper's LLM judgement call --- the same question (``does this database
+  separate gold from something plausible?''), answered by trying plausible
+  edits instead of asking a model.
+\item[Method C --- shake what already exists.] No parsing, no reading of
+  gold's literals at all: copy the database, then delete or duplicate a
+  handful of its \emph{existing} rows at random.
+\end{description}
+
+\begin{example}[what Method C can and cannot catch]
+Suppose gold correctly counts distinct singers at one stadium,
+\texttt{COUNT(DISTINCT singer\_id)}, and the candidate forgot
+\texttt{DISTINCT}, \texttt{COUNT(singer\_id)}. If no singer in today's data
+happens to perform there twice, the two counts agree --- another spurious
+match. \textbf{Duplicating one existing link row} breaks this: gold's
+\texttt{DISTINCT} still counts that singer once; the candidate now counts
+them twice. Caught, with no idea in advance that ``missing \texttt{DISTINCT}''
+was the risk.\\[4pt]
+Now take Example~\ref{ex:spurious} instead. Every row that exists today
+already satisfies \emph{both} filters or \emph{neither} --- there is no
+existing Research-but-low-salary row to duplicate or delete, because it never
+existed in the data to begin with. Reshuffling existing rows cannot reveal
+the two filters are different; only \emph{inserting} the missing row
+(Method A) can. \textbf{Method C is good at multiplicity bugs --- duplicate
+rows, a missing \texttt{DISTINCT}, a join that fans out --- and blind to
+filter/threshold bugs}, which is exactly why it is the fallback, not the main
+method: used only when \texttt{sqlglot} is unavailable, or gold has no
+\texttt{WHERE}/\texttt{HAVING} literal for Method A to anchor on at all (a
+bare \texttt{SELECT COUNT(*) FROM t}).
+\end{example}
+
+\paragraph{Step 4: turning agreement-across-instances into a reward term.}
+Let $\mathcal{I}(y^\star)$ be the set of stress instances built from gold
+$y^\star$ by Methods A--C (up to some fixed count, e.g.\ $5$, matching the
+paper's own choice). Define
+\[
+R_{\mathrm{spurious}}(y) \;=\; \frac{1}{|\mathcal{I}(y^\star)|}
+\sum_{D \in \mathcal{I}(y^\star)} \mathbb{1}\big[\mathrm{exec}(y, D) = \mathrm{exec}(y^\star, D)\big],
+\tag{9.3}
+\]
+the fraction of stress instances on which the prediction still agrees with
+gold --- a dense score in $[0,1]$, not a binary pass/fail, exactly like the
+other two shaping terms in this Part. Awarded, like brevity, \emph{only} to
+rollouts that already passed the original check ($R_{\mathrm{clip}}=1$): a
+rollout that is wrong on the shipped database needs no further test, it is
+already being handled by \S\ref{sec:dense-partial-credit}'s dense partial
+credit. The total reward
+(extending eq.~9.2) gains one more term,
+\[
+r(x,y) \;+=\; -\,w_{\mathrm{spurious}}\cdot\big(1 - R_{\mathrm{spurious}}(y)\big),
+\qquad\text{computed only when } R_{\mathrm{clip}}(y)=1,
+\tag{9.4}
+\]
+a penalty that is exactly $0$ when the prediction survives every stress
+instance (fully robust --- no change in behaviour from before this section)
+and grows toward $-w_{\mathrm{spurious}}$ the more instances expose it as
+lucky rather than correct.
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{What this buys, stated precisely.} It does not change what counts as
+correct on the original database --- $R_{\mathrm{clip}}$ is untouched. It
+changes what a GRPO group looks like \emph{after} all of today's queries are
+already right under $R_{\mathrm{clip}}$: a group that used to be uniformly
+$1.0$ (dead, by Corollary~\ref{cor:zero-grp}) can now split into genuinely
+robust rollouts and spuriously-lucky ones, restoring exactly the kind of
+within-group disagreement GRPO needs to have anything to learn from --- the
+same disagreement brevity restores for length, now restored for semantic
+robustness instead.
+}}
+\end{center}
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{
+\textbf{Status: implemented, not yet measured.} Methods A--C and the reward
+term above are built
+(\texttt{latentsql/db/spurious.py}, \texttt{rewards.py}'s
+\texttt{spurious\_agreement}, \texttt{w\_spurious} in \texttt{RewardConfig}),
+gated behind \texttt{w\_spurious=0} by default so existing behaviour is
+unchanged unless explicitly turned on. No GRPO run with it enabled has been
+made yet. Everything in this subsection is therefore a \emph{mechanism},
+reported the same way Part~\ref{part:grpo-activation} reported Dropout-GRPO's
+and Latent-GRPO's fixes --- real, cited, code-backed, but not yet a measured
+result for this project.
+}}
+\end{center}
 
 \section{Latent rollouts}
 

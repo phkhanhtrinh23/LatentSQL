@@ -512,6 +512,142 @@ class TestBrevityReward(unittest.TestCase):
         self.assertEqual(self._reward(True, 200, w_brevity=0.0).r_brevity, 0.0)
 
 
+class TestSpuriousInstances(unittest.TestCase):
+    """Methods A/B/C of latentsql/db/spurious.py against the real synthetic DB."""
+
+    GOLD = "SELECT name FROM singer WHERE country = 'France'"
+
+    def test_extract_literals_skips_join_keys(self):
+        from latentsql.db.schema import load_schema
+        from latentsql.db.spurious import extract_literals
+
+        schema = load_schema(_DB, n_examples=0)
+        lits = extract_literals(self.GOLD, schema)
+        self.assertEqual(len(lits), 1)
+        self.assertEqual((lits[0].table, lits[0].column, lits[0].op, lits[0].value),
+                         ("singer", "country", "=", "France"))
+
+        join_sql = ("SELECT T2.name FROM concert AS T1 JOIN stadium AS T2 "
+                    "ON T1.stadium_id = T2.stadium_id WHERE T1.year = 2014")
+        join_lits = extract_literals(join_sql, schema)
+        # only the literal comparison (year = 2014) should survive; the join
+        # condition (T1.stadium_id = T2.stadium_id) compares two columns, not
+        # a column against a literal, and must be skipped.
+        self.assertEqual(len(join_lits), 1)
+        self.assertEqual(join_lits[0].column, "year")
+
+    def test_generate_stress_instances_builds_and_caches(self):
+        from latentsql.db.spurious import generate_stress_instances
+
+        cache_dir = tempfile.mkdtemp(prefix="latentsql_stress_")
+        first = generate_stress_instances(_DB, self.GOLD, cache_dir, n=5, seed=0)
+        self.assertGreater(len(first), 0)
+        for p in first:
+            self.assertTrue(os.path.exists(p))
+        # second call must hit the on-disk cache, not rebuild - same paths back
+        second = generate_stress_instances(_DB, self.GOLD, cache_dir, n=5, seed=0)
+        self.assertEqual(first, second)
+
+    def test_spurious_match_is_caught(self):
+        """The decisive case: two queries that agree on the ORIGINAL database
+        for unrelated reasons must disagree on at least one stress instance."""
+        from latentsql.distill.rewards import ExecutionOracle
+        from latentsql.db.execute import execute_sql, gold_is_ordered, result_match
+
+        spurious_wrong = ("SELECT name FROM singer "
+                          "WHERE name != 'Joe Sharp' AND name != 'Timbaland'")
+        gold_res = execute_sql(_DB, self.GOLD)
+        wrong_res = execute_sql(_DB, spurious_wrong)
+        self.assertTrue(result_match(wrong_res, gold_res, ordered=gold_is_ordered(self.GOLD)),
+                        "fixture assumption failed: this pair must agree on the original DB")
+
+        cache_dir = tempfile.mkdtemp(prefix="latentsql_stress_")
+        oracle = ExecutionOracle(timeout=5.0, stress_cache_dir=cache_dir,
+                                 n_stress_instances=5, stress_seed=0)
+        score = oracle.spurious_agreement(_DB, spurious_wrong, self.GOLD)
+        self.assertLess(score, 1.0)
+
+    def test_identical_query_always_fully_agrees(self):
+        from latentsql.distill.rewards import ExecutionOracle
+
+        cache_dir = tempfile.mkdtemp(prefix="latentsql_stress_")
+        oracle = ExecutionOracle(timeout=5.0, stress_cache_dir=cache_dir,
+                                 n_stress_instances=5, stress_seed=0)
+        self.assertEqual(oracle.spurious_agreement(_DB, self.GOLD, self.GOLD), 1.0)
+
+    def test_bootstrap_duplicate_does_not_collide_on_integer_pk(self):
+        """Regression: duplicating a row that carries an INTEGER PRIMARY KEY
+        column must not try to re-insert that same key (sqlite3.IntegrityError
+        swallowed into a silent no-op is the failure mode being guarded against)."""
+        from latentsql.db.schema import load_schema
+        from latentsql.db.spurious import bootstrap_instance
+        import random
+        import sqlite3
+
+        schema = load_schema(_DB, n_examples=0)
+        dst = os.path.join(tempfile.mkdtemp(prefix="latentsql_stress_"), "inst.sqlite")
+        changed = bootstrap_instance(_DB, dst, random.Random(0), schema=schema,
+                                     drop_frac=0.0, dup_frac=0.5)
+        self.assertTrue(changed)
+        conn = sqlite3.connect(dst)
+        n_before = conn.execute("SELECT COUNT(*) FROM singer").fetchone()[0]
+        conn.close()
+        self.assertGreater(n_before, 0)
+
+
+class TestSpuriousReward(unittest.TestCase):
+    """w_spurious: discounts correctness credit when it does not survive stress tests."""
+
+    GOLD = "SELECT COUNT(*) FROM t"
+
+    def _reward(self, spurious_score, w_spurious=0.5, r_clip=1.0):
+        from latentsql.config import RewardConfig
+        from latentsql.distill.rewards import DebateReward, ExecutionOracle, RewardSchedule
+
+        class _O(ExecutionOracle):
+            def __init__(self, v, s):
+                super().__init__(timeout=1.0)
+                self.v, self.s = v, s
+
+            def is_correct(self, *a):
+                return self.v
+
+            def executes(self, *a):
+                return True
+
+            def spurious_agreement(self, *a, **k):
+                return self.s
+
+        cfg = RewardConfig()
+        cfg.w_spurious = w_spurious
+        text = f"<|consensus|>\n```sql\n{self.GOLD}\n```\n<|/consensus|>"
+        return DebateReward(cfg, _O(r_clip >= 1.0, spurious_score),
+                            RewardSchedule(cfg, total_steps=10))(text, None, "", self.GOLD, 0)
+
+    def test_fully_robust_correct_rollout_is_unpenalised(self):
+        r = self._reward(spurious_score=1.0)
+        self.assertEqual(r.r_spurious, 1.0)
+        full = self._reward(spurious_score=1.0, w_spurious=0.0)
+        self.assertAlmostEqual(r.total, full.total)  # no change from the feature being on
+
+    def test_spurious_correct_rollout_is_penalised(self):
+        robust = self._reward(spurious_score=1.0)
+        lucky = self._reward(spurious_score=0.0)
+        self.assertLess(lucky.total, robust.total)
+        self.assertEqual(lucky.r_spurious, 0.0)
+
+    def test_wrong_rollouts_are_not_checked_at_all(self):
+        """A rollout that already failed r_clip gets no spurious check - it is
+        already handled by the dense partial-credit terms instead."""
+        r = self._reward(spurious_score=0.0, r_clip=0.0)
+        self.assertEqual(r.r_spurious, 1.0)  # default, meaning "not checked"
+
+    def test_disabled_by_default(self):
+        r = self._reward(spurious_score=0.3, w_spurious=0.0)
+        full = self._reward(spurious_score=1.0, w_spurious=0.0)
+        self.assertAlmostEqual(r.total, full.total)
+
+
 class TestLatentRollouts(unittest.TestCase):
     """GRPO in the latent regime: the debate costs no tokens, so nothing is clipped."""
 

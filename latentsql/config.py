@@ -256,6 +256,27 @@ class RewardConfig:
     memory_same_db_only: bool = False
     required_tags: List[str] = field(default_factory=list)  # empty => trace schema default
 
+    # --- spurious correctness, checked among CORRECT rollouts --------------
+    # R_clip only checks ONE database (the one the benchmark ships), so two
+    # queries that mean different things can agree there by coincidence - a
+    # "spuriously correct" rollout that is indistinguishable from a genuinely
+    # correct one under r_clip alone. This re-executes gold vs. the prediction
+    # on several synthetic stress instances (latentsql/db/spurious.py, EX-Ext
+    # from pool_text2sql_crowd_source_mixture/main_pool_eval.pdf Appendix B,
+    # adapted to need no per-example LLM call) and discounts the correctness
+    # credit by how many of them still agree. Mirror of w_brevity: both only
+    # ever score rollouts that *already* passed r_clip, so a saturated
+    # all-correct GRPO group (zero variance, Corollary in the proof doc) can
+    # split into robustly-correct vs. merely-lucky instead of staying dead.
+    w_spurious: float = 0.0
+    #: stress instances built per gold query (Methods A/B/C combined, capped
+    #: at this count); more instances cost more SQL executions per reward call.
+    n_stress_instances: int = 5
+    #: directory the generated stress-instance .sqlite copies are cached
+    #: under, keyed by (db path, gold SQL). None => a .stress_cache/ folder
+    #: next to the original database file.
+    stress_cache_dir: Optional[str] = None
+
 
 @dataclass
 class GRPOConfig:

@@ -219,7 +219,16 @@ def main() -> int:
             not getattr(cfg.grpo.reward, "brevity_ref_tokens", 0):
         cfg.grpo.reward.brevity_ref_tokens = cfg.grpo.max_new_tokens
 
-    oracle = ExecutionOracle(timeout=cfg.mas.execution_timeout)
+    oracle = ExecutionOracle(
+        timeout=cfg.mas.execution_timeout,
+        stress_cache_dir=cfg.grpo.reward.stress_cache_dir
+        or os.path.join(cfg.paths.cache_dir, "stress"),
+        n_stress_instances=cfg.grpo.reward.n_stress_instances,
+    )
+    if float(getattr(cfg.grpo.reward, "w_spurious", 0.0)) > 0:
+        print(f"[spurious] w_spurious={cfg.grpo.reward.w_spurious} enabled - "
+              f"up to {cfg.grpo.reward.n_stress_instances} stress instances per gold "
+              f"query, cached under {oracle.stress_cache_dir}")
 
     # the memory bank is built from the *kept* teacher traces - transcripts
     # whose final query was confirmed correct by execution - so the term scores
