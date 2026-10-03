@@ -2658,29 +2658,11 @@ kind.
 }}
 \end{center}
 
-\paragraph{Step 2: the published fix, and the one piece of it that does not transfer.}
-A project document kept locally
-(\texttt{pool\_text2sql\_crowd\_source\_mixture/main\_pool\_eval.pdf},
-``PoolEvaluator'', Appendix B, ``EX and EX-Ext'', anonymous submission under
-review at ICLR 2027) names exactly Example~\ref{ex:spurious} and fixes it for
-\emph{offline evaluation}: build several modified copies of the database,
-require gold and the prediction to agree on \emph{every} copy, not just the
-original. Their Table 2 does precisely this to Example~\ref{ex:spurious}'s
-pair --- one modified copy adds a Research employee earning outside
-\$50{,}000--\$60{,}000, another adds a non-Research employee earning inside
-that range, and the candidate fails both, correctly exposing it as wrong.
+\paragraph{Step 2: why offline robustness checks do not directly transfer.} A stronger offline evaluation can expose Example~\ref{ex:spurious} by building several modified copies of the database and requiring gold and the prediction to agree on \emph{every} copy, not just the original. One copy can add a Research employee earning outside \$50{,}000--\$60{,}000, while another adds a non-Research employee earning inside that range; the candidate fails both and is correctly exposed as wrong.
 
 \begin{center}
 \fbox{\parbox{0.9\textwidth}{
-Their method picks \emph{which} row to add using an LLM (their GPT-5.4),
-\emph{per query pair} --- it already knows both the gold and the candidate
-query when it designs the row. That does not transfer to a reward function:
-GRPO calls the reward on a brand-new, unforeseen rollout at every single
-training step, so there is no query pair to hand-design a row for in advance.
-Only the \emph{gold} query is known ahead of time. The principle (check
-agreement across several databases, not one) transfers; the mechanism (an LLM
-designs each database) has to be replaced by something automatic that only
-ever looks at gold.
+An offline evaluator may choose which row to add after seeing both the gold and candidate queries. That does not transfer directly to a reward function: GRPO evaluates a brand-new, unforeseen rollout at every training step, so there is no fixed query pair for which a row can be designed in advance. Only the \emph{gold} query is known ahead of time. The principle --- check agreement across several databases rather than one --- transfers, but instance construction must be automatic and depend only on gold.
 }}
 \end{center}
 
@@ -2696,8 +2678,8 @@ once per rollout.
   \emph{(column, comparison, literal)} triple: in Example~\ref{ex:spurious},
   \texttt{(dept, =, 'Research')}. For each one, insert two new rows --- one
   that satisfies it, one that just misses it --- filling every other column
-  with a real sampled value so the row looks ordinary. This is exactly what
-  manufactures Table 2's two counterexample rows, with no human or LLM
+  with a real sampled value so the row looks ordinary. This directly
+  manufactures the two counterexample rows above, with no human or LLM
   choosing where to put them: the boundary comes straight out of gold's own
   literal.
 \item[Method B --- keep only the instances that actually test something.]
