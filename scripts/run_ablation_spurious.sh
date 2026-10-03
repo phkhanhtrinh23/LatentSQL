@@ -12,11 +12,12 @@
 # everything else (including the dense terms themselves) fixed.
 #
 #   bash scripts/run_ablation_spurious.sh
-set -u
+set -uo pipefail
 OUT=outputs/pilot3
 CTRL=configs/pilot_mix3_ctrl.yaml
 DENSE=configs/pilot_mix3_dense.yaml
 SPURIOUS=configs/pilot_mix3_spurious.yaml
+SPURIOUS_OUT=${SPURIOUS_OUT:-/mnt/win_d/latent_agent_text2sql_outputs/pilot3/grpo_spurious}
 LOGS=$OUT/logs; TRACES=$OUT/traces
 mkdir -p "$LOGS"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
@@ -41,16 +42,18 @@ fi
 # --- the ablation: same SFT start, same data, only the reward differs -------
 for ARM in ctrl dense spurious; do
   case "$ARM" in
-    ctrl) CFG=$CTRL; DESC="binary reward" ;;
-    dense) CFG=$DENSE; DESC="w_atomic=0.5 w_memory=0.3" ;;
-    spurious) CFG=$SPURIOUS; DESC="w_atomic=0.5 w_memory=0.3 w_spurious=0.5" ;;
+    ctrl) CFG=$CTRL; ARM_OUT=$OUT/grpo_ctrl; DESC="binary reward" ;;
+    dense) CFG=$DENSE; ARM_OUT=$OUT/grpo_dense; DESC="w_atomic=0.5 w_memory=0.3" ;;
+    spurious) CFG=$SPURIOUS; ARM_OUT=$SPURIOUS_OUT; DESC="w_atomic=0.5 w_memory=0.3 w_spurious=0.5" ;;
   esac
   stage "3/6 GRPO arm=$ARM  ($DESC)"
-  if [ ! -f "$OUT/grpo_$ARM/adapter_config.json" ]; then
+  if [ ! -f "$ARM_OUT/adapter_config.json" ]; then
     timeout "${GRPO_TIMEOUT:-3300}" $PY scripts/03_grpo.py --config "$CFG" \
-        --data "$TRACES/sft.jsonl" --out "$OUT/grpo_$ARM" \
+        --data "$TRACES/sft.jsonl" --out "$ARM_OUT" \
         2>&1 | tee "$LOGS/03_grpo_$ARM.log"
-    echo "  arm=$ARM exit: $?" | tee -a "$LOGS/run_spurious.log"
+    STATUS=$?
+    echo "  arm=$ARM exit: $STATUS" | tee -a "$LOGS/run_spurious.log"
+    [ "$STATUS" -ne 0 ] && exit "$STATUS"
   fi
 done
 
@@ -61,7 +64,7 @@ $PY scripts/04_eval.py --config "$CTRL" --methods student --student "$OUT/sft" \
 
 stage "5/6 eval: all three GRPO arms"
 for ARM in ctrl dense spurious; do
-  D=$OUT/grpo_$ARM
+  if [ "$ARM" = spurious ]; then D=$SPURIOUS_OUT; else D=$OUT/grpo_$ARM; fi
   [ -f "$D/adapter_config.json" ] || { echo "  skip $ARM (no adapter)"; continue; }
   $PY scripts/04_eval.py --config "$CTRL" --methods student --student "$D" \
       --limit "${N_EVAL:-24}" --max-new-tokens 2048 \

@@ -9,8 +9,10 @@ paths:
   bird_root: /mnt/win_d/data/sft_data_collections/bird
   spider_root: /mnt/win_d/data/sft_data_collections/spider
   hf_hub: /mnt/win_d/hub
-  output_dir: outputs/pilot3
-  cache_dir: outputs/pilot3/cache
+  # Stress-instance databases can be several GB each. Keep this arm's
+  # generated data on the large data volume instead of filling the root disk.
+  output_dir: /mnt/win_d/latent_agent_text2sql_outputs/pilot3
+  cache_dir: /mnt/win_d/latent_agent_text2sql_outputs/pilot3/cache
 
 mix:
   bird: 30
@@ -69,7 +71,7 @@ sft:
 
 grpo:
   model_name_or_path: outputs/pilot3/sft
-  output_dir: outputs/pilot3/grpo
+  output_dir: /mnt/win_d/latent_agent_text2sql_outputs/pilot3/grpo_spurious
   epochs: 1
   lr: 1.0e-6
   group_size: 4
