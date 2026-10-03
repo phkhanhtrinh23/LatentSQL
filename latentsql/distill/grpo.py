@@ -506,7 +506,8 @@ class GRPOTrainer:
             take = [order.pop() for _ in range(min(cfg.batch_prompts, len(order)))]
 
             batch_rewards, batch_lens, batch_fmt, batch_clip = [], [], [], []
-            batch_brevity = []
+            batch_brevity, batch_spurious = [], []
+            batch_spurious_failures = []
             batch_std, batch_live = [], []
             for ti in take:
                 self._cur_task = tasks[ti]
@@ -527,6 +528,11 @@ class GRPOTrainer:
                 batch_fmt += [r.reward.r_fmt for r in rollouts]
                 batch_clip += [r.reward.r_clip for r in rollouts]
                 batch_brevity += [r.reward.r_brevity for r in rollouts]
+                batch_spurious += [r.reward.r_spurious for r in rollouts]
+                batch_spurious_failures += [
+                    1.0 if r.reward.r_clip >= 1.0 and r.reward.r_spurious < 1.0 else 0.0
+                    for r in rollouts
+                ]
                 gen_tokens_total += sum(len(r.completion_ids) for r in rollouts)
 
                 # the loss backwards chunk by chunk inside _loss_for, so a
@@ -535,6 +541,7 @@ class GRPOTrainer:
                     self._loss_for_latent(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
                 else:
                     self._loss_for(rollouts, ref_model, scale=1.0 / cfg.grad_accum)
+                self.oracle.release_stress_instances(tasks[ti].db_path, tasks[ti].gold_sql)
             micro += 1
 
             if micro % cfg.grad_accum == 0:
@@ -551,6 +558,12 @@ class GRPOTrainer:
                         "r_fmt_mean": _mean(batch_fmt),
                         "r_clip_mean": _mean(batch_clip),
                         "r_brevity_mean": _mean(batch_brevity),
+                        "r_spurious_mean": _mean(batch_spurious),
+                        "spurious_checked_count": sum(batch_clip),
+                        "spurious_failure_count": sum(batch_spurious_failures),
+                        "spurious_failure_frac": round(
+                            sum(batch_spurious_failures) / sum(batch_clip), 4
+                        ) if sum(batch_clip) else 0.0,
                         "gen_tokens_mean": _mean(batch_lens),
                         #: within-group reward spread; 0 => no learning signal
                         "reward_std_mean": _mean(batch_std),

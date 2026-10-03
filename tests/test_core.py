@@ -519,7 +519,7 @@ class TestSpuriousInstances(unittest.TestCase):
 
     def test_extract_literals_skips_join_keys(self):
         from latentsql.db.schema import load_schema
-        from latentsql.db.spurious import extract_literals
+        from latentsql.db.spurious import extract_join_boundaries, extract_literals
 
         schema = load_schema(_DB, n_examples=0)
         lits = extract_literals(self.GOLD, schema)
@@ -535,6 +535,86 @@ class TestSpuriousInstances(unittest.TestCase):
         # a column against a literal, and must be skipped.
         self.assertEqual(len(join_lits), 1)
         self.assertEqual(join_lits[0].column, "year")
+        joins = extract_join_boundaries(join_sql, schema)
+        self.assertEqual(len(joins), 1)
+        self.assertEqual(
+            (joins[0].left_table, joins[0].left_column,
+             joins[0].right_table, joins[0].right_column),
+            ("concert", "stadium_id", "stadium", "stadium_id"),
+        )
+
+    def test_numeric_boundaries_have_a_match_and_near_miss(self):
+        from latentsql.db.spurious import BoundaryLiteral, _straddling_values
+
+        cases = [
+            (">", 10, lambda yes, no: yes > 10 and not no > 10),
+            (">=", 10, lambda yes, no: yes >= 10 and not no >= 10),
+            ("<", 10, lambda yes, no: yes < 10 and not no < 10),
+            ("<=", 10, lambda yes, no: yes <= 10 and not no <= 10),
+        ]
+        for op, value, check in cases:
+            yes, no = _straddling_values(
+                BoundaryLiteral("singer", "age", op, value)
+            )[0]
+            self.assertTrue(check(yes, no), (op, yes, no))
+
+    def test_mutants_include_boolean_and_join_type_edits(self):
+        from latentsql.db.spurious import mutate_query
+        import random
+
+        sql = ("SELECT T2.name FROM concert AS T1 JOIN stadium AS T2 "
+               "ON T1.stadium_id = T2.stadium_id "
+               "WHERE T1.year > 2010 AND T2.capacity > 100")
+        mutants = mutate_query(sql, random.Random(0), max_mutants=12)
+        self.assertTrue(any(" OR " in mutant for mutant in mutants), mutants)
+        self.assertTrue(any("LEFT JOIN" in mutant for mutant in mutants), mutants)
+
+    def test_boundary_rows_satisfy_other_same_table_filters(self):
+        from latentsql.db.schema import load_schema
+        from latentsql.db.spurious import build_boundary_instance, extract_literals
+        import random
+        import sqlite3
+
+        sql = ("SELECT name FROM singer WHERE country = 'France' "
+               "AND 40 < age AND age < 50")
+        schema = load_schema(_DB, n_examples=0)
+        literals = extract_literals(sql, schema)
+        target = next(lit for lit in literals if lit.column == "country")
+        dst = os.path.join(tempfile.mkdtemp(prefix="latentsql_stress_"), "inst.sqlite")
+        with sqlite3.connect(_DB) as conn:
+            before = conn.execute("SELECT MAX(singer_id) FROM singer").fetchone()[0]
+        self.assertTrue(build_boundary_instance(
+            _DB, dst, schema, target, random.Random(0), all_literals=literals
+        ))
+        with sqlite3.connect(dst) as conn:
+            inserted = conn.execute(
+                "SELECT country, age FROM singer WHERE singer_id > ?", (before,)
+            ).fetchall()
+        self.assertTrue(inserted)
+        self.assertTrue(all(40 < age < 50 for _country, age in inserted), inserted)
+
+    def test_join_instance_adds_dangling_and_duplicate_keys(self):
+        from latentsql.db.schema import load_schema
+        from latentsql.db.spurious import build_join_instance, extract_join_boundaries
+        import random
+        import sqlite3
+
+        sql = ("SELECT c.concert_name, s.name FROM concert AS c LEFT JOIN stadium AS s "
+               "ON c.stadium_id = s.stadium_id")
+        schema = load_schema(_DB, n_examples=0)
+        join = extract_join_boundaries(sql, schema)[0]
+        dst = os.path.join(tempfile.mkdtemp(prefix="latentsql_stress_"), "join.sqlite")
+        self.assertTrue(build_join_instance(_DB, dst, schema, join, random.Random(0)))
+        with sqlite3.connect(dst) as conn:
+            dangling = conn.execute(
+                "SELECT COUNT(*) FROM concert c LEFT JOIN stadium s "
+                "ON c.stadium_id=s.stadium_id WHERE s.stadium_id IS NULL"
+            ).fetchone()[0]
+            fanout = conn.execute(
+                "SELECT MAX(n) FROM (SELECT COUNT(*) n FROM concert GROUP BY stadium_id)"
+            ).fetchone()[0]
+        self.assertGreaterEqual(dangling, 1)
+        self.assertGreaterEqual(fanout, 2)
 
     def test_generate_stress_instances_builds_and_caches(self):
         from latentsql.db.spurious import generate_stress_instances
@@ -593,6 +673,28 @@ class TestSpuriousInstances(unittest.TestCase):
         n_before = conn.execute("SELECT COUNT(*) FROM singer").fetchone()[0]
         conn.close()
         self.assertGreater(n_before, 0)
+
+    def test_bootstrap_jitters_non_key_numeric_values(self):
+        from latentsql.db.schema import load_schema
+        from latentsql.db.spurious import bootstrap_instance
+        import random
+        import sqlite3
+
+        schema = load_schema(_DB, n_examples=0)
+        dst = os.path.join(tempfile.mkdtemp(prefix="latentsql_stress_"), "jitter.sqlite")
+        changed = bootstrap_instance(
+            _DB, dst, random.Random(0), schema=schema,
+            drop_frac=0.0, dup_frac=0.0, jitter_frac=1.0,
+        )
+        self.assertTrue(changed)
+        with sqlite3.connect(_DB) as src, sqlite3.connect(dst) as perturbed:
+            original = src.execute(
+                "SELECT singer_id, age, is_male FROM singer ORDER BY singer_id"
+            ).fetchall()
+            jittered = perturbed.execute(
+                "SELECT singer_id, age, is_male FROM singer ORDER BY singer_id"
+            ).fetchall()
+        self.assertNotEqual(original, jittered)
 
 
 class TestSpuriousReward(unittest.TestCase):

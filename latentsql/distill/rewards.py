@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -86,7 +87,8 @@ class ExecutionOracle:
 
     def __init__(self, timeout: float = 30.0, max_cache: int = 200_000,
                 stress_cache_dir: Optional[str] = None,
-                n_stress_instances: int = 5, stress_seed: int = 0):
+                n_stress_instances: int = 5, stress_seed: int = 0,
+                cleanup_stress_cache: bool = False):
         self.timeout = timeout
         self.max_cache = max_cache
         self._gold: Dict[Tuple[str, str], ExecResult] = {}
@@ -100,6 +102,7 @@ class ExecutionOracle:
         self.stress_cache_dir = stress_cache_dir
         self.n_stress_instances = n_stress_instances
         self.stress_seed = stress_seed
+        self.cleanup_stress_cache = cleanup_stress_cache
         self._stress_paths: Dict[Tuple[str, str], List[str]] = {}
         self._spurious: Dict[Tuple[str, str, str], float] = {}
 
@@ -190,6 +193,30 @@ class ExecutionOracle:
         if len(self._spurious) < self.max_cache:
             self._spurious[key] = score
         return score
+
+    def release_stress_instances(self, db_path: str, gold_sql: str) -> None:
+        """Release one query's stress DBs after its rollout group is finished."""
+        if not self.cleanup_stress_cache:
+            return
+        normalized_gold = normalize_sql(gold_sql)
+        key = (db_path, normalized_gold)
+        paths = self._stress_paths.pop(key, [])
+        path_set = set(paths)
+        for cache_key in list(self._gold):
+            if cache_key[0] in path_set:
+                self._gold.pop(cache_key, None)
+        for cache_key in list(self._verdict):
+            if cache_key[0] in path_set:
+                self._verdict.pop(cache_key, None)
+        for cache_key in list(self._spurious):
+            if cache_key[0] == db_path and cache_key[2] == normalized_gold:
+                self._spurious.pop(cache_key, None)
+        folders = {os.path.dirname(path) for path in paths}
+        cache_root = os.path.abspath(self.stress_cache_dir) if self.stress_cache_dir else None
+        for folder in folders:
+            absolute = os.path.abspath(folder)
+            if cache_root and os.path.commonpath((cache_root, absolute)) == cache_root:
+                shutil.rmtree(absolute, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------

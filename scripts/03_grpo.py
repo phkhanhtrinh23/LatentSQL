@@ -48,6 +48,11 @@ def main() -> int:
     ap.add_argument("--len-end", type=int, default=None)
     ap.add_argument("--w-brevity", type=float, default=None,
                     help="reward weight for shorter correct latent rollouts")
+    ap.add_argument("--w-atomic", type=float, default=None)
+    ap.add_argument("--w-memory", type=float, default=None)
+    ap.add_argument("--w-spurious", type=float, default=None)
+    ap.add_argument("--n-stress-instances", type=int, default=None)
+    ap.add_argument("--cleanup-stress-cache", action="store_true")
     ap.add_argument("--brevity-ref-tokens", type=int, default=None,
                     help="token count that receives zero brevity reward")
     ap.add_argument("--latent-steps", type=int, default=None)
@@ -91,6 +96,16 @@ def main() -> int:
         cfg.grpo.reward.len_end = args.len_end
     if args.w_brevity is not None:
         cfg.grpo.reward.w_brevity = args.w_brevity
+    if args.w_atomic is not None:
+        cfg.grpo.reward.w_atomic = args.w_atomic
+    if args.w_memory is not None:
+        cfg.grpo.reward.w_memory = args.w_memory
+    if args.w_spurious is not None:
+        cfg.grpo.reward.w_spurious = args.w_spurious
+    if args.n_stress_instances is not None:
+        cfg.grpo.reward.n_stress_instances = args.n_stress_instances
+    if args.cleanup_stress_cache:
+        cfg.grpo.reward.cleanup_stress_cache = True
     if args.brevity_ref_tokens is not None:
         cfg.grpo.reward.brevity_ref_tokens = args.brevity_ref_tokens
     if args.latent_steps:
@@ -224,6 +239,7 @@ def main() -> int:
         stress_cache_dir=cfg.grpo.reward.stress_cache_dir
         or os.path.join(cfg.paths.cache_dir, "stress"),
         n_stress_instances=cfg.grpo.reward.n_stress_instances,
+        cleanup_stress_cache=cfg.grpo.reward.cleanup_stress_cache,
     )
     if float(getattr(cfg.grpo.reward, "w_spurious", 0.0)) > 0:
         print(f"[spurious] w_spurious={cfg.grpo.reward.w_spurious} enabled - "

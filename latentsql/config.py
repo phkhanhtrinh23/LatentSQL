@@ -276,6 +276,10 @@ class RewardConfig:
     #: under, keyed by (db path, gold SQL). None => a .stress_cache/ folder
     #: next to the original database file.
     stress_cache_dir: Optional[str] = None
+    #: Remove a query's generated SQLite copies after its rollout group has
+    #: been scored. Essential for large corpora whose source DBs can be GBs;
+    #: leave false when later epochs should reuse the on-disk instances.
+    cleanup_stress_cache: bool = False
 
 
 @dataclass
