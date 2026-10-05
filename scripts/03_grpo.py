@@ -38,6 +38,8 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--resume-consumed-prompts", type=int, default=0,
+                    help="after --limit, keep only prompts not consumed by the seeded GRPO order")
     ap.add_argument("--max-prompt-chars", type=int, default=None,
                     help="drop GRPO records whose prompt text is longer than this")
     ap.add_argument("--prefer-hard", action="store_true",
@@ -46,6 +48,8 @@ def main() -> int:
                     help="optional preds jsonl; wrong/unparseable qids are prioritized if they overlap")
     ap.add_argument("--len-start", type=int, default=None)
     ap.add_argument("--len-end", type=int, default=None)
+    ap.add_argument("--w-fmt-start", type=float, default=None)
+    ap.add_argument("--w-fmt-end", type=float, default=None)
     ap.add_argument("--w-brevity", type=float, default=None,
                     help="reward weight for shorter correct latent rollouts")
     ap.add_argument("--w-atomic", type=float, default=None)
@@ -94,6 +98,10 @@ def main() -> int:
         cfg.grpo.reward.len_start = args.len_start
     if args.len_end:
         cfg.grpo.reward.len_end = args.len_end
+    if args.w_fmt_start is not None:
+        cfg.grpo.reward.w_fmt_start = args.w_fmt_start
+    if args.w_fmt_end is not None:
+        cfg.grpo.reward.w_fmt_end = args.w_fmt_end
     if args.w_brevity is not None:
         cfg.grpo.reward.w_brevity = args.w_brevity
     if args.w_atomic is not None:
@@ -136,7 +144,10 @@ def main() -> int:
                 schema_mod.load_schema_cached(ex.db_path, ex.db_id), style="code"
             )
 
-        tasks = tasks_from_examples(examples, _render)
+        tasks = tasks_from_examples(
+            examples, _render, retrieval_cfg=cfg.mas,
+            cache_dir=os.path.join(cfg.paths.cache_dir, "value_indexes"),
+        )
         print(f"no-teacher ablation: prompts built directly from {used}")
     else:
         records = load_records(args.data)
@@ -177,7 +188,27 @@ def main() -> int:
             records = sorted(records, key=_hard_key, reverse=True)
         if args.limit:
             records = records[: args.limit]
-        tasks = tasks_from_records(records)
+        if args.resume_consumed_prompts:
+            if args.resume_consumed_prompts >= len(records):
+                print("resume-consumed-prompts leaves no records")
+                return 1
+            # GRPOTrainer starts with this exact seeded shuffle and consumes
+            # indices from the end. Retain only the prompts not represented by
+            # the saved adapter, then let the continuation reshuffle that set.
+            import random as _random
+
+            order = list(range(len(records)))
+            _random.Random(cfg.grpo.seed).shuffle(order)
+            consumed = set(order[-args.resume_consumed_prompts:])
+            records = [record for i, record in enumerate(records) if i not in consumed]
+            print(
+                f"resume selection kept {len(records)} prompts after excluding "
+                f"{args.resume_consumed_prompts} already consumed"
+            )
+        tasks = tasks_from_records(
+            records, retrieval_cfg=cfg.mas,
+            cache_dir=os.path.join(cfg.paths.cache_dir, "value_indexes"),
+        )
     if not tasks:
         print("no GRPO tasks: prompts need db_path and gold_sql")
         return 1

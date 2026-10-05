@@ -35,6 +35,7 @@ in one leap.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
 import time
@@ -43,6 +44,95 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..mas.prompts import student_prompt
 from ..llm.hf_local import render_chat
 from ..mas.trace import T_CONSENSUS_OPEN, T_CONSENSUS_CLOSE, T_END, T_AGENT_CLOSE, agent_tag
+
+
+def _identifier_error_mutant(sql: str) -> Optional[str]:
+    """Make one deterministic unknown-column mutant when sqlglot can parse SQL."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read="sqlite")
+        column = next(tree.find_all(exp.Column), None)
+        if column is None or not column.name:
+            return None
+        column.set("this", exp.Identifier(this=f"{column.name}__invalid"))
+        return tree.sql(dialect="sqlite")
+    except Exception:
+        return None
+
+
+def _empty_result_mutant(sql: str) -> Optional[str]:
+    """Replace one string literal with an impossible value (one AST edit)."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read="sqlite")
+        literal = next(
+            (node for node in tree.find_all(exp.Literal) if node.is_string), None
+        )
+        if literal is None:
+            return None
+        literal.replace(exp.Literal.string("__latentsql_missing_value__"))
+        return tree.sql(dialect="sqlite")
+    except Exception:
+        return None
+
+
+def _offline_execution_negatives(trace: Any, correct_sql: str,
+                                 max_negatives: int = 2) -> List[Dict[str, str]]:
+    """Build deterministic training-only outcome examples for one correct SQL.
+
+    These labels are produced offline and embedded in the teacher trace.  They
+    are never computed or supplied during latent inference.  A mutant is kept
+    only when execution proves it differs from the gold result.
+    """
+    from ..db.execute import execute_sql, gold_is_ordered, result_match
+    from ..db.spurious import mutate_query
+
+    db_path = str(getattr(trace, "meta", {}).get("db_path", "") or "")
+    gold_sql = str(getattr(trace, "gold_sql", "") or "")
+    if not (db_path and os.path.exists(db_path) and gold_sql and correct_sql):
+        return []
+    gold_result = execute_sql(db_path, gold_sql, timeout=30.0)
+    if not gold_result.ok:
+        return []
+
+    seed_text = f"{getattr(trace, 'qid', '')}\0{correct_sql}"
+    seed = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    candidates: List[str] = []
+    for mutant in (
+        _identifier_error_mutant(correct_sql),
+        _empty_result_mutant(correct_sql),
+        *mutate_query(correct_sql, rng, max_mutants=12),
+    ):
+        if mutant and mutant != correct_sql and mutant not in candidates:
+            candidates.append(mutant)
+
+    labelled: List[Dict[str, str]] = []
+    seen_labels: set[str] = set()
+    for mutant in candidates:
+        result = execute_sql(db_path, mutant, timeout=30.0)
+        if not result.ok:
+            lower = result.error.lower()
+            label = "syntax_error" if "syntax" in lower or "incomplete" in lower else "runtime_error"
+            detail = result.error[:240]
+        elif result.empty and not gold_result.empty:
+            label, detail = "empty_result", "query executed but returned no rows"
+        elif not result_match(result, gold_result, ordered=gold_is_ordered(gold_sql)):
+            label, detail = "result_mismatch", "query executed but disagreed with the gold result"
+        else:
+            continue
+        # Prefer diverse failure modes over two nearly identical mutations.
+        if label in seen_labels and len(candidates) > max_negatives:
+            continue
+        seen_labels.add(label)
+        labelled.append({"sql": mutant, "label": label, "detail": detail})
+        if len(labelled) >= max_negatives:
+            break
+    return labelled
 
 #: sequence positions upcast to fp32 at once when scoring log-probabilities -
 #: same chunking trick as grpo.py/dpo.py, same OOM this avoids.
@@ -66,19 +156,43 @@ def _consensus_target_ids(tok, gold_sql: str) -> List[int]:
     return ids
 
 
+def _explicit_curriculum_turns(role_turns: Sequence[str], roles: Sequence[str],
+                               n_latent_roles: int) -> Dict[int, str]:
+    """Validated explicit suffix for a COCONUT curriculum stage.
+
+    The first ``n_latent_roles`` are replaced by continuous thoughts. Every
+    later non-consensus role must remain as supervised text until its own
+    replacement stage; otherwise trace-only supervision such as offline
+    execution outcomes would never enter the loss.
+    """
+    out: Dict[int, str] = {}
+    for idx, role in enumerate(roles):
+        if role == "consensus":
+            break
+        if idx < n_latent_roles:
+            continue
+        if idx >= len(role_turns) or not str(role_turns[idx]).strip():
+            raise ValueError(
+                f"missing explicit role turn {idx} ({role}) for COCONUT curriculum"
+            )
+        out[idx] = str(role_turns[idx]).rstrip()
+    return out
+
+
 def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: int,
                            target_ids: Sequence[int],
                            sql_ready_role: Optional[int] = None,
                            sql_ready_tokens: int = 16) -> tuple:
-    """Strict COCONUT training loss, without the inference-time KV cache.
+    """COCONUT curriculum loss, without the inference-time KV cache.
 
     COCONUT trains by repeatedly running the model on the current sequence to
     obtain the next continuous thought, appending that hidden state as an input
-    embedding, then doing a final teacher-forced forward over the sequence with
-    loss masked on the prompt and latent thoughts. This is deliberately separate
-    from ``LatentReasoner.build_prefix``: that method builds the inference/GRPO
-    KV prefix, while this method follows the paper's memory-safer training
-    shape using ``use_cache=False``.
+    embedding, while roles not yet internalised remain explicit supervised
+    text.  A final teacher-forced forward supervises that explicit suffix and
+    the answer, with the prompt and latent thoughts masked. This is deliberately
+    separate from ``LatentReasoner.build_prefix``: that method builds the
+    inference/GRPO KV prefix, while this method follows the paper's memory-safer
+    training shape using ``use_cache=False``.
     """
     import torch
 
@@ -107,27 +221,40 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
         add_token_ids(tok(text, add_special_tokens=False)["input_ids"], supervise)
 
     add_text(chat, supervise=False)
+    explicit_turns = _explicit_curriculum_turns(
+        list(rec.get("role_turns") or []), cfg.roles, n_latent_roles
+    )
     for idx, role in enumerate(cfg.roles):
         if role == "consensus":
             break
-        if idx >= n_latent_roles:
-            break
-        add_text(agent_tag(role) + "\n", supervise=False)
-        for _ in range(cfg.latent_steps):
-            cur = torch.cat(pieces, dim=1)
-            attn = torch.ones(cur.shape[:2], dtype=torch.long, device=device)
-            out = model(
-                inputs_embeds=cur,
-                attention_mask=attn,
-                use_cache=False,
-                output_hidden_states=True,
-            )
-            hidden = out.hidden_states[-1][:, -1:, :]
-            pieces.append(reasoner.align(hidden))
-            labels.append(-100)
-            del out, cur, attn
+        if idx < n_latent_roles:
+            add_text(agent_tag(role) + "\n", supervise=False)
+            for _ in range(cfg.latent_steps):
+                cur = torch.cat(pieces, dim=1)
+                attn = torch.ones(cur.shape[:2], dtype=torch.long, device=device)
+                out = model(
+                    inputs_embeds=cur,
+                    attention_mask=attn,
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+                hidden = out.hidden_states[-1][:, -1:, :]
+                pieces.append(reasoner.align(hidden))
+                labels.append(-100)
+                del out, cur, attn
+        else:
+            # COCONUT curriculum: roles not yet replaced by continuous
+            # thoughts remain explicit and supervised.  In the two-role run,
+            # stage 1 therefore learns the candidate-generation trace,
+            # including its training-only offline execution outcomes; stage 2
+            # replaces that whole turn with latent states.  Dropping this
+            # suffix would reduce the objective to SQL-only supervision and
+            # the outcome trace would never influence training.
+            # role_turns_for returns a complete tagged block, so do not add a
+            # second role tag here.
+            add_text(explicit_turns[idx] + "\n", supervise=True)
 
-        if sql_ready_role and idx + 1 == sql_ready_role and target_ids:
+        if idx < n_latent_roles and sql_ready_role and idx + 1 == sql_ready_role and target_ids:
             probe_target = list(target_ids[: max(1, int(sql_ready_tokens))])
             consensus_ids = tok(T_CONSENSUS_OPEN, add_special_tokens=False)["input_ids"]
             probe_pieces = list(pieces)
@@ -194,17 +321,26 @@ def role_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
 
 
 def chess_step_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
-    """Render available CHESS-style pipeline artifacts as ordered steps.
+    """Render two internalisable stages from a correct first-pass CHESS run.
 
-    Existing traces do not keep CHESS's raw three candidates or unit-test
-    assertions separately. The best local approximation is therefore the
-    pipeline state the project does record: retrieved values, schema links,
-    query class, the selected CHESS candidate, execution feedback, and the
-    selector/consensus decision.
+    Value retrieval is deliberately absent: it is an external database/index
+    tool whose results belong in the input prompt, not a reasoning role the
+    student can internalise.  Execution-driven revision and verification are
+    also absent because latent steps cannot invoke SQLite; those signals are
+    applied later as GRPO rewards.  Only schema linking and the round-0 CHESS
+    candidate are supervised here, and the candidate must already have EX=1.
     """
     chess_turns = [t for t in trace.turns if t.agent == "chess"]
     first_chess = sorted(chess_turns, key=lambda t: t.round)[0] if chess_turns else None
-    final_chess = sorted(chess_turns, key=lambda t: t.round)[-1] if chess_turns else None
+    if not (
+        first_chess
+        and int(getattr(first_chess, "round", -1)) == 0
+        and getattr(first_chess, "correct", None) is True
+        and getattr(first_chess, "sql", None)
+    ):
+        return None
+
+    negative_examples = _offline_execution_negatives(trace, first_chess.sql)
 
     def block(role: str, body: str) -> Optional[str]:
         body = (body or "").strip()
@@ -212,37 +348,22 @@ def chess_step_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]
             return None
         return f"{agent_tag(role)}\n{body}\n{T_AGENT_CLOSE}"
 
-    values = "\n".join(f"- {v}" for v in getattr(trace, "value_hints", []) or [])
     step_map: Dict[str, Optional[str]] = {
-        "information_retriever": block(
-            "information_retriever",
-            values or "No retrieved literal values were needed.",
-        ),
         "schema_linker": block("schema_linker", getattr(trace, "schema_links", "")),
-        "query_classifier": block(
-            "query_classifier", getattr(trace, "difficulty_class", "") or "UNKNOWN"
-        ),
         "candidate_generator": block(
             "candidate_generator",
             (
-                f"{first_chess.reasoning.strip()}\n```sql\n{first_chess.sql}\n```"
+                "Training-only execution outcomes (not available at inference):\n"
+                + "\n\n".join(
+                    f"Rejected one-edit mutant {idx}:\n```sql\n{negative['sql']}\n```\n"
+                    f"Outcome: {negative['label']} — {negative['detail']}"
+                    for idx, negative in enumerate(negative_examples, 1)
+                )
+                + ("\n\n" if negative_examples else "")
+                + "Correct first-pass CHESS candidate:\n"
+                + f"{first_chess.reasoning.strip()}\n```sql\n{first_chess.sql}\n```\n"
+                + "Outcome: valid — EX=1 on the training database"
                 if first_chess and first_chess.sql else ""
-            ),
-        ),
-        "query_fixer": block(
-            "query_fixer",
-            (
-                f"Execution feedback:\n"
-                f"{(final_chess.exec_error or final_chess.exec_preview or 'query executed').strip()}\n"
-                f"Corrected query:\n```sql\n{final_chess.sql}\n```"
-                if final_chess and final_chess.sql else ""
-            ),
-        ),
-        "unit_tester": block(
-            "unit_tester",
-            (
-                f"Selector: {getattr(trace, 'meta', {}).get('selector', 'unknown')}\n"
-                f"Chosen SQL:\n```sql\n{trace.consensus_sql or trace.gold_sql}\n```"
             ),
         ),
     }
@@ -295,9 +416,18 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
     for tr in traces:
         if not tr.gold_sql:
             continue
+        from ..db.value_index import retrieve_value_hints
+
+        db_path = str(getattr(tr, "meta", {}).get("db_path", "") or "")
+        retrieval_cache = os.path.join(cfg.paths.cache_dir, "value_indexes")
+        retrieved_values = retrieve_value_hints(
+            db_path, tr.db_id, tr.question, tr.evidence,
+            cfg=cfg.mas, cache_dir=retrieval_cache,
+        )
+        value_hint_text = "\n".join(f"- {value}" for value in retrieved_values)
         sp = student_prompt(
             schema=tr.schema_prompt, question=tr.question, evidence=tr.evidence,
-            value_hints="\n".join(f"- {v}" for v in tr.value_hints),
+            value_hints=value_hint_text,
         )
         if max_prompt_chars and len(sp["user"]) > max_prompt_chars:
             # Truncate the schema (almost always the largest, most cuttable
@@ -310,7 +440,7 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
             truncated_schema = tr.schema_prompt[:schema_budget] + "\n-- (schema truncated)"
             sp = student_prompt(
                 schema=truncated_schema, question=tr.question, evidence=tr.evidence,
-                value_hints="\n".join(f"- {v}" for v in tr.value_hints),
+                value_hints=value_hint_text,
             )
             n_truncated_schema += 1
             if len(sp["user"]) > max_prompt_chars:
@@ -339,6 +469,9 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
         out.append({
             "qid": tr.qid, "system": sp["system"], "prompt": sp["user"],
             "gold_sql": tr.gold_sql, "role_turns": rt,
+            "db_id": tr.db_id, "db_path": db_path,
+            "question": tr.question, "evidence": tr.evidence,
+            "retrieved_values": retrieved_values,
         })
     if n_truncated_schema:
         print(f"[latent_sft] {n_truncated_schema}/{len(out) + n_dropped_overflow} traces had "

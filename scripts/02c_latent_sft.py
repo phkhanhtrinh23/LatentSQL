@@ -15,6 +15,7 @@ COCONUT-style curriculum mode (--curriculum).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -48,8 +49,9 @@ def main() -> int:
                          "them as conditioning - see LatentReasoner.build_prefix's docstring. "
                          "Requires --curriculum (needs role_turns).")
     ap.add_argument("--coconut-objective", action="store_true",
-                    help="strict latent objective: run the requested latent step markers, then "
-                         "train SQL directly after <|consensus|>.")
+                    help="COCONUT curriculum objective: replace the requested leading roles "
+                         "with latent steps, supervise remaining explicit role turns, then "
+                         "supervise SQL after <|consensus|>.")
     ap.add_argument("--sql-ready-role", type=int, default=None,
                     help="strict COCONUT only: after this 1-indexed latent role, add an "
                          "auxiliary probe that feeds <|consensus|> and supervises the "
@@ -129,12 +131,19 @@ def main() -> int:
     banner("loading traces")
     from latentsql.distill.latent_sft import build_records_from_traces
 
-    traces = load_traces(args.data)
-    records = build_records_from_traces(
-        traces, cfg, max_prompt_chars=args.max_prompt_chars,
-        max_role_chars=args.max_role_chars, tokenizer=bundle.tokenizer,
-        max_total_tokens=args.max_total_tokens, chain_format=args.chain_format,
-    )
+    with open(args.data, "r", encoding="utf-8") as probe_fh:
+        first_record = json.loads(next(line for line in probe_fh if line.strip()))
+    if {"system", "prompt", "gold_sql", "role_turns"}.issubset(first_record):
+        with open(args.data, "r", encoding="utf-8") as fh:
+            records = [json.loads(line) for line in fh if line.strip()]
+        print(f"[latent_sft] loaded {len(records)} prepared retrieval-consistent records")
+    else:
+        traces = load_traces(args.data)
+        records = build_records_from_traces(
+            traces, cfg, max_prompt_chars=args.max_prompt_chars,
+            max_role_chars=args.max_role_chars, tokenizer=bundle.tokenizer,
+            max_total_tokens=args.max_total_tokens, chain_format=args.chain_format,
+        )
     if args.require_role_turns:
         before = len(records)
         records = [r for r in records if r.get("role_turns") is not None]

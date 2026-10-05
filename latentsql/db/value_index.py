@@ -24,6 +24,16 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 _MERSENNE = (1 << 61) - 1
 _MAX_HASH = (1 << 32) - 1
 
+_QUESTION_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "before", "between",
+    "both", "by", "can", "did", "do", "does", "each", "for", "from", "had",
+    "has", "have", "how", "in", "into", "is", "it", "its", "least", "less",
+    "list", "many", "more", "most", "name", "names", "not", "number", "of",
+    "on", "or", "other", "show", "than", "that", "the", "their", "there",
+    "these", "those", "to", "was", "were", "what", "when", "where", "which",
+    "who", "whose", "with", "would",
+}
+
 
 @dataclass
 class ValueHit:
@@ -286,3 +296,89 @@ def get_value_index(
             pass
     _INDEX_CACHE[key] = idx
     return idx
+
+
+def extract_value_keywords(question: str, evidence: str = "", max_keywords: int = 40) -> List[str]:
+    """Extract deterministic database-value probes without an LLM.
+
+    Retrieval is preprocessing, not a latent reasoning role.  Keeping keyword
+    extraction deterministic lets latent-SFT, GRPO, and evaluation construct
+    exactly the same prompt without calling a teacher model at test time.
+    Quoted strings and proper-name spans are prioritised, followed by useful
+    1--4-grams from the question/evidence.  The value index's similarity
+    threshold rejects schema words and generic phrases that are not cell
+    values.
+    """
+    text = " ".join(part.strip() for part in (question, evidence) if part and part.strip())
+    candidates: List[str] = []
+
+    candidates.extend(
+        match.strip() for match in re.findall(r"['\"]([^'\"]{2,80})['\"]", text)
+    )
+    candidates.extend(
+        match.strip()
+        for match in re.findall(
+            r"\b(?:[A-Z][\w'-]*(?:\s+|$)){1,5}", text
+        )
+    )
+
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_'-]*", text)
+    content = [
+        word for word in words
+        if len(word) >= 2 and word.lower() not in _QUESTION_STOPWORDS
+    ]
+    for width in (4, 3, 2, 1):
+        for start in range(0, max(0, len(content) - width + 1)):
+            candidates.append(" ".join(content[start:start + width]))
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        clean = re.sub(r"\s+", " ", candidate).strip(" .,:;!?\t\r\n")
+        key = clean.lower()
+        if len(clean) < 2 or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+
+def retrieve_value_hints(
+    db_path: str,
+    db_id: str,
+    question: str,
+    evidence: str = "",
+    *,
+    cfg: Optional[object] = None,
+    cache_dir: Optional[str] = None,
+) -> List[str]:
+    """Return externally retrieved value hints for a student prompt.
+
+    This helper is the single train/GRPO/eval entry point.  It never invokes
+    an LLM and returns an empty list when retrieval is disabled or unavailable.
+    """
+    if cfg is not None and not bool(getattr(cfg, "use_value_retrieval", True)):
+        return []
+    if not db_path or not os.path.exists(db_path):
+        return []
+    try:
+        index = get_value_index(
+            db_path,
+            db_id=db_id,
+            cache_dir=cache_dir,
+            max_values_per_column=int(
+                getattr(cfg, "max_values_indexed_per_column", 5000)
+            ),
+            num_perm=int(getattr(cfg, "lsh_signature_size", 64)),
+            bands=int(getattr(cfg, "lsh_bands", 16)),
+        )
+        hits = index.search_many(
+            extract_value_keywords(question, evidence),
+            top_k=int(getattr(cfg, "value_top_k", 5)),
+            min_similarity=float(getattr(cfg, "value_min_similarity", 0.72)),
+        )
+        return [hit.as_text() for hit in hits[: int(getattr(cfg, "value_top_k", 5)) * 2]]
+    except Exception:
+        return []

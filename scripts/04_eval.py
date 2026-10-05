@@ -33,6 +33,8 @@ def main() -> int:
     ap.add_argument("--heldout", default=None, help="jsonl written by 01_build_traces.py")
     ap.add_argument("--student", default=None, help="adapter dir for student/latent modes")
     ap.add_argument("--base", default=None, help="base model for the student")
+    ap.add_argument("--student-quantization", choices=("none", "4bit", "8bit"), default=None,
+                    help="override target student loading precision")
     ap.add_argument("--out", default=None)
     ap.add_argument("--ves", action="store_true", help="also compute BIRD VES (slow)")
     ap.add_argument("--backend", default=None)
@@ -105,10 +107,11 @@ def main() -> int:
         ) else None
         base_path = resolve_model_path(base, hub_dir=cfg.paths.hf_hub, local_only=False)
         print(f"student: base={base_path} adapter={adapter}")
+        student_quant = args.student_quantization or getattr(cfg.sft, "quantization", "none")
         bundle = load_model(
             base_path, device="auto",
             hub_dir=cfg.paths.hf_hub, adapter_path=adapter,
-            quantization=getattr(cfg.sft, "quantization", "none"),
+            quantization=student_quant,
         )
 
     spec = None

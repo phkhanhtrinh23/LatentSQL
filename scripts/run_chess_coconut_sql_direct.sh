@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# CHESS-step latent curriculum, SQL-direct.
+# Two-role CHESS latent curriculum, SQL-direct.
 #
-# Stages hide CHESS-style pipeline steps as latent vectors:
-#   information_retriever -> schema_linker -> query_classifier ->
-#   candidate_generator -> query_fixer -> unit_tester -> consensus SQL
+# Retrieval is an external database/index tool and is inserted into the prompt
+# in every phase. Only two model-internal stages are trained:
+#   schema_linker -> candidate_generator -> consensus SQL
+# Offline mutant outcomes teach failure anticipation in the explicit
+# candidate turn before that turn is replaced by latent states. Actual
+# execution-based correction remains a GRPO reward, not an inference tool.
 #
-# No remaining agent debate text is generated or supervised. At eval time the
-# model runs N latent CHESS step markers, then jumps straight to <|consensus|>
-# and decodes SQL.
+# During curriculum training, roles not yet made latent remain explicit and
+# supervised, as in COCONUT. At evaluation both roles are latent; the model
+# then jumps to <|consensus|> and decodes only SQL.
 set -u
 cd /home/trinh/Dropbox/thesis/latent_agent_text2sql
 
 N=${1:-94}
 BATCH_SIZE=${2:-16}
-N_STEPS=${3:-6}
+N_STEPS=${3:-2}
 EPOCHS_PER_STAGE=${4:-3}
 BASE=${5:-outputs/latent_sft_1000/sft_7b_bf16}
 DATA=${6:-outputs/latent_sft_1000/traces/traces.jsonl}
@@ -30,8 +33,8 @@ START_STAGE=${16:-1}
 START_EPOCH=${17:-1}
 MAX_TOTAL_TOKENS=${18:-1400}
 LATE_LR=${19:-2e-5}
-SQL_READY_ROLE=${20:-4}
-SQL_READY_WEIGHT=${21:-0.5}
+SQL_READY_ROLE=${20:-}
+SQL_READY_WEIGHT=${21:-0}
 SQL_READY_TOKENS=${22:-16}
 
 # Each training batch and each eval is a fresh process, and the runner launches
@@ -56,7 +59,7 @@ gpu_settle() {
   echo "[chess_coconut] warning: GPU still holding ${used}MiB after 120s; launching anyway" | tee -a "$LOG"
 }
 
-ROLES="information_retriever,schema_linker,query_classifier,candidate_generator,query_fixer,unit_tester,consensus"
+ROLES="schema_linker,candidate_generator,consensus"
 OUT="$RUNDIR/latent_sft"
 OPTIM_STATE="$RUNDIR/optim_state.pt"
 LOG="${RUNDIR}.log"
@@ -68,6 +71,7 @@ AVAILABLE_N=$(python3 - "$DATA" "$CONFIG" "$MAX_PROMPT_CHARS" "$MAX_ROLE_CHARS" 
 import sys
 import contextlib
 import io
+import json
 from latentsql.config import load_config
 from latentsql.mas.trace import load_traces
 from latentsql.distill.latent_sft import build_records_from_traces
@@ -75,10 +79,15 @@ from latentsql.llm.hf_local import resolve_model_path
 from transformers import AutoTokenizer
 
 data, config, max_prompt, max_role, base_model, max_total = sys.argv[1:7]
+with open(data, "r", encoding="utf-8") as fh:
+    first = json.loads(next(line for line in fh if line.strip()))
+if {"system", "prompt", "gold_sql", "role_turns"}.issubset(first):
+    with open(data, "r", encoding="utf-8") as fh:
+        print(sum(1 for line in fh if line.strip() and json.loads(line).get("gold_sql")))
+    raise SystemExit(0)
 cfg = load_config(config)
 cfg.latent.roles = [
-    "information_retriever", "schema_linker", "query_classifier",
-    "candidate_generator", "query_fixer", "unit_tester", "consensus",
+    "schema_linker", "candidate_generator", "consensus",
 ]
 base_path = resolve_model_path(base_model, hub_dir=cfg.paths.hf_hub, local_only=False)
 tok = AutoTokenizer.from_pretrained(base_path, trust_remote_code=True)

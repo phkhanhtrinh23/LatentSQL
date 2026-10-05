@@ -84,7 +84,10 @@ grpo:
   batch_prompts: 1
   grad_accum: 2
   max_new_tokens: 400
-  kl_beta: 0.02
+  # Latent GRPO does not yet have a frozen latent-prefix reference policy.
+  # Keep this explicitly zero instead of silently claiming a KL term that the
+  # latent loss path does not compute. Both reward arms use the same setting.
+  kl_beta: 0.0
   bf16: true
   quantization: 4bit
   logging_steps: 1
@@ -113,8 +116,11 @@ grpo:
 
 latent:
   enabled: true
-  latent_steps: 12
-  roles: [din_sql, dail_sql, chess, chase_sql, din_sql, dail_sql, chess, chase_sql, consensus]
+  latent_steps: 2
+  # Retrieval is external and appears once in the prompt. Execution feedback,
+  # revision and verification are deferred to GRPO rather than represented as
+  # latent roles that cannot call SQLite.
+  roles: [schema_linker, candidate_generator, consensus]
   align: soft_embed   # reverted: raw hidden-state feedback (identity) produced degenerate
                        # token-soup output at eval, consistent with this codebase's own
                        # pre-existing docstring warning that identity mode is OOD (LatentMAS).

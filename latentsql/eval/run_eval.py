@@ -86,6 +86,8 @@ def eval_student(
     progress: bool = True,
     spec: Any = None,
     stream_path: Optional[str] = None,
+    retrieval_cfg: Any = None,
+    retrieval_cache_dir: Optional[str] = None,
 ) -> List[Prediction]:
     """Run the internalised student over ``examples``.
 
@@ -130,8 +132,19 @@ def eval_student(
 
     preds: List[Prediction] = []
     for i, ex in enumerate(examples):
+        retrieval_t0 = time.time()
+        retrieved_values: List[str] = []
+        if retrieval_cfg is not None:
+            from ..db.value_index import retrieve_value_hints
+
+            retrieved_values = retrieve_value_hints(
+                ex.db_path, ex.db_id, ex.question, ex.evidence,
+                cfg=retrieval_cfg, cache_dir=retrieval_cache_dir,
+            )
+        retrieval_latency = time.time() - retrieval_t0
         sp = student_prompt(
-            schema=_render_schema_for(ex), question=ex.question, evidence=ex.evidence
+            schema=_render_schema_for(ex), question=ex.question, evidence=ex.evidence,
+            value_hints="\n".join(f"- {value}" for value in retrieved_values),
         )
         t0 = time.time()
         oom_msg = None
@@ -187,13 +200,20 @@ def eval_student(
                     n_out = int(new_ids.shape[0])
                     extra = {}
 
+            model_latency = time.time() - t0
+            extra.update({
+                "retrieved_values": retrieved_values,
+                "retrieval_latency_s": round(retrieval_latency, 6),
+                "model_latency_s": round(model_latency, 6),
+            })
+
             pred = Prediction(
                 qid=ex.qid, db_id=ex.db_id, db_path=ex.db_path, question=ex.question,
                 gold_sql=ex.gold_sql,
                 pred_sql=extract_final_sql(text) or extract_sql(text),
                 difficulty=ex.difficulty, dataset=getattr(ex, "dataset", ""),
                 prompt_tokens=n_in, completion_tokens=n_out,
-                latency_s=round(time.time() - t0, 3),
+                latency_s=round(retrieval_latency + model_latency, 3),
                 raw_output=text[:4000],
                 extra=extra,
             )
@@ -224,8 +244,12 @@ def eval_student(
                 qid=ex.qid, db_id=ex.db_id, db_path=ex.db_path, question=ex.question,
                 gold_sql=ex.gold_sql, pred_sql=None, difficulty=ex.difficulty,
                 dataset=getattr(ex, "dataset", ""),
-                latency_s=round(time.time() - t0, 3),
-                raw_output="", extra={"oom": True},
+                latency_s=round(retrieval_latency + time.time() - t0, 3),
+                raw_output="", extra={
+                    "oom": True,
+                    "retrieved_values": retrieved_values,
+                    "retrieval_latency_s": round(retrieval_latency, 6),
+                },
             )
 
         preds.append(pred)
@@ -277,6 +301,9 @@ def run(
             temperature=cfg.eval.temperature,
             mode=("latent" if method == "latent" else "student"),
             latent_cfg=cfg.latent,
+            retrieval_cfg=cfg.mas,
+            retrieval_cache_dir=(os.path.join(cache_dir, "value_indexes")
+                                 if cache_dir else None),
             **kw,
         )
     score_predictions(preds, timeout=cfg.mas.execution_timeout, compute_ves=compute_ves)

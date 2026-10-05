@@ -19,7 +19,7 @@ from latentsql.config import load_config
 from latentsql.data.synthetic import load_synthetic
 from latentsql.db.execute import execute_sql, execution_accuracy, gold_is_ordered, is_read_only
 from latentsql.db.schema import load_schema, render_schema
-from latentsql.db.value_index import ValueIndex
+from latentsql.db.value_index import ValueIndex, extract_value_keywords, retrieve_value_hints
 from latentsql.distill.rewards import RewardSchedule, group_advantages
 from latentsql.mas.agents import mask_question, query_skeleton, _group_by_execution
 from latentsql.mas.trace import (
@@ -137,6 +137,83 @@ class TestValueIndex(unittest.TestCase):
         cols = {c for _t, c, _v in idx.lsh.entries}
         self.assertNotIn("capacity", cols)
         self.assertIn("name", cols)
+
+    def test_external_retrieval_is_deterministic_and_finds_values(self):
+        keywords = extract_value_keywords("Which singers are from France?")
+        self.assertIn("France", keywords)
+        cfg = load_config().mas
+        cache = tempfile.mkdtemp(prefix="latentsql_values_")
+        first = retrieve_value_hints(
+            _DB, "concert_singer", "Which singers are from France?",
+            cfg=cfg, cache_dir=cache,
+        )
+        second = retrieve_value_hints(
+            _DB, "concert_singer", "Which singers are from France?",
+            cfg=cfg, cache_dir=cache,
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(any("France" in hint for hint in first), first)
+
+    def test_grpo_rebuilds_prompt_with_external_retrieval_once(self):
+        from types import SimpleNamespace
+        from latentsql.distill.grpo import tasks_from_records
+
+        record = SimpleNamespace(
+            qid="q", db_id="concert_singer", db_path=_DB,
+            question="Which singers are from France?", evidence="",
+            gold_sql="SELECT name FROM singer WHERE country = 'France'",
+            system="old", prompt="Retrieved values:\n- bogus.old = 'leak'",
+        )
+        task = tasks_from_records(
+            [record], retrieval_cfg=load_config().mas,
+            cache_dir=tempfile.mkdtemp(prefix="latentsql_values_"),
+        )[0]
+        self.assertEqual(task.prompt.count("Retrieved values:"), 1)
+        self.assertIn("France", task.prompt)
+        self.assertNotIn("bogus.old", task.prompt)
+
+    def test_latent_curriculum_keeps_only_two_internalisable_roles(self):
+        from latentsql.distill.latent_sft import chess_step_turns_for
+
+        trace = DebateTrace(
+            schema_links="Tables: singer\nColumns: singer.name, singer.country",
+            difficulty_class="SIMPLE",
+            turns=[AgentTurn(
+                "chess", 0, "Filter singer by country.",
+                "SELECT name FROM singer WHERE country = 'France'",
+                exec_ok=True, exec_preview="name\n('Alice',)", correct=True,
+            )],
+            consensus_sql="SELECT name FROM singer WHERE country = 'France'",
+            gold_sql="SELECT name FROM singer WHERE country = 'France'",
+            meta={"selector": "unit_test", "db_path": _DB},
+        )
+        roles = ["schema_linker", "candidate_generator", "consensus"]
+        turns = chess_step_turns_for(trace, roles)
+        self.assertIsNotNone(turns)
+        self.assertEqual(len(turns), 2)
+        self.assertFalse(any("information_retriever" in turn for turn in turns))
+        self.assertNotIn("<|exec|>", turns[-1])
+        self.assertIn("Training-only execution outcomes", turns[-1])
+        self.assertIn("Rejected one-edit mutant", turns[-1])
+        self.assertIn("Outcome: valid", turns[-1])
+        self.assertEqual(turns, chess_step_turns_for(trace, roles))
+
+        trace.turns[0].correct = False
+        self.assertIsNone(chess_step_turns_for(trace, roles))
+
+    def test_coconut_stage_one_supervises_candidate_trace_before_replacement(self):
+        from latentsql.distill.latent_sft import _explicit_curriculum_turns
+
+        roles = ["schema_linker", "candidate_generator", "consensus"]
+        turns = [
+            "<|agent schema_linker|>schema<|/agent|>",
+            "<|agent candidate_generator|>Outcome: runtime_error\n"
+            "Outcome: valid — EX=1<|/agent|>",
+        ]
+        self.assertEqual(_explicit_curriculum_turns(turns, roles, 1), {1: turns[1]})
+        self.assertEqual(_explicit_curriculum_turns(turns, roles, 2), {})
+        with self.assertRaises(ValueError):
+            _explicit_curriculum_turns(turns[:1], roles, 1)
 
 
 class TestTrace(unittest.TestCase):

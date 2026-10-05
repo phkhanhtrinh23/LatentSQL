@@ -54,27 +54,60 @@ class GRPOTask:
     qid: str = ""
 
 
-def tasks_from_records(records: Sequence[Any]) -> List[GRPOTask]:
+def _external_prompt(record: Any, schema: str, retrieval_cfg: Any,
+                     cache_dir: Optional[str]) -> Dict[str, str]:
+    """Construct the same externally retrieved student prompt in every phase."""
+    from ..db.value_index import retrieve_value_hints
+
+    values = retrieve_value_hints(
+        getattr(record, "db_path", ""), getattr(record, "db_id", ""),
+        getattr(record, "question", ""), getattr(record, "evidence", ""),
+        cfg=retrieval_cfg, cache_dir=cache_dir,
+    )
+    return student_prompt(
+        schema=schema,
+        question=getattr(record, "question", ""),
+        evidence=getattr(record, "evidence", ""),
+        value_hints="\n".join(f"- {value}" for value in values),
+    )
+
+
+def tasks_from_records(records: Sequence[Any], retrieval_cfg: Any = None,
+                       cache_dir: Optional[str] = None) -> List[GRPOTask]:
     out = []
     for r in records:
         if not (getattr(r, "db_path", "") and getattr(r, "gold_sql", "")):
             continue
+        if retrieval_cfg is not None:
+            from ..db.schema import load_schema_cached, render_schema
+
+            schema = render_schema(
+                load_schema_cached(r.db_path, getattr(r, "db_id", "")), style="code"
+            )
+            sp = _external_prompt(r, schema, retrieval_cfg, cache_dir)
+            system, prompt = sp["system"], sp["user"]
+        else:
+            system, prompt = r.system, r.prompt
         out.append(
             GRPOTask(
-                system=r.system, prompt=r.prompt, db_path=r.db_path,
+                system=system, prompt=prompt, db_path=r.db_path,
                 gold_sql=r.gold_sql, qid=r.qid,
             )
         )
     return out
 
 
-def tasks_from_examples(examples: Sequence[Any], schema_render) -> List[GRPOTask]:
+def tasks_from_examples(examples: Sequence[Any], schema_render, retrieval_cfg: Any = None,
+                        cache_dir: Optional[str] = None) -> List[GRPOTask]:
     """Build GRPO tasks straight from benchmark examples (no teacher needed)."""
     out = []
     for ex in examples:
-        sp = student_prompt(
-            schema=schema_render(ex), question=ex.question, evidence=ex.evidence
-        )
+        if retrieval_cfg is not None:
+            sp = _external_prompt(ex, schema_render(ex), retrieval_cfg, cache_dir)
+        else:
+            sp = student_prompt(
+                schema=schema_render(ex), question=ex.question, evidence=ex.evidence
+            )
         out.append(
             GRPOTask(
                 system=sp["system"], prompt=sp["user"],
