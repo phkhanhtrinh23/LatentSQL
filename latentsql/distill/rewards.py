@@ -392,18 +392,29 @@ class DebateReward:
 # --------------------------------------------------------------------------
 # GRPO advantage
 # --------------------------------------------------------------------------
-def group_advantages(rewards: Sequence[float], eps: float = 1e-4) -> List[float]:
-    """GRPO's group-relative advantage: (r - mean) / std within the group.
+def group_advantages(rewards: Sequence[float], eps: float = 1e-4,
+                     std_normalize: bool = False) -> List[float]:
+    """Group-relative advantage, Dr. GRPO style: r - mean, NOT divided by std.
 
-    With a degenerate group (all rewards equal) every advantage is 0, which is
-    correct - there is no preference signal to learn from.
+    Dividing by the group std (original GRPO) blows tiny reward gaps up to
+    full size: four correct rollouts that differ by one token of brevity
+    (std ~4e-4) got advantages of about +1.7/-0.6 - as large as a right-vs-wrong
+    group - so most steps trained "be one token shorter". Without the std a
+    one-token gap stays ~1e-3 and a right/wrong group gets ~+/-0.5
+    (Liu et al., 2025, "Understanding R1-Zero-Like Training").
+
+    With a degenerate group (all rewards equal within eps) every advantage is
+    0 - there is no preference signal to learn from.
     """
     n = len(rewards)
     if n == 0:
         return []
     mean = sum(rewards) / n
-    var = sum((r - mean) ** 2 for r in rewards) / n
-    std = math.sqrt(var)
-    if std < eps:
+    if std_normalize:
+        std = math.sqrt(sum((r - mean) ** 2 for r in rewards) / n)
+        if std < eps:
+            return [0.0] * n
+        return [(r - mean) / std for r in rewards]
+    if max(rewards) - min(rewards) < eps:
         return [0.0] * n
-    return [(r - mean) / std for r in rewards]
+    return [r - mean for r in rewards]

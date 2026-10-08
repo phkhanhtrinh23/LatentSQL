@@ -10,7 +10,7 @@ Per optimizer step:
 1. sample ``group_size`` completions for each prompt in the batch
 2. score each with :class:`~latentsql.distill.rewards.DebateReward` at the
    current ``(w_fmt, l)``
-3. advantage = (r - group mean) / group std
+3. advantage = r - group mean (Dr. GRPO: no std division)
 4. maximise the clipped policy-gradient objective with a KL penalty to the
    frozen SFT reference
 
@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..llm.hf_local import ModelBundle, render_chat
 from ..mas.prompts import student_prompt
+from ..mas.trace import T_END
 from .rewards import DebateReward, ExecutionOracle, RewardBreakdown, RewardSchedule, group_advantages
 
 
@@ -41,6 +42,8 @@ class Rollout:
     reward: RewardBreakdown
     advantage: float = 0.0
     logprob_old: Optional[Any] = None
+    #: latent roles run before <|consensus|>; 0 = all of them (the usual path)
+    depth: int = 0
 
 
 @dataclass
@@ -231,7 +234,9 @@ class GRPOTrainer:
                                             text=text, reward=rb))
             if was_training:
                 model.train()
-            advs = group_advantages([r.reward.total for r in rollouts])
+            advs = group_advantages(
+                [r.reward.total for r in rollouts],
+                std_normalize=getattr(self.cfg, "std_normalize_advantages", False))
             for r, a in zip(rollouts, advs):
                 r.advantage = a
             return rollouts
@@ -260,7 +265,9 @@ class GRPOTrainer:
                 Rollout(prompt_ids=prompt_ids, completion_ids=comp_ids, text=comp_text, reward=rb)
             )
 
-        advs = group_advantages([r.reward.total for r in rollouts])
+        advs = group_advantages(
+                [r.reward.total for r in rollouts],
+                std_normalize=getattr(self.cfg, "std_normalize_advantages", False))
         for r, a in zip(rollouts, advs):
             r.advantage = a
         return rollouts
@@ -297,114 +304,146 @@ class GRPOTrainer:
                                             text=text, reward=rb))
                 if was_training:
                     model.train()
-                advs = group_advantages([r.reward.total for r in rollouts])
+                advs = group_advantages(
+                [r.reward.total for r in rollouts],
+                std_normalize=getattr(self.cfg, "std_normalize_advantages", False))
                 for r, a in zip(rollouts, advs):
                     r.advantage = a
                 return rollouts
-            for _ in range(max(1, self.cfg.group_size)):
-                past = _clone_cache(past0)
-                attn = attn0.clone()
-                logits = logits0.clone()
-                ids: List[int] = []
-                for _t in range(self.cfg.max_new_tokens):
-                    if self.cfg.temperature and self.cfg.temperature > 0:
-                        probs = torch.softmax(logits.float() / self.cfg.temperature, dim=-1)
-                        nxt = int(torch.multinomial(probs, 1).item())
-                    else:
-                        nxt = int(logits.argmax(-1).item())
-                    if nxt == tok.eos_token_id:
-                        break
-                    ids.append(nxt)
-                    step_ids = torch.tensor([[nxt]], device=self.bundle.device)
-                    attn = torch.cat(
-                        [attn, torch.ones(1, 1, dtype=attn.dtype, device=attn.device)], dim=-1
+            n_roles = sum(1 for r in self.latent.cfg.roles if r != "consensus")
+            # Per-role credit: besides the usual full-depth group, sample the
+            # same number of rollouts that stop after each earlier role and go
+            # straight to <|consensus|> (what scripts/07_probe_latent.py forces).
+            # All depths share one advantage baseline, so an early answer that
+            # beats the full-depth one pushes the later roles' latents down.
+            depths = [n_roles]
+            if getattr(self.cfg, "role_credit", False):
+                depths += list(range(1, n_roles))
+            for depth in depths:
+                if depth != n_roles:
+                    past0, attn0, logits0, _aux0, _txt0 = self.latent.build_prefix(
+                        task.system, task.prompt, n_latent_roles=depth
                     )
-                    out = model(input_ids=step_ids, past_key_values=past,
-                                attention_mask=attn, use_cache=True)
-                    past, logits = out.past_key_values, out.logits[:, -1, :]
-                text = tok.decode(ids, skip_special_tokens=True)
-                rb = self.reward_fn(text, ids, task.db_path, task.gold_sql, step)
-                rollouts.append(Rollout(prompt_ids=[], completion_ids=ids,
-                                        text=text, reward=rb))
+                for _ in range(max(1, self.cfg.group_size)):
+                    rollouts.append(self._decode_latent_rollout(
+                        task, step, past0, attn0, logits0, depth
+                    ))
         if was_training:
             model.train()
-        advs = group_advantages([r.reward.total for r in rollouts])
+        advs = group_advantages(
+                [r.reward.total for r in rollouts],
+                std_normalize=getattr(self.cfg, "std_normalize_advantages", False))
         for r, a in zip(rollouts, advs):
             r.advantage = a
         return rollouts
 
+    def _decode_latent_rollout(self, task: GRPOTask, step: int, past0: Any,
+                               attn0: Any, logits0: Any, depth: int) -> Rollout:
+        """Sample one SQL completion from a latent prefix and score it."""
+        import torch
+
+        tok, model = self.bundle.tokenizer, self.bundle.model
+        past = _clone_cache(past0)
+        attn = attn0.clone()
+        logits = logits0.clone()
+        ids: List[int] = []
+        for _t in range(self.cfg.max_new_tokens):
+            if self.cfg.temperature and self.cfg.temperature > 0:
+                probs = torch.softmax(logits.float() / self.cfg.temperature, dim=-1)
+                nxt = int(torch.multinomial(probs, 1).item())
+            else:
+                nxt = int(logits.argmax(-1).item())
+            if nxt == tok.eos_token_id:
+                break
+            ids.append(nxt)
+            # T_END ("<|endofdebate|>") is never registered as a real
+            # tokenizer special token (see mas/trace.py) - it is plain
+            # text the model is trained to *write*, not a token id the
+            # bare `nxt == eos_token_id` check above can ever catch.
+            # A degenerate rollout that never predicts the literal EOS
+            # token - the stage-4-collapse failure mode documented
+            # elsewhere in this project, looping schema-linker prose
+            # instead of answering - would otherwise run all the way
+            # to max_new_tokens on every single occurrence, which is
+            # what was spiking memory during GRPO rollout sampling:
+            # group_size independent temperature>0 samples per prompt
+            # make that far likelier to occur than it is at eval's
+            # temperature=0, n=30 greedy decode. Checking for a
+            # well-formed close explicitly bounds the common case
+            # (real SQL answers are ~50 tokens, see RESULTS.md) without
+            # relying on the model also emitting the tokenizer's own
+            # EOS afterward.
+            if T_END in tok.decode(ids, skip_special_tokens=False):
+                break
+            step_ids = torch.tensor([[nxt]], device=self.bundle.device)
+            attn = torch.cat(
+                [attn, torch.ones(1, 1, dtype=attn.dtype, device=attn.device)], dim=-1
+            )
+            out = model(input_ids=step_ids, past_key_values=past,
+                        attention_mask=attn, use_cache=True)
+            past, logits = out.past_key_values, out.logits[:, -1, :]
+        else:
+            # the for-loop ran to max_new_tokens without any `break`
+            # firing (neither eos_token_id nor T_END) - a genuinely
+            # non-terminating rollout, not merely a long-but-valid one.
+            # Surfaced explicitly rather than silently eating the
+            # worst-case memory cost: see Part IX of the proof doc
+            # (the stage-4 collapse) for the same failure pattern -
+            # a model reverting to its base prior and looping prose
+            # that never reaches a closing tag at all.
+            preview = tok.decode(ids[-60:], skip_special_tokens=True)
+            print(f"[grpo] qid={task.qid}: rollout hit max_new_tokens="
+                  f"{self.cfg.max_new_tokens} without EOS or T_END - "
+                  f"tail: {preview!r}", flush=True)
+        text = tok.decode(ids, skip_special_tokens=True)
+        rb = self.reward_fn(text, ids, task.db_path, task.gold_sql, step)
+        return Rollout(prompt_ids=[], completion_ids=ids, text=text,
+                       reward=rb, depth=depth)
+
     def _loss_for_latent(self, rollouts: Sequence[Rollout], ref_model, scale: float):
         """GRPO loss whose gradient flows through the latent debate steps."""
-        import torch
-        import torch.nn.functional as F
-
         active = [r for r in rollouts if abs(r.advantage) > 1e-8 and r.completion_ids]
         if not active:
             return None
-        task = self._cur_task
-
-        # The whole computation - latent prefix AND the completion forward that
-        # consumes its cache - has to run uncheckpointed. Checkpointing forces
-        # use_cache=False, so the cache the prefix returns is ignored and the
-        # attention mask then describes memory that is not there. Suspending it
-        # only inside build_prefix is not enough: the completion forward runs
-        # after it returns.
-        model = self.bundle.model
-        ckpt = bool(getattr(model, "is_gradient_checkpointing", False))
-        prev_use_cache = getattr(model.config, "use_cache", True)
-        if ckpt:
-            model.gradient_checkpointing_disable()
-        model.config.use_cache = True
-        try:
-            return self._latent_loss_inner(active, task, scale)
-        finally:
-            if ckpt:
-                model.gradient_checkpointing_enable()
-            model.config.use_cache = prev_use_cache
+        return self._latent_loss_inner(active, self._cur_task, scale)
 
     def _latent_loss_inner(self, active, task, scale: float):
-        import torch
-        import torch.nn.functional as F
+        """Score each rollout with the latent SFT objective's own computation.
 
+        log pi(completion | prompt, latent roles) is computed by
+        ``latent_sft._coconut_sequence_loss`` - the exact function the latent
+        SFT stage trains with - on the sequence
+        ``prompt || tag(r1) . . || ... || <|consensus|> || completion``, with
+        only the completion tokens supervised. That function runs every
+        forward with ``use_cache=False``, so HF's per-layer gradient
+        checkpointing stays on and backward holds one decoder layer's
+        activations at a time. The previous implementation rebuilt the prefix
+        through a KV cache instead, which forced per-layer checkpointing off
+        and recomputed the whole prompt prefill as one checkpoint block during
+        backward - all 28 layers' activations over the full prompt at once,
+        which is what OOMed GRPO while the same model trained fine in SFT.
+        """
+        import torch
+
+        from .latent_sft import _coconut_sequence_loss
+
+        roles = list(self.latent.cfg.roles)
+        n_latent_roles = sum(1 for r in roles if r != "consensus")
+        rec = {"system": task.system, "prompt": task.prompt}
         denom = float(max(1, sum(len(r.completion_ids) for r in active)))
         total = 0.0
 
         for r in active:
-            # rebuild the latent prefix WITH grad: this is the path the policy
-            # is actually optimised through
-            past, attn, first_logits, _aux, _txt = self.latent.build_prefix(
-                task.system, task.prompt, grad=True
+            depth = r.depth or n_latent_roles
+            mean_nll, n_tok, _n_roles, _probe = _coconut_sequence_loss(
+                self.latent, rec, depth, r.completion_ids,
+                skip_explicit_roles=depth < n_latent_roles,
             )
-            ids = torch.tensor([r.completion_ids], device=self.bundle.device)
-            first_lp = F.log_softmax(first_logits.float(), dim=-1)[0, r.completion_ids[0]]
-            terms = [first_lp]
-            if len(r.completion_ids) > 1:
-                attn2 = torch.cat(
-                    [attn, torch.ones(1, ids.shape[1] - 1, dtype=attn.dtype,
-                                      device=attn.device)], dim=-1
-                )
-                out = self.bundle.model(input_ids=ids[:, :-1], past_key_values=past,
-                                        attention_mask=attn2, use_cache=False)
-                logits, tgt = out.logits, ids[:, 1:]
-                # Upcasting the whole completion to fp32 in one shot is what
-                # OOMs here: [1, ~2560, 152936] fp32 is ~1.6GB, on top of the
-                # 96 uncheckpointed latent steps already holding activations
-                # for backward. Chunk over sequence positions, same pattern as
-                # _loss_for and dpo.py's _seq_logprob - autograd stitches the
-                # blocks back together, so the gradient is unchanged.
-                parts = []
-                for i in range(0, logits.shape[1], _LOGP_CHUNK):
-                    block = F.log_softmax(logits[:, i : i + _LOGP_CHUNK, :].float(), dim=-1)
-                    tb = tgt[:, i : i + _LOGP_CHUNK]
-                    parts.append(block.gather(-1, tb.unsqueeze(-1)).squeeze(-1))
-                terms.append(torch.cat(parts, dim=1).sum())
-                del out, logits
-            token_logp = torch.stack([x.reshape(()) if x.dim() == 0 else x.sum()
-                                      for x in terms]).sum()
+            token_logp = -mean_nll * n_tok
             loss = -(r.advantage * token_logp) / denom
             (loss * scale).backward()
             total += float(loss.detach())
-            del past, attn, first_logits
+            del mean_nll, token_logp, loss
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return total
@@ -542,6 +581,10 @@ class GRPOTrainer:
             batch_brevity, batch_spurious = [], []
             batch_spurious_failures = []
             batch_std, batch_live = [], []
+            # per-role credit diagnostics: EX of early-consensus vs full-depth
+            # rollouts, and how often each depth beat the other on a question
+            batch_early_ex, batch_full_ex = [], []
+            early_better, full_better = 0, 0
             for ti in take:
                 self._cur_task = tasks[ti]
                 rollouts = self.sample_group(tasks[ti], opt_step)
@@ -567,6 +610,15 @@ class GRPOTrainer:
                     for r in rollouts
                 ]
                 gen_tokens_total += sum(len(r.completion_ids) for r in rollouts)
+                if any(r.depth for r in rollouts):
+                    top = max(r.depth for r in rollouts)
+                    full = [float(r.reward.r_clip >= 1.0) for r in rollouts if r.depth == top]
+                    early = [float(r.reward.r_clip >= 1.0) for r in rollouts if r.depth != top]
+                    batch_full_ex += full
+                    batch_early_ex += early
+                    if early:
+                        early_better += int(_mean(early) > _mean(full))
+                        full_better += int(_mean(full) > _mean(early))
 
                 # the loss backwards chunk by chunk inside _loss_for, so a
                 # long BIRD group never has to fit in memory all at once
@@ -604,6 +656,12 @@ class GRPOTrainer:
                         #: fraction of rollouts that actually contributed a
                         #: gradient this step
                         "adv_nonzero_frac": _mean(batch_live),
+                        **({
+                            "early_ex_mean": _mean(batch_early_ex),
+                            "full_ex_mean": _mean(batch_full_ex),
+                            "early_better_count": early_better,
+                            "full_better_count": full_better,
+                        } if batch_early_ex else {}),
                         "gen_tokens_total": gen_tokens_total,
                         "n_executions": self.oracle.n_exec,
                         "elapsed_s": round(time.time() - t0, 1),
@@ -635,7 +693,7 @@ class GRPOTrainer:
         if log_path:
             os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
             with open(log_path, "w", encoding="utf-8") as fh:
-                json.dump(result, fh, indent=2)
+                json.dump(result, fh, indent=4)
         return result
 
     def save(self, output_dir: str) -> None:

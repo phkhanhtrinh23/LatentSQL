@@ -2545,6 +2545,55 @@ Part~\ref{part:grpo} measured $+6.67$ EX from GRPO. If the latent step never dis
 
 \textbf{From the one place that still rolls: the SQL decode.} After the shared latent prefix, this project's own \texttt{\_sample\_group\_latent} (l.276--291) samples the actual SQL tokens with $\texttt{torch.multinomial}$ at $\texttt{temperature=1.0}$ --- a real die roll, every rollout, every token. Two rollouts starting from the \emph{identical} latent state can still decode to two \emph{different} queries, one correct and one not, and Fact 2 (\S\ref{sec:grpo-shared-latent}) needs exactly that kind of disagreement to produce a nonzero gradient. So the group's advantage was not forced to zero the way Jung's Coconut baseline was --- but the resulting gradient could only ever be shaped like ``write better SQL from this plan'', never ``pick a better plan.'' This is a plausible mechanism consistent with the measured numbers, not a controlled test of it: no run at \texttt{temperature=0} has been made for comparison.
 
+\subsection{How SQL reward still changes the shared latent trajectory}
+\label{sec:shared-latent-chain-rule}
+
+``Shared'' does not mean ``frozen.'' It means that every rollout sees the same latent value before the update. During the update, \texttt{\_latent\_loss\_inner} rebuilds that value with \texttt{build\_prefix(..., grad=True)}. Autograd can therefore follow the SQL loss backward through the whole latent computation.
+
+Write the deterministic latent prefix as $z_\theta=\Phi_\theta(x)$. The probability of a sampled SQL query is then a composition of two parameterised maps:
+\[
+p_\theta(y\mid x)=\pi_\theta\!\left(y\mid x,z_\theta\right)
+=\pi_\theta\!\left(y\mid x,\Phi_\theta(x)\right).
+\]
+For a group of sampled queries, the implemented latent-path loss is:
+\[
+\mathcal L_{\mathrm{latent}}(\theta)
+=-\frac{1}{N_{\mathrm{tok}}}\sum_{i=1}^{G}A_i
+\log\pi_\theta\!\left(y_i\mid x,\Phi_\theta(x)\right).
+\tag{10.4}
+\]
+The execution engine is not differentiable. GRPO does not differentiate through it. The engine only produces the scalar advantage $A_i$. The differentiable object is the log probability of the sampled SQL. Applying the chain rule gives two gradient paths:
+\[
+\nabla_\theta\log\pi_\theta(y_i\mid x,\Phi_\theta(x))
+=
+\left.\frac{\partial\log\pi_\theta(y_i\mid x,z)}{\partial\theta}\right|_{z=\Phi_\theta(x)}
++
+\left.\nabla_z\log\pi_\theta(y_i\mid x,z)\right|_{z=\Phi_\theta(x)}^{\!\top}
+\nabla_\theta\Phi_\theta(x).
+\tag{10.5}
+\]
+The first term changes the SQL decoder directly. The second term changes the parameters that created the latent prefix. A positive advantage moves those parameters toward a state that makes the rewarded SQL more likely. A negative advantage moves them away from a state that supports the penalised SQL. The stored prefix from the completed rollout does not change. The same question produces a new prefix after the parameter update.
+
+\begin{proposition}[zero-mean advantages need not cancel the latent gradient]
+Suppose two SQL rollouts share one latent prefix $z$. Let their advantages be $A_+=a$ and $A_-=-a$, where $a>0$. The gradient with respect to the shared prefix is:
+\[
+\nabla_z\mathcal L_{\mathrm{latent}}
+=-\frac{a}{N_{\mathrm{tok}}}
+\left(
+\nabla_z\log\pi_\theta(y_+\mid x,z)
+-\nabla_z\log\pi_\theta(y_-\mid x,z)
+\right).
+\tag{10.6}
+\]
+It is non-zero whenever the two SQL queries have different score gradients at $z$.
+\end{proposition}
+
+\begin{proof}
+The two advantages sum to zero. Their multipliers cancel only when the vectors they multiply are equal. Different SQL sequences generally have different token log probabilities and different score gradients. Substituting $A_+=a$ and $A_-=-a$ into (10.4) gives (10.6). Therefore zero mean reward advantage does not imply zero latent-state gradient.
+\end{proof}
+
+This proves the limited claim precisely. Current GRPO can reshape one deterministic latent computation so that it supports rewarded SQL more strongly. It still cannot learn that one latent plan is better than another for the same question because the group contains no second latent plan.
+
 \section{A separate question: did SFT even need to \emph{create} the subspaces?}
 
 One more complication, about Part~\ref{part:activation} rather than about GRPO. IMAD's own number: base-model steering AUC $= 0.802$, not $\approx 0.5$ (chance). That is already well above chance \emph{before} any internalisation. Two 2026 papers, read for this section, suggest why that might be:

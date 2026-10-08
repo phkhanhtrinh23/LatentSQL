@@ -98,6 +98,9 @@ for ARM in binary spurious; do
       --epochs "$GRPO_EPOCHS" \
       --latent-steps 2 \
       --latent-role-list schema_linker,candidate_generator,consensus \
+      --no-spec-decode \
+      --max-new-tokens 200 \
+      --max-prompt-chars 4000 \
       "${EXTRA[@]}" \
       2>&1 | tee "$LOGS/grpo_$ARM.log"
   else

@@ -169,7 +169,7 @@ def main() -> int:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as fh:
-        json.dump(summary, fh, indent=2)
+        json.dump(summary, fh, indent=4)
 
     lines = [
         "# True execution accuracy",

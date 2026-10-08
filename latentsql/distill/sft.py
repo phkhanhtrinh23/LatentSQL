@@ -290,7 +290,7 @@ def train_sft(
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
+            json.dump(result, fh, indent=4)
     return result
 
 
@@ -302,4 +302,4 @@ def save_student(bundle: ModelBundle, output_dir: str) -> None:
     base = getattr(getattr(bundle.model, "peft_config", {}).get("default", None),
                    "base_model_name_or_path", None)
     with open(os.path.join(output_dir, "latentsql_student.json"), "w", encoding="utf-8") as fh:
-        json.dump({"base_model": base or bundle.name, "is_peft": base is not None}, fh, indent=2)
+        json.dump({"base_model": base or bundle.name, "is_peft": base is not None}, fh, indent=4)

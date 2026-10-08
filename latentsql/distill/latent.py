@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..llm.hf_local import ModelBundle, render_chat
-from ..mas.trace import T_CONSENSUS_OPEN, agent_tag, extract_final_sql
+from ..mas.trace import T_CONSENSUS_OPEN, T_END, agent_tag, extract_final_sql
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +383,13 @@ class LatentReasoner:
                         tgt = torch.tensor(ids[1:], device=step_logits.device)
                         lp = step_logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                         gen_terms.append(-lp.mean())
-                    cur_logits = out.logits[:, -1, :]
+                # Always the prediction after the text just fed, supervised or
+                # not. Updating it only under `supervise` returned the caller's
+                # stale prev_logits instead - so after feeding <|consensus|>,
+                # build_prefix/generate sampled the first SQL token from the
+                # last *latent* position's prediction, before <|consensus|> was
+                # read, while SFT trains that token from the consensus position.
+                cur_logits = out.logits[:, -1, :]
             gen_loss = (torch.stack(gen_terms).mean() if gen_terms
                        else torch.zeros((), device=dummy.device, dtype=torch.float32))
             return last_hidden, gen_loss, cur_logits
@@ -684,6 +690,14 @@ class LatentReasoner:
                 if tid == tok.eos_token_id:
                     break
                 out_ids.append(tid)
+                # T_END is plain text, never a registered tokenizer special
+                # token (mas/trace.py), so the bare eos_token_id check above
+                # cannot catch it. Without this, a rollout that degenerates
+                # into repeating prose instead of answering runs all the way
+                # to max_new_tokens before stopping - see the identical fix
+                # and its rationale in grpo.py::_sample_group_latent.
+                if T_END in tok.decode(out_ids, skip_special_tokens=False):
+                    break
                 inputs_embeds = model.get_input_embeddings()(nxt)
                 attention_mask = torch.cat(
                     [attention_mask, torch.ones_like(attention_mask[:, :1])], dim=-1

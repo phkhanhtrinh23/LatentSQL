@@ -182,7 +182,8 @@ def _explicit_curriculum_turns(role_turns: Sequence[str], roles: Sequence[str],
 def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: int,
                            target_ids: Sequence[int],
                            sql_ready_role: Optional[int] = None,
-                           sql_ready_tokens: int = 16) -> tuple:
+                           sql_ready_tokens: int = 16,
+                           skip_explicit_roles: bool = False) -> tuple:
     """COCONUT curriculum loss, without the inference-time KV cache.
 
     COCONUT trains by repeatedly running the model on the current sequence to
@@ -193,6 +194,11 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
     separate from ``LatentReasoner.build_prefix``: that method builds the
     inference/GRPO KV prefix, while this method follows the paper's memory-safer
     training shape using ``use_cache=False``.
+
+    ``skip_explicit_roles`` drops the roles after the first ``n_latent_roles``
+    instead of feeding them as text, jumping straight to ``<|consensus|>`` -
+    the sequence ``LatentReasoner.build_prefix(n_latent_roles=d)`` samples
+    from. GRPO's per-role credit scores its early-consensus rollouts with it.
     """
     import torch
 
@@ -221,11 +227,11 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
         add_token_ids(tok(text, add_special_tokens=False)["input_ids"], supervise)
 
     add_text(chat, supervise=False)
-    explicit_turns = _explicit_curriculum_turns(
+    explicit_turns = [] if skip_explicit_roles else _explicit_curriculum_turns(
         list(rec.get("role_turns") or []), cfg.roles, n_latent_roles
     )
     for idx, role in enumerate(cfg.roles):
-        if role == "consensus":
+        if role == "consensus" or (skip_explicit_roles and idx >= n_latent_roles):
             break
         if idx < n_latent_roles:
             add_text(agent_tag(role) + "\n", supervise=False)
@@ -780,5 +786,5 @@ def train_latent_sft(
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)) or ".", exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
+            json.dump(result, fh, indent=4)
     return result

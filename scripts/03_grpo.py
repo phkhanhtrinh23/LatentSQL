@@ -65,6 +65,10 @@ def main() -> int:
     ap.add_argument("--spec-k", type=int, default=None)
     ap.add_argument("--no-spec-decode", action="store_true",
                     help="disable speculative decoding for this run")
+    ap.add_argument("--role-credit", action="store_true",
+                    help="also reward SQL decoded right after each earlier latent role")
+    ap.add_argument("--std-adv", action="store_true",
+                    help="original GRPO (r-mean)/std advantages instead of Dr. GRPO r-mean")
     ap.add_argument(
         "--from-examples", default=None,
         help="build GRPO prompts straight from a benchmark (bird|spider|synthetic) "
@@ -127,6 +131,12 @@ def main() -> int:
         cfg.grpo.spec_k = args.spec_k
     if args.no_spec_decode:
         cfg.grpo.spec_decode = False
+    if args.std_adv:
+        cfg.grpo.std_normalize_advantages = True
+    if args.role_credit:
+        if cfg.grpo.spec_decode:
+            ap.error("--role-credit is not implemented for speculative decoding")
+        cfg.grpo.role_credit = True
     set_seed(cfg.grpo.seed)
 
     banner("loading tasks")
@@ -135,8 +145,17 @@ def main() -> int:
         from latentsql.distill.grpo import tasks_from_examples
         from latentsql.utils.common import resolve_examples
 
+        # Prompts here carry the full, untruncated schema, so one BIRD database
+        # can produce a ~19k-token prompt - 12x longer than anything the latent
+        # SFT corpus contains (capped at 4000 chars / 1800 tokens). The GRPO
+        # loss backpropagates through the prompt prefill, so a single such
+        # prompt OOMs the backward regardless of the memory cap. Apply the
+        # same --max-prompt-chars filter the --data branch has, over-sampling
+        # so --limit is still met after the long prompts are dropped.
+        want = args.limit
+        fetch = want * 2 if (want and args.max_prompt_chars) else want
         examples, used = resolve_examples(
-            cfg, dataset=args.from_examples, limit=args.limit, split="train"
+            cfg, dataset=args.from_examples, limit=fetch, split="train"
         )
 
         def _render(ex):
@@ -148,7 +167,14 @@ def main() -> int:
             examples, _render, retrieval_cfg=cfg.mas,
             cache_dir=os.path.join(cfg.paths.cache_dir, "value_indexes"),
         )
-        print(f"no-teacher ablation: prompts built directly from {used}")
+        if args.max_prompt_chars:
+            before = len(tasks)
+            tasks = [t for t in tasks if len(t.prompt) <= args.max_prompt_chars]
+            print(f"prompt length filter kept {len(tasks)}/{before} "
+                  f"(max_prompt_chars={args.max_prompt_chars})")
+        if want:
+            tasks = tasks[:want]
+        print(f"no-teacher ablation: {len(tasks)} prompts built directly from {used}")
     else:
         records = load_records(args.data)
         if args.max_prompt_chars:

@@ -1231,7 +1231,7 @@ Kept — the five adapters that matter:
 |---|---|
 | `sft_7b_bf16` | SFT baseline |
 | `chess_coconut_sql_direct/latent_sft` | stage-6 latent student; the 52.22% EX baseline and GRPO's starting point |
-| `chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200` | current best, 58.89% EX (section 17) |
+| `chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200` | 58.89% EX (section 17); superseded, weights deleted in section 23 |
 | `curriculum_chain_7b_bf16_multipass_fixed/latent_sft` | earlier documented arm |
 | `coconut_staged/latent_sft` | earlier documented arm |
 
@@ -1498,3 +1498,29 @@ perfectly, so it pushed the weights very little.
 The reasoning above explains why `=3` is the *correct* setting and `=4` was a
 no-op. It does not prove `=3` is what produced the +40 EX. Establishing that
 would need one more run at `lr=1e-5` with the probe switched off.
+
+## 23. Workspace cleanup (2026-10-07)
+
+`outputs/` went **11 GB → 2.8 GB**. Unlike section 19, this pass **deleted**
+files — nothing is recoverable. Every reported number survives: each run's
+`.json`/`.jsonl`/`.md`/`.log` files (predictions, eval reports, step logs) were
+kept; only adapter weights, tokenizer copies and optimizer state were removed.
+
+Kept in full:
+
+| Path | Why |
+|---|---|
+| `latent_sft_1000/chess_two_role_ex1/` | current runs: two-role latent SFT and its GRPO arms (binary, spurious, std-advantage), evals, true-EX audits |
+| `latent_sft_1000/sft_7b_bf16` | SFT base the latent run starts from |
+| `latent_sft_1000/traces/` | training data |
+| `latent_sft_1000/cache/value_indexes` | retrieval value index used at eval (slow to rebuild) |
+
+Weights deleted, results kept: `chess_coconut_sql_direct`,
+`chess_coconut_sql_direct_s4fix`, `…_grpo_spec7b_hard50_brevity_cap1200`
+(section 17's 58.89% EX, superseded by `chess_two_role_ex1` at 63–64% EX),
+`coconut_staged`, `curriculum_chain_7b_bf16_multipass_fixed`,
+`large_reward_ablation`, `pilot3` (plus its copy on `/mnt/win_d`).
+
+Deleted entirely: `chess_coconut_large_677_INVALID_retrieval_role_20261005`
+(invalid run), `chess_two_role_ex1/checkpoints` (intermediate SFT stages),
+`chess_two_role_ex1/optim_state.pt` (resume-only), `pilot3/cache`.

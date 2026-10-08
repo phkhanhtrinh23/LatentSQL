@@ -75,6 +75,8 @@ if _HAVE_SQLGLOT:
 
 _MANIFEST = "_manifest.json"
 _CACHE_VERSION = 2
+#: databases above this size get no stress instances (each one is a full copy)
+MAX_STRESS_DB_BYTES = 512 * 2**20
 
 
 # --------------------------------------------------------------------------
@@ -803,7 +805,8 @@ def _cache_key(db_path: str, gold_sql: str) -> str:
 
 def generate_stress_instances(db_path: str, gold_sql: str, cache_dir: str,
                               n: int = 5, seed: int = 0,
-                              timeout: float = 10.0) -> List[str]:
+                              timeout: float = 10.0,
+                              max_db_bytes: int = MAX_STRESS_DB_BYTES) -> List[str]:
     """Build up to ``n`` perturbed copies of ``db_path`` for ``gold_sql``.
 
     Cached on disk under ``cache_dir/<hash>/`` so repeated calls across GRPO
@@ -811,7 +814,16 @@ def generate_stress_instances(db_path: str, gold_sql: str, cache_dir: str,
     instances (filtered by Method B) are tried first; Method C fills any
     remaining slots, and is the *only* source when ``sqlglot`` is unavailable
     or the gold query has no targetable predicate or join.
+
+    Every instance is a full file copy, so a database larger than
+    ``max_db_bytes`` is skipped (returns ``[]``, i.e. no spurious check):
+    three copies of a 5 GB BIRD database filled the disk and stalled GRPO.
     """
+    try:
+        if max_db_bytes and os.path.getsize(db_path) > max_db_bytes:
+            return []
+    except OSError:
+        return []
     key = _cache_key(db_path, gold_sql)
     folder = os.path.join(cache_dir, key)
     manifest_path = os.path.join(folder, _MANIFEST)
@@ -904,5 +916,5 @@ def generate_stress_instances(db_path: str, gold_sql: str, cache_dir: str,
         "n_bootstrap": len(instances) - n_boundary - n_join,
     }
     with open(manifest_path, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh)
+        json.dump(manifest, fh, indent=4)
     return instances

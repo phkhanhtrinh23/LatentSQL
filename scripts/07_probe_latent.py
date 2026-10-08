@@ -265,7 +265,11 @@ def main() -> int:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     non_consensus_roles = [role for role in cfg.latent.roles if role != "consensus"]
-    with open(args.out, "w", encoding="utf-8") as fh:
+    # Stream one line per role while running (crash-safe), then write the
+    # human-readable indented JSON to --out and drop the stream.
+    partial = args.out + ".partial.jsonl"
+    records: list[dict] = []
+    with open(partial, "w", encoding="utf-8") as fh:
         for example_index, ex in enumerate(examples, 1):
             schema = render_schema(load_schema_cached(ex.db_path, ex.db_id), style="code")
             retrieved_values = retrieve_value_hints(
@@ -294,6 +298,7 @@ def main() -> int:
                 })
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fh.flush()
+                records.append(record)
                 previous_sql = record["decoded_sql"]
                 print(
                     f"[latent-probe] {example_index}/{len(examples)} {ex.qid} "
@@ -301,7 +306,28 @@ def main() -> int:
                     f"exec={record['execution_ok']} correct={record['execution_correct']}",
                     flush=True,
                 )
+    write_readable(records, args.out)
+    os.remove(partial)
     print(f"wrote {args.out}")
+
+
+_QUESTION_KEYS = ("qid", "dataset", "db_id", "question", "gold_sql", "retrieved_values")
+
+
+def write_readable(records: list[dict], path: str) -> None:
+    """Group per-role records by question and write them as indent=4 JSON."""
+    questions: list[dict] = []
+    by_qid: dict[str, dict] = {}
+    for rec in records:
+        qid = rec["qid"]
+        if qid not in by_qid:
+            by_qid[qid] = {k: rec.get(k) for k in _QUESTION_KEYS}
+            by_qid[qid]["roles"] = []
+            questions.append(by_qid[qid])
+        by_qid[qid]["roles"].append({k: v for k, v in rec.items() if k not in _QUESTION_KEYS})
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(questions, fh, indent=4, ensure_ascii=False)
+        fh.write("\n")
     return 0
 
 

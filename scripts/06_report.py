@@ -365,7 +365,7 @@ def main() -> int:
         fh.write(md + "\n")
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump({"teacher": teacher, "training": training, "eval": methods},
-                  fh, indent=2, default=str)
+                  fh, indent=4, default=str)
     print(md)
     print(f"\nwrote {out_dir}/report.md and report.json")
     return 0

@@ -321,6 +321,13 @@ class GRPOConfig:
     #: step, and a weak draft can be *slower* than plain decoding, so the
     #: acceptance length is logged every step.
     spec_decode: bool = False
+    #: True = original GRPO advantages (r - mean) / std; False = Dr. GRPO
+    #: r - mean. Kept only for the before/after ablation (rewards.group_advantages).
+    std_normalize_advantages: bool = False
+    #: latent path only: also sample group_size rollouts that stop after each
+    #: earlier role and jump to <|consensus|>; every depth gets the full reward
+    #: and all depths share one advantage baseline (per-role credit)
+    role_credit: bool = False
     spec_draft_model: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
     #: Iso et al. Table 4: acceptance length rises with k but realized speedup
     #: falls - k=3 was best in both their settings and k>=5 was *slower* than
@@ -418,7 +425,7 @@ class Config:
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.to_dict(), fh, indent=2)
+            json.dump(self.to_dict(), fh, indent=4)
 
 
 # --------------------------------------------------------------------------

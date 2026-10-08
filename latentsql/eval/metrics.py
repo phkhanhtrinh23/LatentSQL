@@ -163,7 +163,7 @@ def save_predictions(preds: Sequence[Prediction], path: str) -> None:
 def save_reports(reports: Sequence[EvalReport], path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump([r.to_dict() for r in reports], fh, indent=2)
+        json.dump([r.to_dict() for r in reports], fh, indent=4)
 
 
 def render_table(reports: Sequence[EvalReport]) -> str:

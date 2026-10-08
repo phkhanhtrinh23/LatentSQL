@@ -72,7 +72,7 @@ def set_seed(seed: int) -> None:
 def write_json(obj: Any, path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, indent=2, default=str)
+        json.dump(obj, fh, indent=4, default=str)
 
 
 def read_json(path: str) -> Any:

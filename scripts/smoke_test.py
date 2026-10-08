@@ -316,7 +316,7 @@ def tier1(cfg, work: str, n: int) -> Dict[str, Any]:
 
     from latentsql.distill.rewards import group_advantages
 
-    @check("GRPO group advantages normalise within a group")
+    @check("GRPO group advantages are centred within a group")
     def _adv2():
         a = group_advantages([1.0, 0.0, 0.0, 0.0])
         assert abs(sum(a)) < 1e-6, a

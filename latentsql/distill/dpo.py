@@ -282,5 +282,5 @@ def train_dpo(
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
+            json.dump(result, fh, indent=4)
     return result

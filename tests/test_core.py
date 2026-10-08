@@ -303,6 +303,16 @@ class TestRewards(unittest.TestCase):
         self.assertEqual(group_advantages([0.3] * 5), [0.0] * 5)
         self.assertEqual(group_advantages([]), [])
 
+    def test_group_advantages_do_not_amplify_tiny_gaps(self):
+        # Four correct rollouts one brevity token apart (0.2 / 200 = 0.001):
+        # std normalisation turned this into +1.73 / -0.58.
+        a = group_advantages([1.1270, 1.1260, 1.1260, 1.1260])
+        self.assertLess(max(abs(x) for x in a), 1e-3)
+        # A right/wrong group keeps a real, comparable-scale signal.
+        b = group_advantages([1.0, 0.0, 0.0, 0.0])
+        self.assertAlmostEqual(b[0], 0.75)
+        self.assertAlmostEqual(b[1], -0.25)
+
 
 class TestDailSelection(unittest.TestCase):
     def test_masking_removes_domain_words(self):
