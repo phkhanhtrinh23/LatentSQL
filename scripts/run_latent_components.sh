@@ -116,7 +116,7 @@ for MODE in static cegis; do
     EXTRA=()
     [ "$MODE" = "cegis" ] && EXTRA=(--cegis --cegis-k-max 0 --cegis-n-delta 3
       --verieql-python /home/trinh/miniconda3/envs/verieql/bin/python
-      --verieql-dir /mnt/win_d/tools/VeriEQL --verieql-bound 3 --verieql-timeout 60)
+      --verieql-dir /mnt/win_d/tools/VeriEQL --verieql-bound 2 --verieql-timeout 60)
     LATENTSQL_GPU_FRACTION=0.7 "$PY" scripts/03_grpo.py \
       --config "$CFG" --data outputs/latent_sft_1000/traces/sft.jsonl --from-examples mix \
       --sft "$BEST_DIR" --out "$OUT" --limit "$N_GRPO" --epochs 1 \

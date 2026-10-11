@@ -91,7 +91,7 @@ class CounterexamplePool:
                  budget: int = 40, timeout: float = 5.0, seed: int = 0,
                  max_db_bytes: int = MAX_STRESS_DB_BYTES,
                  verieql_python: Optional[str] = None, verieql_dir: Optional[str] = None,
-                 verieql_bound: int = 3, verieql_timeout: float = 60.0):
+                 verieql_bound: int = 2, verieql_timeout: float = 60.0):
         self.cache_dir = cache_dir
         self.verieql_python, self.verieql_dir = verieql_python, verieql_dir
         self.verieql_bound, self.verieql_timeout = int(verieql_bound), float(verieql_timeout)

@@ -70,7 +70,7 @@ def main() -> int:
                     help="python of VeriEQL's environment; with --verieql-dir enables VeriEQL "
                          "as the fallback verifier when mutation search finds nothing")
     ap.add_argument("--verieql-dir", default=None, help="VeriEQL checkout")
-    ap.add_argument("--verieql-bound", type=int, default=3, help="max rows per table")
+    ap.add_argument("--verieql-bound", type=int, default=2, help="max rows per table")
     ap.add_argument("--verieql-timeout", type=float, default=60.0, help="seconds per pair")
     ap.add_argument("--brevity-ref-tokens", type=int, default=None,
                     help="token count that receives zero brevity reward")
