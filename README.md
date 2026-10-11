@@ -1524,3 +1524,15 @@ Weights deleted, results kept: `chess_coconut_sql_direct`,
 Deleted entirely: `chess_coconut_large_677_INVALID_retrieval_role_20261005`
 (invalid run), `chess_two_role_ex1/checkpoints` (intermediate SFT stages),
 `chess_two_role_ex1/optim_state.pt` (resume-only), `pilot3/cache`.
+
+Second pass (2026-10-11), `outputs/` 7.9 GB → 3.7 GB, same rule (weights
+deleted, every `.json`/`.jsonl`/`.md`/`.log` kept; each emptied adapter dir has a
+`WEIGHTS_DELETED.txt`). The 300-question audit
+(`chess_three_role_r3/scale/true_ex/results.md`) has two-role SFT and role-credit
+GRPO best (64.3–64.7% EX, 60.3% true EX), so only those keep weights:
+
+- weights deleted: `chess_two_role_ex1/grpo_{binary,stdadv,spurious}`,
+  `chess_three_role_r3/{latent_sft,grpo_paper,scale/grpo_paper_1000}`,
+  `chess_three_role_r3/checkpoints/stage_{1,2,3}`;
+- deleted entirely: `chess_three_role_r3/optim_state.pt` (resume-only) and
+  `chess_three_role_r3/outputs/` (a stray duplicate of `cache/value_indexes`).

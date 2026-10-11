@@ -288,6 +288,7 @@ class GRPOTrainer:
         model.eval()
         rollouts: List[Rollout] = []
         with torch.no_grad():
+            self.latent.set_schema(task.db_path)
             past0, attn0, logits0, _aux0, _txt0 = self.latent.build_prefix(task.system, task.prompt)
             if self.spec is not None:
                 dp = tok(task.prompt, return_tensors="pt",
@@ -429,7 +430,7 @@ class GRPOTrainer:
 
         roles = list(self.latent.cfg.roles)
         n_latent_roles = sum(1 for r in roles if r != "consensus")
-        rec = {"system": task.system, "prompt": task.prompt}
+        rec = {"system": task.system, "prompt": task.prompt, "db_path": task.db_path}
         denom = float(max(1, sum(len(r.completion_ids) for r in active)))
         total = 0.0
 
@@ -700,6 +701,10 @@ class GRPOTrainer:
         from .sft import save_student
 
         save_student(self.bundle, output_dir)
+        if self.latent is not None:
+            # W_S / execution heads are frozen in GRPO but the adapter
+            # needs them (and the r1 aligner mode) to be evaluated
+            self.latent.save_extras(output_dir)
 
 
 def _mean(xs: Sequence[float]) -> float:

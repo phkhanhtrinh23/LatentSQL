@@ -57,6 +57,21 @@ def main() -> int:
     ap.add_argument("--w-spurious", type=float, default=None)
     ap.add_argument("--n-stress-instances", type=int, default=None)
     ap.add_argument("--cleanup-stress-cache", action="store_true")
+    ap.add_argument("--cegis", action="store_true",
+                    help="grow each question's instance pool with counterexamples found "
+                         "against the student's own spurious rollouts (paper Eq. 22; "
+                         "--reward-mode paper only)")
+    ap.add_argument("--cegis-k-max", type=int, default=0,
+                    help="pool size cap, counting the fixed stress instances; 0 = no cap")
+    ap.add_argument("--cegis-n-delta", type=int, default=3, help="rows an edit may touch")
+    ap.add_argument("--cegis-budget", type=int, default=40,
+                    help="candidate edits per mutation search")
+    ap.add_argument("--verieql-python", default=None,
+                    help="python of VeriEQL's environment; with --verieql-dir enables VeriEQL "
+                         "as the fallback verifier when mutation search finds nothing")
+    ap.add_argument("--verieql-dir", default=None, help="VeriEQL checkout")
+    ap.add_argument("--verieql-bound", type=int, default=3, help="max rows per table")
+    ap.add_argument("--verieql-timeout", type=float, default=60.0, help="seconds per pair")
     ap.add_argument("--brevity-ref-tokens", type=int, default=None,
                     help="token count that receives zero brevity reward")
     ap.add_argument("--latent-steps", type=int, default=None)
@@ -65,6 +80,8 @@ def main() -> int:
     ap.add_argument("--spec-k", type=int, default=None)
     ap.add_argument("--no-spec-decode", action="store_true",
                     help="disable speculative decoding for this run")
+    ap.add_argument("--reward-mode", choices=("weighted", "paper"), default=None,
+                    help="paper = main_latentsql.pdf Eq. (13): R_atomic + 1[EX=1](R_spur + R_brev)")
     ap.add_argument("--role-credit", action="store_true",
                     help="also reward SQL decoded right after each earlier latent role")
     ap.add_argument("--std-adv", action="store_true",
@@ -133,6 +150,8 @@ def main() -> int:
         cfg.grpo.spec_decode = False
     if args.std_adv:
         cfg.grpo.std_normalize_advantages = True
+    if args.reward_mode:
+        cfg.grpo.reward.reward_mode = args.reward_mode
     if args.role_credit:
         if cfg.grpo.spec_decode:
             ap.error("--role-credit is not implemented for speculative decoding")
@@ -287,7 +306,8 @@ def main() -> int:
     banner("GRPO")
     # the brevity reference is the generation budget: a rollout that uses the
     # whole budget scores 0, one that answers immediately scores ~1
-    if getattr(cfg.grpo.reward, "w_brevity", 0.0) > 0 and \
+    paper_reward = getattr(cfg.grpo.reward, "reward_mode", "weighted") == "paper"
+    if (paper_reward or getattr(cfg.grpo.reward, "w_brevity", 0.0) > 0) and \
             not getattr(cfg.grpo.reward, "brevity_ref_tokens", 0):
         cfg.grpo.reward.brevity_ref_tokens = cfg.grpo.max_new_tokens
 
@@ -298,6 +318,20 @@ def main() -> int:
         n_stress_instances=cfg.grpo.reward.n_stress_instances,
         cleanup_stress_cache=cfg.grpo.reward.cleanup_stress_cache,
     )
+    if args.cegis:
+        if args.reward_mode != "paper":
+            raise SystemExit("--cegis needs --reward-mode paper")
+        from latentsql.db.counterexample import CounterexamplePool
+
+        oracle.cegis = CounterexamplePool(
+            os.path.join(oracle.stress_cache_dir, "cegis"), k_max=args.cegis_k_max,
+            n_delta=args.cegis_n_delta, budget=args.cegis_budget,
+            verieql_python=args.verieql_python, verieql_dir=args.verieql_dir,
+            verieql_bound=args.verieql_bound, verieql_timeout=args.verieql_timeout,
+        )
+        print(f"[cegis] counterexample pools on (k_max={args.cegis_k_max}, "
+              f"n_delta={args.cegis_n_delta}, budget={args.cegis_budget}, "
+              f"verieql={'on' if args.verieql_python else 'off'})")
     if float(getattr(cfg.grpo.reward, "w_spurious", 0.0)) > 0:
         print(f"[spurious] w_spurious={cfg.grpo.reward.w_spurious} enabled - "
               f"up to {cfg.grpo.reward.n_stress_instances} stress instances per gold "
@@ -333,6 +367,10 @@ def main() -> int:
         from latentsql.distill.latent import LatentReasoner
 
         latent = LatentReasoner(bundle, cfg.latent)
+        if latent.extras is not None:
+            for prm in latent.extras.parameters():
+                prm.requires_grad_(False)
+            print(f"latent extras loaded: align_r1={latent.align_r1} (frozen during GRPO)")
         print(f"[latent] rollouts run {cfg.latent.latent_steps} latent steps per role "
               f"over {cfg.latent.roles}; only the query is decoded")
 
@@ -352,6 +390,17 @@ def main() -> int:
     result = trainer.train(
         tasks, ref, log_path=os.path.join(cfg.grpo.output_dir, "grpo_log.json")
     )
+    if getattr(oracle, "cegis", None) is not None:
+        pools = oracle.cegis.pools
+        st = oracle.cegis.stats
+        result["cegis"] = {**st, "questions_with_counterexamples": len(pools),
+                           "counterexamples": sum(len(v) for v in pools.values()),
+                           "largest_pool": max((len(v) for v in pools.values()), default=0),
+                           "search_seconds_per_step": round(
+                               (st["search_seconds"] + st["pool_check_seconds"])
+                               / max(1, len(result.get("history", []))), 3)}
+        print(f"[cegis] {result['cegis']}")
+        oracle.cegis.close(remove=True)
     write_json(result, os.path.join(cfg.grpo.output_dir, "grpo_result.json"))
     print(f"\nsaved internalised student to {result['output_dir']}")
     return 0

@@ -59,7 +59,11 @@ gpu_settle() {
   echo "[chess_coconut] warning: GPU still holding ${used}MiB after 120s; launching anyway" | tee -a "$LOG"
 }
 
-ROLES="schema_linker,candidate_generator,consensus"
+ROLES=${ROLES:-schema_linker,candidate_generator,consensus}
+CHAIN_FORMAT=${CHAIN_FORMAT:-chess_steps}
+# Resume inside an epoch: skip batches already applied to $OUT (first resumed
+# stage/epoch only). Batch b covers records [b*BATCH_SIZE, (b+1)*BATCH_SIZE).
+START_BATCH=${START_BATCH:-0}
 OUT="$RUNDIR/latent_sft"
 OPTIM_STATE="$RUNDIR/optim_state.pt"
 LOG="${RUNDIR}.log"
@@ -118,7 +122,7 @@ N_BATCHES=$(( (N + BATCH_SIZE - 1) / BATCH_SIZE ))
 FRESH_START=0
 [ "$START_STAGE" -le 1 ] && [ "$START_EPOCH" -eq 1 ] && FRESH_START=1
 if [ "$FRESH_START" -eq 1 ]; then
-  : > "$LOG"; : > "$EVAL_LOG"; rm -f "$OPTIM_STATE"
+  : > "$LOG"; : > "$EVAL_LOG"; rm -f "$OPTIM_STATE" "$OPTIM_STATE.extras"
   CUR="$BASE"
 else
   CUR="$OUT"
@@ -129,8 +133,8 @@ echo "[chess_coconut] using N=$N records ($AVAILABLE_N available), batch_size=$B
 for stage in $(seq "$START_STAGE" "$N_STEPS"); do
   ep_start=1
   [ "$stage" -eq "$START_STAGE" ] && ep_start="$START_EPOCH"
-  if [ "$ep_start" -eq 1 ]; then
-    rm -f "$OPTIM_STATE"
+  if [ "$ep_start" -eq 1 ] && ! { [ "$stage" -eq "$START_STAGE" ] && [ "$START_BATCH" -gt 0 ]; }; then
+    rm -f "$OPTIM_STATE" "$OPTIM_STATE.extras"
   fi
   for epoch in $(seq "$ep_start" "$EPOCHS_PER_STAGE"); do
     EFFECTIVE_LR="$LR"
@@ -146,7 +150,11 @@ for stage in $(seq "$START_STAGE" "$N_STEPS"); do
       )
     fi
     echo "=== [$(date +%H:%M:%S)] CHESS STAGE $stage/$N_STEPS epoch $epoch/$EPOCHS_PER_STAGE (latent_roles=$stage, lr=$EFFECTIVE_LR, from $CUR) ===" | tee -a "$LOG"
-    for b in $(seq 0 $((N_BATCHES - 1))); do
+    b_start=0
+    if [ "$stage" -eq "$START_STAGE" ] && [ "$epoch" -eq "$ep_start" ]; then
+      b_start="$START_BATCH"
+    fi
+    for b in $(seq "$b_start" $((N_BATCHES - 1))); do
       offset=$((b * BATCH_SIZE))
       remaining=$((N - offset))
       limit=$BATCH_SIZE
@@ -168,13 +176,14 @@ for stage in $(seq "$START_STAGE" "$N_STEPS"); do
         --out "$OUT" \
         --curriculum --latent-steps "$LATENT_STEPS" \
         --roles "$ROLES" \
-        --chain-format chess_steps \
+        --chain-format "$CHAIN_FORMAT" \
         --max-prompt-chars "$MAX_PROMPT_CHARS" --max-role-chars "$MAX_ROLE_CHARS" \
         --max-total-tokens "$MAX_TOTAL_TOKENS" \
         --force-n-latent-roles "$stage" \
         --optim-state "$OPTIM_STATE" \
         --coconut-objective --lr "$EFFECTIVE_LR" \
         "${SQL_READY_ARGS[@]}" \
+        ${EXTRA_SFT_ARGS:-} \
         --offset "$offset" --limit "$limit" --epochs 1 --grad-accum "$limit" --save-steps "$limit" \
         >> "$LOG" 2>&1
       code=$?

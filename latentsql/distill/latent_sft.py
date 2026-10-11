@@ -37,13 +37,16 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import random
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..mas.prompts import student_prompt
 from ..llm.hf_local import render_chat
-from ..mas.trace import T_CONSENSUS_OPEN, T_CONSENSUS_CLOSE, T_END, T_AGENT_CLOSE, agent_tag
+from ..mas.trace import (
+    T_CONSENSUS_OPEN, T_CONSENSUS_CLOSE, T_END, T_AGENT_CLOSE, agent_tag,
+)
 
 
 def _identifier_error_mutant(sql: str) -> Optional[str]:
@@ -179,11 +182,36 @@ def _explicit_curriculum_turns(role_turns: Sequence[str], roles: Sequence[str],
     return out
 
 
+def _latent_extra_losses(reasoner: Any, rec: Dict[str, Any], out: Dict[str, Any]) -> None:
+    """L_schema (Eq. 13) and L_exec (Eq. 14) from the states recorded this pass."""
+    import torch
+
+    if reasoner.schema_pis and rec.get("schema_gold"):
+        keys = [k.lower() for k in reasoner.schema_items()]
+        gold = [keys.index(k.lower()) for k in rec["schema_gold"] if k.lower() in keys]
+        if gold:
+            g = torch.tensor(gold, device=reasoner.schema_pis[0].device)
+            terms = [-(pi.reshape(-1)[g].clamp(min=1e-12).log().mean())
+                     for pi in reasoner.schema_pis]
+            out["schema"] = torch.stack(terms).mean()
+            with torch.no_grad():
+                k = min(10, len(keys))
+                top = set(reasoner.schema_pis[-1].reshape(-1).topk(k).indices.tolist())
+                out["schema_recall@10"] = len(top & set(gold)) / len(gold)
+    heads = getattr(reasoner.extras, "exec_heads", None) if reasoner.extras else None
+    if heads is not None and reasoner.exec_states and rec.get("exec_props"):
+        loss = heads.loss(reasoner.exec_states, rec["exec_props"])
+        if loss is not None:
+            out["exec"] = loss
+    reasoner.reset_records()
+
+
 def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: int,
                            target_ids: Sequence[int],
                            sql_ready_role: Optional[int] = None,
                            sql_ready_tokens: int = 16,
-                           skip_explicit_roles: bool = False) -> tuple:
+                           skip_explicit_roles: bool = False,
+                           extra_losses: Optional[Dict[str, Any]] = None) -> tuple:
     """COCONUT curriculum loss, without the inference-time KV cache.
 
     COCONUT trains by repeatedly running the model on the current sequence to
@@ -199,6 +227,11 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
     instead of feeding them as text, jumping straight to ``<|consensus|>`` -
     the sequence ``LatentReasoner.build_prefix(n_latent_roles=d)`` samples
     from. GRPO's per-role credit scores its early-consensus rollouts with it.
+
+    ``extra_losses`` (a dict, filled in place) receives ``schema`` (Eq. 13,
+    when r1 uses schema-space alignment and ``rec["schema_gold"]`` is set) and
+    ``exec`` (Eq. 14, when execution-property heads exist and
+    ``rec["exec_props"]`` is set; only latent states of roles after r1).
     """
     import torch
 
@@ -206,6 +239,10 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
     device = reasoner.bundle.device
     cfg = reasoner.cfg
     embed = model.get_input_embeddings()
+    reasoner.reset_records()
+    reasoner.set_schema(rec.get("db_path"), rec.get("db_id"))
+    heads = getattr(reasoner.extras, "exec_heads", None) if reasoner.extras else None
+    reasoner.record_states = extra_losses is not None and heads is not None
     chat = render_chat(
         tok,
         [{"role": "system", "content": rec["system"]}, {"role": "user", "content": rec["prompt"]}],
@@ -235,6 +272,7 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
             break
         if idx < n_latent_roles:
             add_text(agent_tag(role) + "\n", supervise=False)
+            reasoner.set_role(role)
             for _ in range(cfg.latent_steps):
                 cur = torch.cat(pieces, dim=1)
                 attn = torch.ones(cur.shape[:2], dtype=torch.long, device=device)
@@ -284,6 +322,10 @@ def _coconut_sequence_loss(reasoner: Any, rec: Dict[str, Any], n_latent_roles: i
             sql_ready_terms.append(probe_out.loss)
             del probe_out, probe_inputs, probe_labels_t, probe_attn, probe_pieces, probe_labels
 
+    reasoner.set_role(None)
+    reasoner.record_states = False
+    if extra_losses is not None:
+        _latent_extra_losses(reasoner, rec, extra_losses)
     add_text(T_CONSENSUS_OPEN, supervise=False)
     add_token_ids(target_ids, supervise=True)
 
@@ -385,6 +427,188 @@ def chess_step_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]
     return out
 
 
+def _execution_report(turn: Any, max_preview_chars: int = 400) -> str:
+    """What the reviser sees when it executes the draft once."""
+    if not getattr(turn, "exec_ok", False):
+        return f"Error: {(getattr(turn, 'exec_error', '') or 'execution failed').strip()}"
+    preview = (getattr(turn, "exec_preview", "") or "").strip()
+    if not preview or len(preview.splitlines()) <= 1:
+        return "Result: empty (no rows returned)"
+    if len(preview) > max_preview_chars:
+        preview = preview[:max_preview_chars].rstrip() + "\n..."
+    return f"Result preview:\n{preview}"
+
+
+def chess_reviser_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
+    """Three teacher roles from main_latentsql.pdf Sec. 4.1, Eq. (7)-(8).
+
+    r1 schema selector: the trace's schema links.
+    r2 candidate generator: the round-0 CHESS reasoning and its *draft* SQL,
+       right or wrong, with no outcome label.
+    r3 reviser: executes the draft once, records the result or error, and
+       either keeps the draft or explains and applies the round-1 correction.
+
+    A trace is kept only when the reviser's final SQL is execution-correct
+    (EX = 1), so failed drafts that were repaired are retained - those are the
+    examples that teach the student to forecast errors before writing SQL.
+    """
+    chess = {t.round: t for t in trace.turns if t.agent == "chess"}
+    draft, final = chess.get(0), chess.get(1)
+    if not (draft and final and getattr(draft, "sql", None) and getattr(final, "sql", None)):
+        return None
+    # r3's output is the draft when the draft is correct, else round 1; keep the
+    # trace only if that output is execution-correct (Eq. 8).
+    if getattr(draft, "correct", None) is not True and getattr(final, "correct", None) is not True:
+        return None
+
+    def block(role: str, body: str) -> Optional[str]:
+        body = (body or "").strip()
+        if not body:
+            return None
+        return f"{agent_tag(role)}\n{body}\n{T_AGENT_CLOSE}"
+
+    # A correct draft is kept even when round 1 rewrote it: labelling a
+    # rewrite of a correct query as a "fix" would teach the student to repair
+    # queries that were never broken.
+    if getattr(draft, "correct", None) is True:
+        verdict = (
+            "The draft executes and its result is consistent with the question; "
+            f"keep it.\n```sql\n{draft.sql}\n```"
+        )
+    else:
+        verdict = (
+            "Diagnosis and fix:\n"
+            f"{(final.reasoning or '').strip()}\n```sql\n{final.sql}\n```"
+        )
+    step_map: Dict[str, Optional[str]] = {
+        "schema_linker": block("schema_linker", getattr(trace, "schema_links", "")),
+        "candidate_generator": block(
+            "candidate_generator",
+            f"{(draft.reasoning or '').strip()}\n```sql\n{draft.sql}\n```",
+        ),
+        "reviser": block(
+            "reviser",
+            f"Execute the draft once.\n{_execution_report(draft)}\n{verdict}",
+        ),
+    }
+    out: List[str] = []
+    for role in roles:
+        if role == "consensus":
+            break
+        text = step_map.get(role)
+        if text is None:
+            return None
+        out.append(text)
+    return out
+
+
+REPAIR_AGENT_ORDER = ("chess", "din_sql", "chase_sql", "dail_sql")
+_DEBATE_REF = re.compile(
+    r"din[_ -]?sql|dail[_ -]?sql|chase[_ -]?sql|\bchess\b|\bagents?\b|\bpanel\b|"
+    r"previous round|other (?:answers|queries|candidates)|consensus|\bround \d",
+    re.I,
+)
+
+
+def _strip_debate_refs(text: str) -> str:
+    """Drop sentences about the teacher debate, which the student never sees.
+
+    Round-1 revisions often justify the fix by other agents' answers ("dail_sql
+    and chase_sql use ..."); kept verbatim they teach the reviser to cite a
+    panel that does not exist at inference.
+    """
+    kept: List[str] = []
+    for line in (text or "").splitlines():
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        parts = [p for p in parts if p and not _DEBATE_REF.search(p)]
+        if parts:
+            kept.append(" ".join(parts))
+    return "\n".join(kept).strip()
+
+
+def reviser_repair_turns_for(trace: Any, roles: Sequence[str]) -> Optional[List[str]]:
+    """Like :func:`chess_reviser_turns_for`, but draws repairs from every teacher.
+
+    The CHESS-only corpus has a fix in ~10% of records and an execution error in
+    <1%, so the student learns "keep the draft" and never forecasts errors. Here
+    one record per question is still built, but a wrong draft is preferred
+    whenever the panel produced one:
+
+      1. same-agent repair - an agent whose round-0 draft is wrong and whose
+         round-1 revision is correct (draft, its error, its own fix);
+      2. cross-agent repair - a wrong round-0 draft from one agent, fixed by
+         another agent's correct round-1 revision and reasoning;
+      3. keep - a correct round-0 draft.
+
+    Within each tier a draft that fails to execute is preferred (so the reviser
+    sees real "Error:" reports), then agents in ``REPAIR_AGENT_ORDER``.
+    """
+    by: Dict[str, Dict[int, Any]] = {}
+    for t in trace.turns:
+        if getattr(t, "sql", None):
+            by.setdefault(t.agent, {})[t.round] = t
+    order = [a for a in REPAIR_AGENT_ORDER if a in by] + sorted(
+        a for a in by if a not in REPAIR_AGENT_ORDER)
+
+    def wrong_draft(a: str) -> bool:
+        return getattr(by[a].get(0), "correct", None) is False
+
+    def fixed(a: str) -> bool:
+        return getattr(by[a].get(1), "correct", None) is True
+
+    def crash_first(agents: List[str]) -> List[str]:
+        return sorted(agents, key=lambda a: bool(getattr(by[a][0], "exec_ok", True)))
+
+    same = crash_first([a for a in order if wrong_draft(a) and fixed(a)])
+    if same:
+        draft, final = by[same[0]][0], by[same[0]][1]
+    else:
+        wrong = crash_first([a for a in order if wrong_draft(a)])
+        fixers = [a for a in order if fixed(a)]
+        if wrong and fixers:
+            draft, final = by[wrong[0]][0], by[fixers[0]][1]
+        else:
+            keep = [a for a in order if getattr(by[a].get(0), "correct", None) is True]
+            if not keep:
+                return None
+            draft, final = by[keep[0]][0], None
+
+    def block(role: str, body: str) -> Optional[str]:
+        body = (body or "").strip()
+        if not body:
+            return None
+        return f"{agent_tag(role)}\n{body}\n{T_AGENT_CLOSE}"
+
+    if final is None:
+        verdict = (
+            "The draft executes and its result is consistent with the question; "
+            f"keep it.\n```sql\n{draft.sql}\n```"
+        )
+    else:
+        why = _strip_debate_refs(final.reasoning) or "The draft does not answer the question."
+        verdict = f"Diagnosis and fix:\n{why}\n```sql\n{final.sql}\n```"
+    step_map: Dict[str, Optional[str]] = {
+        "schema_linker": block("schema_linker", getattr(trace, "schema_links", "")),
+        "candidate_generator": block(
+            "candidate_generator",
+            f"{_strip_debate_refs(draft.reasoning)}\n```sql\n{draft.sql}\n```",
+        ),
+        "reviser": block(
+            "reviser",
+            f"Execute the draft once.\n{_execution_report(draft)}\n{verdict}",
+        ),
+    }
+    out: List[str] = []
+    for role in roles:
+        if role == "consensus":
+            break
+        text = step_map.get(role)
+        if text is None:
+            return None
+        out.append(text)
+    return out
+
+
 def build_records_from_traces(traces: Sequence[Any], cfg: Any,
                               max_prompt_chars: Optional[int] = None,
                               max_role_chars: Optional[int] = None,
@@ -457,6 +681,10 @@ def build_records_from_traces(traces: Sequence[Any], cfg: Any,
                 continue
         if chain_format == "chess_steps":
             rt = chess_step_turns_for(tr, cfg.latent.roles)
+        elif chain_format == "chess_reviser":
+            rt = chess_reviser_turns_for(tr, cfg.latent.roles)
+        elif chain_format == "reviser_repair":
+            rt = reviser_repair_turns_for(tr, cfg.latent.roles)
         else:
             rt = role_turns_for(tr, cfg.latent.roles)
         if rt is None:
@@ -559,6 +787,24 @@ def train_latent_sft(
         optim.load_state_dict(torch.load(optim_state_path, map_location=bundle.device))
         print(f"[latent_sft] restored optimizer momentum from {optim_state_path}", flush=True)
 
+    # W_S / execution heads (schema_latent.py) train with their own AdamW:
+    # they start from scratch (heads) or zero (W_S), so the LoRA learning
+    # rate would barely move them. Loaded from <sft>/latent_extras.pt when the
+    # starting adapter has one, saved next to every adapter write.
+    extras = reasoner.extras
+    extra_params = extras.parameters() if extras is not None else []
+    extra_optim = None
+    lambda_schema = float(getattr(cfg, "lambda_schema", 0.5))
+    mu_exec = float(getattr(cfg, "mu_exec", 0.1))
+    if extra_params:
+        extra_optim = torch.optim.AdamW(extra_params, lr=float(getattr(cfg, "extras_lr", 1e-3)))
+        extra_state = (optim_state_path + ".extras") if optim_state_path else None
+        if extra_state and os.path.exists(extra_state):
+            extra_optim.load_state_dict(torch.load(extra_state, map_location=bundle.device))
+        print(f"[latent_sft] latent extras: align_r1={reasoner.align_r1} "
+              f"schema={extras.schema is not None} exec_heads={extras.exec_heads is not None} "
+              f"({sum(p.numel() for p in extra_params)} params)", flush=True)
+
     steplog = None
     if log_path:
         steplog = RunLog(
@@ -577,6 +823,7 @@ def train_latent_sft(
 
     order = list(range(len(usable)))
     rng = random.Random(getattr(cfg, "seed", 0))
+    probe_rng = random.Random(getattr(cfg, "seed", 0) + 1)   # j* draws; leaves record order alone
     rng.shuffle(order)
     n_steps = max(1, int(len(order) * cfg.epochs))
     history: List[Dict[str, Any]] = []
@@ -637,6 +884,16 @@ def train_latent_sft(
             sql_ready_role = getattr(cfg, "sql_ready_role", None)
             sql_ready_weight = float(getattr(cfg, "sql_ready_weight", 0.0) or 0.0)
             sql_ready_tokens = int(getattr(cfg, "sql_ready_tokens", 16) or 16)
+            # L_probe (paper Eq. 16): at stage k > 1 rehearse one earlier stage
+            # j* ~ U{1..k-1} by supervising the first kappa SQL tokens decoded
+            # right after j*'s latent roles. Reuses the sql_ready probe path,
+            # which builds exactly that prefix (Phi_{j*} || <|consensus|>).
+            probe_weight = float(getattr(cfg, "probe_weight", 0.0) or 0.0)
+            if (coconut_objective and probe_weight > 0 and n_latent_roles is not None
+                    and n_latent_roles > 1):
+                sql_ready_role = probe_rng.randint(1, n_latent_roles - 1)
+                sql_ready_weight = probe_weight
+                sql_ready_tokens = int(getattr(cfg, "probe_tokens", 16) or 16)
             sql_ready_active = (
                 coconut_objective
                 and sql_ready_role is not None
@@ -645,17 +902,26 @@ def train_latent_sft(
                 and n_latent_roles >= int(sql_ready_role)
             )
 
+            extra_log: Dict[str, float] = {}
             try:
                 if coconut_objective:
+                    extra_losses: Dict[str, Any] = {}
                     base_loss, n_tok, _n_roles, sql_ready_loss = _coconut_sequence_loss(
                         reasoner, rec, n_latent_roles, target_ids,
                         sql_ready_role=(int(sql_ready_role) if sql_ready_active else None),
                         sql_ready_tokens=sql_ready_tokens,
+                        extra_losses=extra_losses if extras is not None else None,
                     )
                     sql_loss = base_loss
                     loss = sql_loss
                     if sql_ready_active:
                         loss = loss + sql_ready_weight * sql_ready_loss
+                    if "schema" in extra_losses:
+                        loss = loss + lambda_schema * extra_losses["schema"]
+                    if "exec" in extra_losses:
+                        loss = loss + mu_exec * extra_losses["exec"]
+                    extra_log = {k: round(float(v.detach() if hasattr(v, "detach") else v), 4)
+                                 for k, v in extra_losses.items()}
                     aux_loss = torch.zeros((), device=bundle.device, dtype=torch.float32)
                     text_gen_loss = sql_loss
                     past = attn = first_logits = terms = token_logp = ids = None
@@ -736,6 +1002,10 @@ def train_latent_sft(
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optim.step()
                 optim.zero_grad(set_to_none=True)
+                if extra_optim is not None:
+                    torch.nn.utils.clip_grad_norm_(extra_params, 1.0)
+                    extra_optim.step()
+                    extra_optim.zero_grad(set_to_none=True)
 
             if (step + 1) % cfg.logging_steps == 0 or step + 1 == n_steps:
                 entry = {
@@ -748,6 +1018,8 @@ def train_latent_sft(
                     "n_latent_roles": n_latent_roles if curriculum else n_roles,
                     "elapsed_s": round(time.time() - t0, 1),
                 }
+                if coconut_objective and extras is not None:
+                    entry.update({f"extra_{k}": v for k, v in extra_log.items()})
                 entry.update(gpu_stats())
                 history.append(entry)
                 if steplog:
@@ -758,6 +1030,7 @@ def train_latent_sft(
                 from .sft import save_student
 
                 save_student(bundle, cfg.output_dir)
+                reasoner.save_extras(cfg.output_dir)
     finally:
         if ckpt and not coconut_objective:
             model.gradient_checkpointing_enable()
@@ -766,9 +1039,12 @@ def train_latent_sft(
     from .sft import save_student
 
     save_student(bundle, cfg.output_dir)
+    reasoner.save_extras(cfg.output_dir)
     if optim_state_path:
         os.makedirs(os.path.dirname(os.path.abspath(optim_state_path)) or ".", exist_ok=True)
         torch.save(optim.state_dict(), optim_state_path)
+        if extra_optim is not None:
+            torch.save(extra_optim.state_dict(), optim_state_path + ".extras")
     result = {
         "output_dir": cfg.output_dir,
         "n_records": len(usable),

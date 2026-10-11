@@ -280,6 +280,13 @@ class RewardConfig:
     #: been scored. Essential for large corpora whose source DBs can be GBs;
     #: leave false when later epochs should reuse the on-disk instances.
     cleanup_stress_cache: bool = False
+    #: "weighted" = the weighted sum in DebateReward (w_clip, w_atomic, ...).
+    #: "paper" = main_latentsql.pdf Eq. (13):
+    #:   s(Y) = R_atomic(Y) + 1[EX=1] * (R_spur(Y) + R_brev(Y))
+    #: with R_atomic = phi(Jaccard) on every rollout, R_spur = 1 only if Y
+    #: matches gold on every stress instance (Eq. 16), R_brev = max(0,
+    #: 1 - |Y|/L_max) (Eq. 17), and no memory/format terms. Weights are ignored.
+    reward_mode: str = "weighted"
 
 
 @dataclass
@@ -350,6 +357,12 @@ class LatentConfig:
     align: str = "soft_embed"       # soft_embed | linear | identity
     soft_embed_top_k: int = 32
     soft_embed_temperature: float = 1.0
+    # r1 (schema selection) aligner: vocab | schema | hard | identity
+    align_r1: str = "vocab"
+    schema_top_k: int = 10          # n_S
+    schema_tau: float = 0.5
+    schema_beta: float = 0.3        # FK propagation weight
+    exec_heads: bool = False        # execution-property heads on r2.. latent states
     share_working_memory: bool = True   # prepend previous roles' KV caches
     train_latent_slots: bool = False    # curriculum-replace agent spans with latent slots
     max_context_tokens: Optional[int] = None  # optional runtime KV-prefix cap; strict

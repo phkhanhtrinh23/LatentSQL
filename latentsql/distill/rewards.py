@@ -105,6 +105,8 @@ class ExecutionOracle:
         self.cleanup_stress_cache = cleanup_stress_cache
         self._stress_paths: Dict[Tuple[str, str], List[str]] = {}
         self._spurious: Dict[Tuple[str, str, str], float] = {}
+        #: optional CounterexamplePool (latentsql/db/counterexample.py)
+        self.cegis = None
 
     def gold_result(self, db_path: str, gold_sql: str) -> ExecResult:
         key = (db_path, normalize_sql(gold_sql))
@@ -312,6 +314,9 @@ class DebateReward:
 
         clipped_sql = extract_final_sql(clipped_text)
         r_clip = 1.0 if self.oracle.is_correct(db_path, clipped_sql, gold_sql) else 0.0
+        if getattr(self.cfg, "reward_mode", "weighted") == "paper":
+            return self._paper_reward(text, clipped_sql, r_clip, n_tokens,
+                                      db_path, gold_sql, w_fmt, limit)
 
         # --- small shaping terms, specific to SQL -----------------------------
         full_sql = extract_final_sql(text)
@@ -386,6 +391,56 @@ class DebateReward:
             n_tokens=n_tokens,
             clipped_has_answer=bool(clipped_sql),
             final_sql=full_sql,
+        )
+
+    def _counterexample_check(self, db_path: str, sql: str, gold_sql: str) -> float:
+        """Eq. (22): 0 if a counterexample instance separates sql from gold.
+
+        Checked against the question's grown pool first; if sql survives it
+        but its atomic operations differ from the gold's, search for a new
+        separating edit while the pool (fixed + found) is below k_max.
+        """
+        pool = self.oracle.cegis
+        if not pool.passes_pool(db_path, sql, gold_sql):
+            return 0.0
+        if self.atomic.ops(sql) == self.atomic.ops(gold_sql):
+            return 1.0
+        if pool.k_max > 0:   # k_max <= 0: the pool grows without a cap
+            n_fixed = len(self.oracle._stress_instances(db_path, gold_sql))
+            if n_fixed + pool.pool_size(db_path, gold_sql) >= pool.k_max:
+                return 1.0
+        return 0.0 if pool.search(db_path, sql, gold_sql) else 1.0
+
+    def _paper_reward(self, text: str, sql: Optional[str], ex: float, n_tokens: int,
+                      db_path: str, gold_sql: str, w_fmt: float, limit: int) -> RewardBreakdown:
+        """main_latentsql.pdf Eq. (13): R_atomic + 1[EX=1] * (R_spur + R_brev)."""
+        if self.atomic is None:
+            from .dense_rewards import AtomicOpsReward
+
+            self.atomic = AtomicOpsReward()
+        r_atomic = self.atomic.score(sql, gold_sql) if sql else 0.0      # Eq. (15)
+        r_spurious = r_brevity = 0.0
+        if ex >= 1.0:
+            # Eq. (16): a product of per-instance EX, so 1 only if Y is correct
+            # on every stress instance. No buildable instance => empty product.
+            agree = self.oracle.spurious_agreement(db_path, sql, gold_sql)
+            r_spurious = 1.0 if agree >= 1.0 else 0.0
+            if r_spurious and self.oracle.cegis is not None and sql:
+                r_spurious = self._counterexample_check(db_path, sql, gold_sql)
+            l_max = int(getattr(self.cfg, "brevity_ref_tokens", 0)) or max(1, limit)
+            r_brevity = max(0.0, 1.0 - float(n_tokens) / float(l_max))  # Eq. (17)
+        return RewardBreakdown(
+            total=r_atomic + ex * (r_spurious + r_brevity),
+            r_atomic=r_atomic,
+            r_brevity=r_brevity,
+            # logged as "fraction of instances agreeing": 1.0 = robust
+            r_spurious=r_spurious if ex >= 1.0 else 1.0,
+            r_clip=ex,
+            w_fmt=w_fmt,
+            length_limit=limit,
+            n_tokens=n_tokens,
+            clipped_has_answer=bool(sql),
+            final_sql=extract_final_sql(text),
         )
 
 

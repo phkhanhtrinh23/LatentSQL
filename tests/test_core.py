@@ -784,6 +784,147 @@ class TestSpuriousInstances(unittest.TestCase):
         self.assertNotEqual(original, jittered)
 
 
+class TestPaperReward(unittest.TestCase):
+    """reward_mode="paper": main_latentsql.pdf Eq. (13)."""
+
+    GOLD = "SELECT name FROM t WHERE age > 40"
+
+    def _reward(self, pred, correct, agreement=1.0, n_tokens=50, l_max=200):
+        from latentsql.config import RewardConfig
+        from latentsql.distill.rewards import DebateReward, ExecutionOracle, RewardSchedule
+
+        class _O(ExecutionOracle):
+            def __init__(self):
+                super().__init__(timeout=1.0)
+
+            def is_correct(self, *a):
+                return correct
+
+            def executes(self, *a):
+                return True
+
+            def spurious_agreement(self, *a, **k):
+                return agreement
+
+        cfg = RewardConfig()
+        cfg.reward_mode = "paper"
+        cfg.brevity_ref_tokens = l_max
+        text = f"<|consensus|>\n```sql\n{pred}\n```\n<|/consensus|>"
+        reward = DebateReward(cfg, _O(), RewardSchedule(cfg, total_steps=10),
+                              decode=lambda ids: text)
+        return reward(text, list(range(n_tokens)), "", self.GOLD, 0)
+
+    def test_robust_correct_gets_atomic_plus_spur_plus_brevity(self):
+        r = self._reward(self.GOLD, correct=True, agreement=1.0, n_tokens=50)
+        self.assertAlmostEqual(r.r_brevity, 0.75)
+        self.assertEqual(r.r_spurious, 1.0)
+        self.assertAlmostEqual(r.total, r.r_atomic + 1.0 + 0.75)
+
+    def test_spur_is_all_or_nothing(self):
+        r = self._reward(self.GOLD, correct=True, agreement=0.8)
+        self.assertEqual(r.r_spurious, 0.0)
+        self.assertAlmostEqual(r.total, r.r_atomic + r.r_brevity)
+
+    def test_wrong_query_gets_only_atomic_credit(self):
+        r = self._reward("SELECT name FROM t WHERE age >= 40", correct=False)
+        self.assertGreater(r.r_atomic, 0.0)
+        self.assertEqual(r.r_brevity, 0.0)
+        self.assertAlmostEqual(r.total, r.r_atomic)
+
+
+class TestReviserTurns(unittest.TestCase):
+    """chess_reviser_turns_for: r3 executes the draft and keeps or fixes it."""
+
+    def _trace(self, draft_ok, final_ok, draft_exec_ok=True):
+        from types import SimpleNamespace as NS
+
+        draft = NS(agent="chess", round=0, reasoning="draft plan", sql="SELECT a FROM t",
+                   exec_ok=draft_exec_ok, exec_error="" if draft_exec_ok else "no such column: a",
+                   exec_preview="a\n(1,)", correct=draft_ok)
+        final = NS(agent="chess", round=1, reasoning="column a is wrong; use b",
+                   sql="SELECT b FROM t", exec_ok=True, exec_error="",
+                   exec_preview="b\n(2,)", correct=final_ok)
+        return NS(turns=[draft, final], schema_links="Tables: t")
+
+    ROLES = ["schema_linker", "candidate_generator", "reviser", "consensus"]
+
+    def test_failed_draft_repaired_is_kept_with_error_and_fix(self):
+        from latentsql.distill.latent_sft import chess_reviser_turns_for
+
+        turns = chess_reviser_turns_for(self._trace(False, True, draft_exec_ok=False), self.ROLES)
+        self.assertEqual(len(turns), 3)
+        self.assertIn("SELECT a FROM t", turns[1])
+        self.assertNotIn("Outcome", turns[1])                 # r2 carries no label
+        self.assertIn("Error: no such column: a", turns[2])
+        self.assertIn("Diagnosis and fix", turns[2])
+        self.assertIn("SELECT b FROM t", turns[2])
+
+    def test_correct_draft_is_kept_not_fixed(self):
+        from latentsql.distill.latent_sft import chess_reviser_turns_for
+
+        turns = chess_reviser_turns_for(self._trace(True, False), self.ROLES)
+        self.assertIn("keep it", turns[2])
+        self.assertIn("SELECT a FROM t", turns[2])
+        self.assertNotIn("SELECT b FROM t", turns[2])
+
+    def test_unrepaired_failure_is_dropped(self):
+        from latentsql.distill.latent_sft import chess_reviser_turns_for
+
+        self.assertIsNone(chess_reviser_turns_for(self._trace(False, False), self.ROLES))
+
+
+class TestReviserRepairTurns(unittest.TestCase):
+    """reviser_repair_turns_for: repairs from every teacher, debate talk removed."""
+
+    ROLES = ["schema_linker", "candidate_generator", "reviser", "consensus"]
+
+    @staticmethod
+    def _turn(agent, rnd, sql, correct, exec_ok=True, reasoning="plan"):
+        from types import SimpleNamespace as NS
+
+        return NS(agent=agent, round=rnd, reasoning=reasoning, sql=sql, exec_ok=exec_ok,
+                  exec_error="" if exec_ok else "no such column: x",
+                  exec_preview="c\n(1,)", correct=correct)
+
+    def _build(self, turns):
+        from types import SimpleNamespace as NS
+        from latentsql.distill.latent_sft import reviser_repair_turns_for
+
+        return reviser_repair_turns_for(NS(turns=turns, schema_links="Tables: t"), self.ROLES)
+
+    def test_same_agent_repair_beats_correct_chess_draft(self):
+        out = self._build([
+            self._turn("chess", 0, "SELECT ok FROM t", True),
+            self._turn("din_sql", 0, "SELECT x FROM t", False, exec_ok=False),
+            self._turn("din_sql", 1, "SELECT y FROM t", True,
+                       reasoning="Column x does not exist. The other agents agree. Use y."),
+        ])
+        self.assertIn("SELECT x FROM t", out[1])
+        self.assertIn("Error: no such column: x", out[2])
+        self.assertIn("Diagnosis and fix", out[2])
+        self.assertIn("SELECT y FROM t", out[2])
+        self.assertIn("Column x does not exist.", out[2])
+        self.assertNotIn("agents", out[2])
+
+    def test_cross_agent_repair(self):
+        out = self._build([
+            self._turn("chess", 0, "SELECT bad FROM t", False),
+            self._turn("chess", 1, "SELECT bad FROM t", False),
+            self._turn("dail_sql", 1, "SELECT good FROM t", True, reasoning="Filter on b."),
+        ])
+        self.assertIn("SELECT bad FROM t", out[1])
+        self.assertIn("SELECT good FROM t", out[2])
+        self.assertIn("Filter on b.", out[2])
+
+    def test_keep_when_no_wrong_draft_and_drop_when_nothing_correct(self):
+        out = self._build([self._turn("chess", 0, "SELECT ok FROM t", True)])
+        self.assertIn("keep it", out[2])
+        self.assertIsNone(self._build([
+            self._turn("chess", 0, "SELECT a FROM t", False),
+            self._turn("chess", 1, "SELECT b FROM t", False),
+        ]))
+
+
 class TestSpuriousReward(unittest.TestCase):
     """w_spurious: discounts correctness credit when it does not survive stress tests."""
 
@@ -946,3 +1087,230 @@ class TestSpeculativeDecoding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSchemaLatent(unittest.TestCase):
+    """schema_latent.py: schema items, gold targets, A_S, execution heads."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "hr.sqlite")
+        conn = sqlite3.connect(self.db)
+        conn.executescript("""
+            CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, salary REAL,
+                              dept_id INTEGER REFERENCES dept(id));
+            INSERT INTO dept VALUES (1, 'sales'), (2, 'it');
+            INSERT INTO emp VALUES (1, 'ann', 10.5, 1), (2, 'bob', 20.0, 2), (3, 'cy', 5.0, 2);
+        """)
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_index_and_fk_edges(self):
+        from latentsql.distill.schema_latent import build_schema_index
+
+        idx = build_schema_index(self.db)
+        self.assertIn("emp.salary", idx.keys)
+        a, b = idx.index("emp.dept_id"), idx.index("dept.id")
+        self.assertIn((a, b), idx.edges)
+        self.assertIn((idx.index("emp"), idx.index("dept")), idx.edges)
+
+    def test_gold_items_resolve_aliases(self):
+        from latentsql.distill.schema_latent import gold_schema_items
+
+        items = gold_schema_items(
+            "SELECT T2.name FROM emp AS T1 JOIN dept AS T2 ON T1.dept_id = T2.id "
+            "WHERE T1.salary > 6", self.db)
+        self.assertEqual(set(items), {"emp", "dept", "dept.name", "emp.dept_id", "dept.id",
+                                      "emp.salary"})
+
+    def test_exec_properties(self):
+        from latentsql.distill.schema_latent import TYPE_CLASSES, exec_properties
+
+        p = exec_properties(self.db, "SELECT name, salary FROM emp ORDER BY salary")
+        self.assertEqual(p["n_columns"], 1)            # 2 columns -> class 1
+        self.assertEqual(p["row_bucket"], 2)           # 3 rows -> 2..10
+        self.assertEqual(p["type_0"], TYPE_CLASSES.index("text"))
+        self.assertEqual(p["type_1"], TYPE_CLASSES.index("real"))
+        self.assertEqual(p["type_2"], TYPE_CLASSES.index("absent"))
+        self.assertEqual((p["aggregates"], p["orders"]), (0, 1))
+        self.assertEqual(exec_properties(self.db, "SELECT COUNT(*) FROM emp")["aggregates"], 1)
+        self.assertIsNone(exec_properties(self.db, "SELECT nope FROM emp"))
+
+    def test_schema_aligner_distribution_and_mixture(self):
+        import torch
+        from types import SimpleNamespace as NS
+        from latentsql.distill.schema_latent import SchemaAligner
+
+        torch.manual_seed(0)
+        d, V = 16, 50
+        embed = torch.nn.Embedding(V, d)
+
+        class Tok:
+            def __call__(self, text, add_special_tokens=False):
+                return {"input_ids": [hash(w) % V for w in text.split()]}
+
+        bundle = NS(tokenizer=Tok(), model=NS(get_input_embeddings=lambda: embed))
+        al = SchemaAligner(d, "cpu", top_k=3, tau=0.5, beta=0.3)
+        E, P, index = al.items(bundle, self.db)
+        self.assertEqual(E.shape, (len(index.keys), d))
+        self.assertTrue(torch.allclose(P.sum(-1), torch.ones(len(index.keys))))
+        h = torch.randn(1, d)
+        a, pihat = al.align(h, torch.randn(1, d), E.detach(), P)
+        self.assertEqual(a.shape, (1, d))
+        self.assertAlmostEqual(float(pihat.detach().sum()), 1.0, places=5)
+        # gradient reaches W_S through the mixture
+        a.float().sum().backward()
+        self.assertIsNotNone(al.W_S.grad)
+
+    def test_exec_heads_loss_ignores_missing_labels(self):
+        import torch
+        from latentsql.distill.schema_latent import IGNORE, ExecHeads
+
+        heads = ExecHeads(8, "cpu", hidden=4)
+        z = [torch.randn(8), torch.randn(8)]
+        loss = heads.loss(z, {"n_columns": 0, "row_bucket": 1, "type_0": IGNORE})
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNone(heads.loss(z, {}))
+
+
+class TestCounterexamplePool(unittest.TestCase):
+    """counterexample.py: CEGIS search grows the pool only for real mistakes."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "hr.sqlite")
+        conn = sqlite3.connect(self.db)
+        conn.executescript("""
+            CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, salary REAL,
+                              dept_id INTEGER REFERENCES dept(id));
+            INSERT INTO dept VALUES (1, 'sales'), (2, 'it');
+            INSERT INTO emp VALUES (1, 'ann', 10.5, 1), (2, 'bob', 20.0, 2), (3, 'cy', 5.0, 2);
+        """)
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pool(self):
+        from latentsql.db.counterexample import CounterexamplePool
+
+        return CounterexamplePool(os.path.join(self.tmp, "cx"), budget=60, seed=1)
+
+    def test_finds_boundary_counterexample_and_pool_rejects_later(self):
+        gold = "SELECT name FROM emp WHERE salary > 6"
+        pred = "SELECT name FROM emp WHERE salary >= 10"     # same rows on D
+        pool = self._pool()
+        self.assertTrue(pool.passes_pool(self.db, pred, gold))
+        self.assertTrue(pool.search(self.db, pred, gold))
+        self.assertEqual(pool.pool_size(self.db, gold), 1)
+        self.assertFalse(pool.passes_pool(self.db, pred, gold))
+        self.assertTrue(pool.passes_pool(self.db, gold, gold))
+        # edits are rolled back: the working copy still has three employees
+        conn = pool._conn(self.db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM emp").fetchone()[0], 3)
+        pool.close(remove=True)
+
+    def test_finds_multiplicity_counterexample(self):
+        gold = "SELECT COUNT(*) FROM emp WHERE dept_id = 2"
+        pred = "SELECT 2"                                     # constant that happens to match
+        pool = self._pool()
+        self.assertTrue(pool.search(self.db, pred, gold))
+        pool.close(remove=True)
+
+    def test_equivalent_rewrite_is_not_separated(self):
+        gold = "SELECT name FROM emp WHERE salary > 6"
+        pred = "SELECT name FROM emp WHERE 6 < salary"
+        pool = self._pool()
+        self.assertFalse(pool.search(self.db, pred, gold))
+        self.assertEqual(pool.pool_size(self.db, gold), 0)
+        pool.close(remove=True)
+
+    def test_original_database_untouched(self):
+        import sqlite3
+
+        pool = self._pool()
+        pool.search(self.db, "SELECT name FROM emp WHERE salary >= 10",
+                    "SELECT name FROM emp WHERE salary > 6")
+        pool.close(remove=True)
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM emp").fetchone()[0], 3)
+        conn.close()
+
+
+VERIEQL_PY = "/home/trinh/miniconda3/envs/verieql/bin/python"
+VERIEQL_DIR = "/mnt/win_d/tools/VeriEQL"
+
+
+@unittest.skipUnless(os.path.exists(VERIEQL_PY) and os.path.isdir(VERIEQL_DIR),
+                     "VeriEQL environment not installed")
+class TestVeriEQLFallback(unittest.TestCase):
+    """Mutation search first; VeriEQL only when it finds nothing."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "co.sqlite")
+        conn = sqlite3.connect(self.db)
+        conn.executescript("""
+            CREATE TABLE employee (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER);
+            INSERT INTO employee VALUES (1, 'Alice', 'Research', 52000),
+                                        (2, 'Bob', 'Research', 58000),
+                                        (3, 'Carol', 'Sales', 71000);
+        """)
+        conn.commit()
+        conn.close()
+        self.gold = "SELECT name FROM employee WHERE dept = 'Research'"
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pool(self, budget):
+        from latentsql.db.counterexample import CounterexamplePool
+
+        return CounterexamplePool(os.path.join(self.tmp, "cx"), budget=budget, seed=0,
+                                  verieql_python=VERIEQL_PY, verieql_dir=VERIEQL_DIR)
+
+    def test_mutation_catches_example_without_verieql(self):
+        pool = self._pool(budget=60)
+        self.assertTrue(pool.search(self.db, "SELECT name FROM employee WHERE salary < 60000",
+                                    self.gold))
+        self.assertEqual((pool.stats["found_mutation"], pool.stats["verieql_calls"]), (1, 0))
+        pool.close(remove=True)
+
+    def test_verieql_fallback_adds_database_instance(self):
+        pred = "SELECT name FROM employee WHERE salary < 60000"
+        pool = self._pool(budget=0)                 # mutation search tries nothing
+        self.assertTrue(pool.search(self.db, pred, self.gold))
+        self.assertEqual(pool.stats["found_verieql"], 1)
+        entry = pool.pools[(os.path.abspath(self.db), self.gold)][0]
+        self.assertIn("db", entry)
+        self.assertFalse(pool.passes_pool(self.db, pred, self.gold))
+        self.assertTrue(pool.passes_pool(self.db, self.gold, self.gold))
+        pool.close(remove=True)
+
+    def test_verieql_equivalent_keeps_reward(self):
+        pool = self._pool(budget=0)
+        self.assertFalse(pool.search(self.db, "SELECT name FROM employee WHERE 'Research' = dept",
+                                     self.gold))
+        self.assertEqual(pool.stats["verieql_equivalent"], 1)
+        pool.close(remove=True)

@@ -140,6 +140,7 @@ class ModelBundle:
     tokenizer: Any
     device: str
     name: str = ""
+    adapter_path: Optional[str] = None
 
     @property
     def config(self):
@@ -217,7 +218,8 @@ def load_model(
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-    return ModelBundle(model=model, tokenizer=tok, device=dev, name=name_or_path)
+    return ModelBundle(model=model, tokenizer=tok, device=dev, name=name_or_path,
+                       adapter_path=adapter_path)
 
 
 def render_chat(tokenizer: Any, messages: Sequence[Dict[str, str]], add_generation_prompt: bool = True) -> str:

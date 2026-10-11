@@ -151,6 +151,7 @@ def eval_student(
         pred = None
         try:
             if reasoner is not None:
+                reasoner.set_schema(ex.db_path, ex.db_id)
                 run = reasoner.generate(
                     sp["system"], sp["user"], max_new_tokens=max_new_tokens,
                     temperature=temperature, n_latent_roles=latent_roles,

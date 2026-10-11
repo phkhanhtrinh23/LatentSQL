@@ -27,6 +27,7 @@ so the debate happens in activation space and only the final query is decoded.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..llm.hf_local import ModelBundle, render_chat
@@ -130,10 +131,101 @@ class LatentReasoner:
     def __init__(self, bundle: ModelBundle, cfg: Any):
         self.bundle = bundle
         self.cfg = cfg
-        self.align = build_aligner(
+        self._vocab_align = build_aligner(
             bundle, mode=cfg.align, top_k=cfg.soft_embed_top_k,
             temperature=cfg.soft_embed_temperature,
         )
+        # Role r1 (schema selection) may use its own aligner (paper Sec. 4.2):
+        # "vocab" (Eq. 9, same as the other roles), "schema" (Eq. 10-12),
+        # "hard" (argmax token embedding) or "identity" (raw hidden state).
+        # Trained W_S / execution heads live in <adapter>/latent_extras.pt and
+        # carry the r1 mode with them, so eval and GRPO pick it up unchanged.
+        self.extras = None
+        self.align_r1 = getattr(cfg, "align_r1", "vocab") or "vocab"
+        self._active_role: Optional[str] = None
+        self._schema_ctx = None
+        self.schema_pis: List[Any] = []      # live pihat per r1 step (for L_schema)
+        self.exec_states: List[Any] = []     # live hidden states of exec-supervised roles
+        self.record_states = False
+        self._init_extras()
+
+    # -- r1 alignment / extras ---------------------------------------------
+    def _init_extras(self) -> None:
+        from .schema_latent import EXTRAS_FILE, ExecHeads, LatentExtras, SchemaAligner
+
+        d = self.bundle.model.config.hidden_size
+        dev = self.bundle.device
+        path = getattr(self.bundle, "adapter_path", None)
+        path = os.path.join(path, EXTRAS_FILE) if path else None
+        if path and os.path.exists(path):
+            self.extras = LatentExtras.load(path, d, dev)
+            self.align_r1 = self.extras.align_r1
+        want_schema = self.align_r1 == "schema"
+        want_heads = bool(getattr(self.cfg, "exec_heads", False))
+        # any non-default r1 mode is persisted (even "hard"/"identity", which
+        # have no parameters) so a saved adapter is evaluated the way it trained
+        if want_schema or want_heads or self.align_r1 != "vocab":
+            if self.extras is None:
+                self.extras = LatentExtras(align_r1=self.align_r1)
+            if want_schema and self.extras.schema is None:
+                self.extras.schema = SchemaAligner(
+                    d, dev, top_k=getattr(self.cfg, "schema_top_k", 10),
+                    tau=getattr(self.cfg, "schema_tau", 0.5),
+                    beta=getattr(self.cfg, "schema_beta", 0.3),
+                )
+            if want_heads and self.extras.exec_heads is None:
+                self.extras.exec_heads = ExecHeads(d, dev)
+            self.extras.align_r1 = self.align_r1
+
+    def save_extras(self, out_dir: str) -> None:
+        if self.extras is not None:
+            self.extras.save(out_dir)
+
+    def set_schema(self, db_path: Optional[str], db_id: Optional[str] = None) -> None:
+        """Database whose tables/columns r1's schema-space thoughts range over."""
+        if self.align_r1 != "schema":
+            return
+        if not db_path:
+            raise ValueError("schema-space alignment needs the example's db_path")
+        self._schema_ctx = self.extras.schema.items(self.bundle, db_path, db_id)
+
+    def set_role(self, role: Optional[str]) -> None:
+        self._active_role = role
+
+    def reset_records(self) -> None:
+        self.schema_pis = []
+        self.exec_states = []
+
+    def align(self, h):
+        """Map a last-layer state back to input space for the active role."""
+        import torch
+
+        roles = [r for r in self.cfg.roles if r != "consensus"]
+        is_r1 = bool(roles) and self._active_role == roles[0]
+        mode = self.align_r1 if is_r1 else "vocab"
+        if self.record_states and not is_r1 and self._active_role is not None:
+            self.exec_states.append(h.reshape(-1))
+        if mode == "vocab":
+            return self._vocab_align(h)
+        if mode == "identity":
+            return h
+        model = self.bundle.model
+        if mode == "hard":
+            W_out = model.get_output_embeddings().weight
+            W_in = model.get_input_embeddings().weight
+            idx = (h.to(W_out.dtype) @ W_out.t()).argmax(-1)
+            return W_in[idx]
+        if mode == "schema":
+            if self._schema_ctx is None:
+                raise RuntimeError("align_r1='schema' but set_schema() was not called")
+            E, P, _index = self._schema_ctx
+            a, pihat = self.extras.schema.align(h, self._vocab_align(h), E, P)
+            self.schema_pis.append(pihat)
+            return a.to(h.dtype)
+        raise ValueError(f"unknown align_r1 mode {mode!r}")
+
+    def schema_items(self) -> List[str]:
+        return list(self._schema_ctx[2].keys) if self._schema_ctx is not None else []
 
     # -- low level --------------------------------------------------------
     def _latent_steps(self, inputs_embeds, past_key_values, attention_mask, m: int,
@@ -536,6 +628,7 @@ class LatentReasoner:
                     full_ids = tok(role_turns[idx], add_special_tokens=False)["input_ids"]
                     aux_target_ids = full_ids[: cfg.latent_steps]
 
+                self.set_role(role)
                 inputs_embeds = self.align(last_hidden[0][:, -1:, :])
                 inputs_embeds, past, attention_mask, next_logits, aux_loss = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps,
@@ -627,6 +720,7 @@ class LatentReasoner:
                 if role == "consensus":
                     consensus_fed = True
                     break
+                self.set_role(role)
                 inputs_embeds = self.align(last_hidden[:, -1:, :])
                 inputs_embeds, past, attention_mask, _h, _aux = self._latent_steps(
                     inputs_embeds, past, attention_mask, cfg.latent_steps

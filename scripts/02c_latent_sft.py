@@ -61,7 +61,7 @@ def main() -> int:
                     help="weight for --sql-ready-role auxiliary loss")
     ap.add_argument("--sql-ready-tokens", type=int, default=16,
                     help="number of SQL-answer target tokens used by the sql-readiness probe")
-    ap.add_argument("--chain-format", choices=("debate_roles", "chess_steps"),
+    ap.add_argument("--chain-format", choices=("debate_roles", "chess_steps", "chess_reviser", "reviser_repair"),
                     default="debate_roles",
                     help="which ordered step chain to derive from traces for curriculum metadata")
     ap.add_argument("--require-role-turns", action="store_true",
@@ -98,6 +98,22 @@ def main() -> int:
                          "exp_avg_sq) across subprocess boundaries - without this every chain "
                          "step starts from zero momentum, which is far noisier than a real "
                          "training run's optimizer")
+    ap.add_argument("--align-r1", choices=("vocab", "schema", "hard", "identity"), default=None,
+                    help="aligner for the first role's latent steps (paper Sec. 4.2); a starting "
+                         "adapter with latent_extras.pt keeps its own mode")
+    ap.add_argument("--schema-top-k", type=int, default=None, help="n_S")
+    ap.add_argument("--schema-tau", type=float, default=None)
+    ap.add_argument("--schema-beta", type=float, default=None, help="FK propagation weight")
+    ap.add_argument("--exec-heads", action="store_true",
+                    help="execution-property heads on the latent states after r1 (Eq. 14)")
+    ap.add_argument("--lambda-schema", type=float, default=0.5, help="weight of L_schema")
+    ap.add_argument("--mu-exec", type=float, default=0.1, help="weight of L_exec")
+    ap.add_argument("--probe-weight", type=float, default=0.0,
+                    help="lambda of L_probe (paper Eq. 16): at stage k > 1 rehearse a random "
+                         "earlier stage's first --probe-tokens SQL tokens")
+    ap.add_argument("--probe-tokens", type=int, default=16, help="kappa")
+    ap.add_argument("--extras-lr", type=float, default=1e-3,
+                    help="learning rate of W_S and the execution heads")
     args = ap.parse_args()
 
     limits = limit_resources()
@@ -109,6 +125,13 @@ def main() -> int:
         cfg.latent.latent_steps = args.latent_steps
     if args.roles:
         cfg.latent.roles = [r.strip() for r in args.roles.split(",")]
+    if args.align_r1:
+        cfg.latent.align_r1 = args.align_r1
+    for name in ("schema_top_k", "schema_tau", "schema_beta"):
+        if getattr(args, name) is not None:
+            setattr(cfg.latent, name, getattr(args, name))
+    if args.exec_heads:
+        cfg.latent.exec_heads = True
 
     banner("loading the SFT student")
     from latentsql.llm.hf_local import load_model, resolve_model_path
@@ -185,6 +208,8 @@ def main() -> int:
         sql_ready_tokens=args.sql_ready_tokens,
         require_role_turns=args.require_role_turns,
         optim_state_path=args.optim_state,
+        lambda_schema=args.lambda_schema, mu_exec=args.mu_exec, extras_lr=args.extras_lr,
+        probe_weight=args.probe_weight, probe_tokens=args.probe_tokens,
     )
     result = train_latent_sft(bundle, records, run_cfg, log_path=f"{args.out}_result.json")
     write_json({k: v for k, v in result.items() if k != "history"},
