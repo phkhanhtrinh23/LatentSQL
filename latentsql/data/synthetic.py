@@ -1,11 +1,9 @@
-"""A tiny self-contained Text-to-SQL benchmark.
+"""A tiny self-contained Text-to-SQL fixture for the smoke test.
 
-The real experiments run on BIRD and Spider under ``/mnt/win_d/data_FusionSQL``.
-This module builds two small SQLite databases plus ~30 question/gold-SQL pairs
-so that the whole pipeline - value retrieval, schema linking, the debate,
-trace serialisation, reward computation, SFT and GRPO - can be exercised end to
-end on any machine, with no downloads and no GPU. It is a *plumbing* fixture,
-not a benchmark: never report numbers from it.
+Two small SQLite databases and 30 question/SQL pairs, so the whole pipeline
+(retrieval, teacher, curriculum, RL, evaluation) runs on any machine with no
+download, no GPU and no API key. It checks plumbing only: never report
+numbers from it.
 """
 from __future__ import annotations
 
@@ -234,8 +232,10 @@ _QUESTIONS: List[Tuple[str, str, str, str, str]] = [
 ]
 
 
-def load_synthetic(root: str, limit: int | None = None) -> List[Example]:
-    """Materialise the databases under ``root`` and return the question set."""
+def load_synthetic(root: str, split: str = "train", limit: int | None = None) -> List[Example]:
+    """Materialise the databases under ``root`` and return one split (train | test)."""
+    from .loaders import random_split
+
     db_root = build_databases(root)
     out: List[Example] = []
     for i, (db_id, q, sql, ev, diff) in enumerate(_QUESTIONS):
@@ -251,4 +251,15 @@ def load_synthetic(root: str, limit: int | None = None) -> List[Example]:
                 db_path=os.path.join(db_root, db_id, f"{db_id}.sqlite"),
             )
         )
+    # a follow-up question with interaction history H, as in SParC / CoSQL
+    out.append(Example(
+        qid="synthetic_dialogue_1", db_id="concert_singer",
+        question="Which of them are older than 40?",
+        gold_sql="SELECT name FROM singer WHERE country = 'France' AND age > 40",
+        history=["List the names of all singers from France."],
+        dataset="synthetic", difficulty="moderate",
+        db_path=os.path.join(db_root, "concert_singer", "concert_singer.sqlite"),
+    ))
+    train, test = random_split(out, heldout_fraction=0.3, seed=0)
+    out = test if split == "test" else train
     return out[:limit] if limit else out

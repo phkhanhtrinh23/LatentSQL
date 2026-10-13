@@ -1,1538 +1,331 @@
-# LatentSQL — internalising multi-agent Text-to-SQL into a small language model
+# LatentSQL
 
-Distil a DIN-SQL / DAIL-SQL / CHESS / CHASE-SQL–style multi-agent system into a
-**single sub-7B model** that runs the debate in its **latent space** and emits
-only the final query.
+This is the official code for **"LatentSQL: Empowering Small Language Models for Text2SQL with Latent Reasoning"**. LatentSQL trains a single small language model (SLM) to reason through continuous latent states before it writes SQL. The pipeline has three stages:
 
-The target claim: *match or beat the explicit multi-agent system on BIRD and
-Spider, with a small local model, at a fraction of the tokens.*
+1. **Teacher.** A teacher writes verified role-based SQL traces: schema selection, candidate generation and revision.
+2. **Curriculum.** A curriculum internalises the traces into latent steps, one role at a time.
+3. **RL.** Execution-based RL with dense and spurious-correctness rewards refines the student.
 
-Method = **IMAD** (Yi et al., ACL 2026, "Latent Agents: A Post-Training
-Procedure for Internalized Multi-Agent Debate") applied to Text-to-SQL, with
-inference-time **LatentMAS** (Zou et al., ICML 2026, "Latent Collaboration in
-Multi-Agent Systems") layered on top.
+At inference the SLM runs a fixed number of latent steps and decodes only the final SQL.
 
----
+![LatentSQL pipeline](assets/pipeline.png)
 
-## 1. Contents
+## What is included
 
-| Path | What it is |
+- **Three-role teacher (Sec. 4.1).**
+  - Value retrieval with a precomputed MinHash-LSH index.
+  - A schema selector, a candidate generator, and a reviser that executes the draft and fixes it.
+  - Traces are kept only when EX = 1. The teacher is GPT-5.4 through the OpenAI API; any OpenAI-compatible server or local HuggingFace model also works.
+- **Text-to-latent curriculum (Sec. 4.2).**
+  - Warm-up on the written traces, then stages k = 1…J in which roles r1…rk become latent and the remaining roles are dropped.
+  - Losses: `L_main`, the probe rehearsal `L_probe` and the schema loss `L_schema` (Eq. 16–19), with gradients through every latent step.
+  - Alignments: the token-space soft alignment A (Eq. 12) for r2 and r3, and the schema-space alignment A_S with foreign-key propagation (Eq. 13–15) for r1.
+- **RL (Sec. 4.3).**
+  - Dr. GRPO on latent rollouts with `s(Y) = R_atomic + 1[EX=1]·R_spur` (Eq. 20–21).
+  - Five initial database instances per gold query (Appendix B), grown with VeriEQL counterexamples up to 20.
+- **Inference (Sec. 4.4).** J = 3 roles × m = 2 latent steps, then greedy decoding of the SQL only.
+- **Data.** Converters for the eight benchmarks of the paper: WikiSQL, BIRD, Spider, KaggleDBQA, SParC, CoSQL, EHRSQL and LiveSQLBench. Multi-turn history and external knowledge are part of the input `x = (q, S, K, H)`.
+- **Students.** Configurations for the five students of Table 1 (Qwen2.5-Coder 0.5B/1.5B/3B, Qwen3 4B/8B). All share the hyperparameters of Table 3.
+- **Runs.** Repeated runs over seeds with mean EX ± 95% CI, the nine ablations of Table 2, and the analyses of Appendix C (schema linking, Recall@k of π̂, probing latent steps).
+- **One script** for the whole pipeline: `scripts/run_all.sh`.
+
+The two paper figures in this README are committed as README assets. Baselines of Table 1 are run with their own released code and are not part of this repository.
+
+## 1. Create the environment
+
+Python 3.10 or newer is required. Experiments in the paper run in bfloat16 on RTX 4090 GPUs.
+
+```bash
+git clone <repository-url>
+cd latentsql
+
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+# PyTorch matching your CUDA build, then the remaining dependencies
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt
+
+# Teacher (Sec. 4.1): GPT-5.4 through the OpenAI API
+export OPENAI_API_KEY=...
+```
+
+To use another teacher, pass `--set teacher.base_url=http://<host>:<port>/v1 --set teacher.model=<name>` for any OpenAI-compatible server, or `--set teacher.backend=hf --set teacher.model=<hf id>` for a local model.
+
+### VeriEQL (counterexample search, Sec. 4.3)
+
+[VeriEQL](https://github.com/VeriEQL/VeriEQL) pins its own dependencies, so install it in a separate environment. LatentSQL calls it as a subprocess through `scripts/verieql_worker.py`.
+
+```bash
+git clone https://github.com/VeriEQL/VeriEQL tools/VeriEQL
+python -m venv tools/verieql-env
+tools/verieql-env/bin/pip install -r tools/VeriEQL/requirements.txt
+```
+
+Then set both paths in the config (or with `--set`):
+
+```yaml
+rl:
+  verieql_python: tools/verieql-env/bin/python
+  verieql_dir: tools/VeriEQL
+```
+
+Without VeriEQL, `--set rl.verifier=mutation` searches small edits of the database instead. That is a dependency-free substitute, not the paper's setting.
+
+## 2. Configure the datasets
+
+Keep downloaded data outside Git under `datasets/`, one folder per benchmark:
+
+```bash
+mkdir -p datasets
+```
+
+| Dataset | Official source | Save or extract to | Setup |
+|---|---|---|---|
+| WikiSQL | [official repository](https://github.com/salesforce/WikiSQL) | `datasets/wikisql/` | Extract `data.tar.bz2` so that `data/{train,dev,test}.jsonl` and `data/{split}.tables.jsonl` exist. |
+| BIRD | [project and download page](https://bird-bench.github.io/) | `datasets/bird/` | Unzip the train and dev packages into `train/train.json`, `train/train_databases/`, `dev/dev.json` and `dev/dev_databases/`. |
+| Spider | [project and download page](https://yale-lily.github.io/spider) | `datasets/spider/` | Extract the archive: `train_spider.json`, `train_others.json`, `dev.json`, `database/`. |
+| KaggleDBQA | [official repository](https://github.com/Chia-Hsuan-Lee/KaggleDBQA) | `datasets/kaggledbqa/` | Download `examples/` and the `databases/` archive from the repository. |
+| SParC | [project page](https://yale-lily.github.io/sparc) | `datasets/sparc/` | Extract the archive: `train.json`, `dev.json`, `database/`. |
+| CoSQL | [project page](https://yale-lily.github.io/cosql) | `datasets/cosql/` | Extract `cosql_dataset/` so that `sql_state_tracking/cosql_{train,dev}.json` and `database/` sit in this folder. |
+| EHRSQL | [official repository](https://github.com/glee4810/EHRSQL) | `datasets/ehrsql/` | Copy `dataset/ehrsql/mimic_iii/{train,valid,test}.json`. Build `mimic_iii.sqlite` with the repository's `preprocess/preprocess_db.py` (requires PhysioNet credentialed access to MIMIC-III) and place it in the same folder. |
+| LiveSQLBench | [official repository](https://github.com/bird-bench/livesqlbench), [SQLite dataset](https://huggingface.co/datasets/birdsql/livesqlbench-base-lite-sqlite) | `datasets/livesqlbench/` | Clone the SQLite release (`livesqlbench_data_sqlite.jsonl`, `<db>/`). The solution SQL is released on request; point `LIVESQLBENCH_GT` (or `--gt`) at that file. |
+
+Each benchmark is converted once into the common format:
+
+```bash
+python scripts/prepare_data.py --benchmark spider --raw datasets/spider
+python scripts/prepare_data.py --benchmark livesqlbench --raw datasets/livesqlbench --gt <solutions.jsonl>
+```
+
+This writes `data/<benchmark>/{train,test}.jsonl` and links the SQLite databases. Each line holds:
+- the question q
+- the gold SQL
+- the external knowledge K (`evidence`)
+- the interaction history H (`history`: earlier questions of the same dialogue)
+- the database path
+- the difficulty, when the benchmark provides one
+
+`scripts/run_all.sh` runs this conversion for every folder it finds under `datasets/`.
+
+Splits follow Appendix A.1:
+- **Train → dev:** BIRD, Spider, SParC and CoSQL.
+- **Train → test:** WikiSQL and EHRSQL.
+- **Random 70:30 split (seed 0):** KaggleDBQA and LiveSQLBench, which have no training split. All methods are evaluated on the same held-out 30%.
+
+Per-benchmark details:
+- **WikiSQL.** Every table becomes its own SQLite database, and the logical forms become SQL.
+- **EHRSQL.** `current_time` resolves to `2105-12-31 23:59:00`, as in the official preprocessing. Unanswerable questions are skipped unless `data.keep_unanswerable: true`.
+- **LiveSQLBench.** The `SELECT` tasks are kept. The knowledge-base entries they reference become K.
+
+## 3. Run the pipeline step by step
+
+Every script takes `--config` (see `configs/`) and repeatable `--set section.key=value` overrides.
+
+**Step 1: teacher traces (Sec. 4.1).** The script is resumable: questions already traced are skipped.
+
+```bash
+python scripts/teacher_traces.py --config configs/qwen3_8b.yaml
+# -> outputs/qwen3_8b/teacher/traces.jsonl, summary.json
+```
+
+**Step 2: warm-up and text-to-latent curriculum (Sec. 4.2).** Stages 0 (warm-up), 1, 2 and 3 are each checkpointed, and finished stages are skipped on a re-run.
+
+```bash
+python scripts/train_latent.py --config configs/qwen3_8b.yaml
+# -> outputs/qwen3_8b/latent/stage_{0,1,2,3}/, latent/final/
+```
+
+**Step 3: Dr. GRPO with dense and spurious rewards (Sec. 4.3).**
+
+```bash
+python scripts/train_rl.py --config configs/qwen3_8b.yaml
+# -> outputs/qwen3_8b/rl/final/
+```
+
+**Step 4: latent inference and EX (Sec. 4.4).**
+
+```bash
+python scripts/evaluate.py --config configs/qwen3_8b.yaml --model outputs/qwen3_8b/rl/final
+# -> outputs/qwen3_8b/eval/predictions.jsonl, report.json
+```
+
+`report.json` gives, per benchmark:
+- EX, overall and per difficulty
+- generated tokens and latent steps
+- reasoning KV-cache positions
+- per-question and total latency
+
+`--latent-roles k` decodes after the first k roles (early decoding).
+
+**Mean EX ± 95% CI over runs (Table 1).**
+
+```bash
+python scripts/aggregate.py --runs 'outputs/qwen3_8b/seed_*/eval' --out outputs/qwen3_8b/results.md
+```
+
+## 4. Configurations and hyperparameters
+
+| Config | Student |
 |---|---|
-| [COMPARISON.md](COMPARISON.md) | **LatentSQL vs. FINER-SQL** — what is actually different, what we borrowed, and what we had to change |
-| [RESULTS.md](RESULTS.md) | **Recorded results** — accuracy, cost, GPU/wall-clock, and worked examples of what internalisation fixed |
-| [METHOD.md](METHOD.md) | **The method in full detail** — the teacher panel, the trace format, both training stages, the latent layer, the evaluation protocol, and the measured drawbacks and failure modes |
-| [docs/COCONUT_LATENT_TRAINING.md](docs/COCONUT_LATENT_TRAINING.md) | **Current COCONUT-style latent training record** — CHESS-step SQL-direct curriculum, stage 1-6 results, full latent eval, token savings, and next-run hyperparameters |
-| [latentsql/mas/](latentsql/mas/) | The teacher: agents, prompts, debate orchestration, trace format, and standalone re-implementations of the four published systems |
-| [latentsql/distill/](latentsql/distill/) | IMAD stage 1 (SFT), stage 2 (GRPO + annealed reward), and the LatentMAS latent-thought module |
-| [latentsql/steering/](latentsql/steering/) | Agent-subspace extraction and activation steering (IMAD §3) |
-| [latentsql/db/](latentsql/db/) | Schema introspection, sandboxed execution, EX / VES metrics, LSH value retrieval |
-| [latentsql/data/](latentsql/data/) | BIRD / Spider loaders + a synthetic fixture for offline testing |
-| [scripts/](scripts/) | The five-step pipeline plus the smoke test |
-| [configs/](configs/) | `bird_local.yaml` (main), `spider_local.yaml`, `smoke.yaml`, `teacher_openai.yaml` |
-| [tests/](tests/) | 25 torch-free unit tests |
+| `configs/qwen2.5_coder_0.5b.yaml` | Qwen2.5-Coder-0.5B-Instruct |
+| `configs/qwen2.5_coder_1.5b.yaml` | Qwen2.5-Coder-1.5B-Instruct |
+| `configs/qwen2.5_coder_3b.yaml` | Qwen2.5-Coder-3B-Instruct |
+| `configs/qwen3_4b.yaml` | Qwen3-4B |
+| `configs/qwen3_8b.yaml` | Qwen3-8B |
+| `configs/smoke.yaml` | tiny random model, synthetic data, mock teacher (plumbing check only) |
 
----
+All configs extend `configs/default.yaml`, which holds the hyperparameters of Table 3, shared by every model size:
 
-## 2. The idea in one picture
+| Stage | Hyperparameter | Value | Config key |
+|---|---|---|---|
+| Latent reasoning | roles J, latent steps per role m | 3, 2 | `latent.roles`, `latent.latent_steps` |
+| | mixed tokens n_top, temperature τ | 10, 0.5 | `latent.top_k`, `latent.temperature` |
+| | schema items n_S, propagation weight β | 10, 0.3 | `latent.schema_top_k`, `latent.schema_beta` |
+| LoRA | rank r, scaling α | 32, 64 | `student.lora_r`, `student.lora_alpha` |
+| | target modules | attention and MLP projections | `student.lora_target_modules` |
+| Warm-up and curriculum | optimizer | AdamW (β1 = 0.9, β2 = 0.999) | |
+| | learning rate, warm-up and stage 1 | 5e-5 | `curriculum.lr` |
+| | learning rate, stages 2 and 3 | 1e-5 | `curriculum.lr_late` |
+| | epochs per stage, batch size | 3, 16 | `curriculum.epochs_per_stage`, `curriculum.batch_size` |
+| | gradient clipping norm | 1.0 | `curriculum.max_grad_norm` |
+| | probe weight λ, probe length κ | 0.5, 24 tokens | `curriculum.probe_weight`, `curriculum.probe_tokens` |
+| | schema weight λ_S | 0.5 | `curriculum.schema_weight` |
+| RL | group size, clipping range | 8, 0.2 | `rl.group_size`, `rl.clip_eps` |
+| | sampling temperature, learning rate | 1.0, 1e-6 | `rl.temperature`, `rl.lr` |
+| | maximum query length | 256 tokens | `rl.max_new_tokens` |
+| | initial instances, maximum pool size | 5, 20 | `rl.n_initial_instances`, `rl.max_pool_size` |
+| | VeriEQL row bound b, timeout t_max | 5, 10 s | `rl.verieql_bound`, `rl.verieql_timeout` |
+| Inference | decoding | greedy | `eval.temperature` |
 
-```
-                    ┌─────────────── TEACHER (expensive, explicit) ───────────────┐
-                    │                                                             │
- question + schema ─┼─▶ value retrieval ─▶ schema linking ─▶ classify/decompose ──┤
-                    │        (CHESS/CHASE)     (DIN-SQL/CHESS)     (DIN-SQL)      │
-                    │                                                             │
-                    │   ┌────────────── debate, m = 2 rounds ─────────────┐       │
-                    │   │  divide_conquer   query_plan     dail_icl       │       │
-                    │   │   (CHASE §3.3)   (CHASE §3.3)   (DAIL §3.1-3.3) │       │
-                    │   │        ↕ critique + execution feedback ↕        │       │
-                    │   └─────────────────────────────────────────────────┘       │
-                    │                      ↓ fixer (CHASE §3.4)                   │
-                    │                      ↓ selector (CHESS Unit Tester)         │
-                    └──────────────────────┬──────────────────────────────────────┘
-                                           │  tagged debate transcript
-                                           ▼
-       ┌───────────────── STUDENT (< 7B, local) ─────────────────┐
-       │  stage 1  SFT on the FULL transcript   (IMAD §2.2)      │
-       │  stage 2  GRPO, w_fmt 1.0→0.05, l 2000→500  (IMAD §2.3) │
-       │           ⇒ the debate stops being verbalised           │
-       │  optional LatentMAS roles before decoding (§3.1-3.2)    │
-       └────────────────────────┬────────────────────────────────┘
-                                ▼
-                          just the SQL
-```
+By default one student is trained on the union of the training splits and evaluated per benchmark (`data.train_benchmarks`, `data.eval_benchmarks`).
 
-The mechanism that does the work is IMAD equation (1):
+## 5. Reproduce the tables and figures
 
-```
-r(x, y) = w_fmt · R_fmt  +  w_clip · R(y; l)
-```
+<p align="center">
+  <img src="assets/latency_vs_ex.png" width="460" alt="EX versus latency on BIRD Dev">
+  <br><em>EX (%) versus the latency to answer 100 random BIRD Dev questions (Figure 1).</em>
+</p>
 
-`R_fmt` rewards emitting the debate structure tags; `R(y; l)` is 1 only if the
-**correct** query appears within the first `l` tokens. Over training `w_fmt`
-decays 1.0 → 0.05 and `l` shrinks 2000 → 500. Verbalising the debate stops
-paying and stops fitting — so the only strategy left is to run the
-multi-perspective analysis internally and answer directly.
+| Paper | Command or source |
+|---|---|
+| Table 1 | `SEEDS="0 1 2 3 4 5 6 7 8 9" bash scripts/run_all.sh configs/<model>.yaml` for each student; see `outputs/<model>/results.md` |
+| Table 2 | `SEEDS="0 1 2 3 4 5 6 7 8 9" bash scripts/run_ablations.sh configs/qwen3_8b.yaml` |
+| Table 5 | `python scripts/analysis/schema_linking.py --predictions <eval>/predictions.jsonl --dataset bird` |
+| Table 6 | `python scripts/analysis/schema_recall.py --config <cfg> --model <rl/final> --benchmarks bird` (add `--set latent.schema_beta=0` for the β = 0 row) |
+| Figure 3 | `report.json`: `by_difficulty`, `avg_generated_tokens` |
+| Figures 4–6 | `report.json`: `total_latency_s`, `avg_generated_tokens`; vary m with `--set latent.latent_steps=<m>` |
+| Figures 7, 8, 10 | `report.json`: `avg_prompt_tokens`, `avg_reasoning_positions` (one KV position per latent step) |
+| Figure 9 | `python scripts/analysis/probe_latent.py --config <cfg> --model <rl/final> --benchmarks spider` |
 
-For Text-to-SQL, "correct" means **execution match against the gold query**, so
-`R(y; l)` runs SQL rather than string-matching (see
-[rewards.py](latentsql/distill/rewards.py)).
+The ablations of Table 2 each change one setting:
 
----
+| Variant | Setting |
+|---|---|
+| w/o role traces | `curriculum.use_role_traces=false` |
+| w/o reviser role r3 | `latent.roles=[schema_selector,candidate_generator]` |
+| w/o curriculum | `curriculum.curriculum=false` |
+| w/o probe loss | `curriculum.probe_weight=0` |
+| w/o schema alignment A_S | `latent.schema_alignment=false` |
+| w/o FK propagation (β = 0) | `latent.schema_beta=0` |
+| w/o R_atomic | `rl.use_atomic=false` |
+| w/o R_spur | `rl.use_spurious=false` |
+| w/o counterexample pool | `rl.use_counterexamples=false` |
 
-## 3. Quick start
-
-### Install
-
-```bash
-python -m venv .venv && . .venv/bin/activate       # Windows: .venv\Scripts\activate
-pip install torch --index-url https://download.pytorch.org/whl/cu121   # or /cpu
-pip install -r requirements.txt
-```
-
-### Smoke test (no data, no GPU, no API key)
+## 6. Run everything from one script
 
 ```bash
-python scripts/smoke_test.py
+# one run (seed 0) of the full pipeline for one student
+bash scripts/run_all.sh configs/qwen3_8b.yaml
+
+# 10 runs as in the paper
+SEEDS="0 1 2 3 4 5 6 7 8 9" bash scripts/run_all.sh configs/qwen3_8b.yaml
+
+# offline plumbing check: synthetic data, mock teacher, tiny model, no API key
+bash scripts/run_all.sh configs/smoke.yaml
 ```
 
-Two tiers. **Tier 1** needs nothing but the standard library: it builds two
-small SQLite databases, runs the teacher and all four baselines, and checks the
-trace format and every reward term. **Tier 2** needs torch: it loads a tiny
-model, runs an SFT step, a GRPO step with a real execution-based reward, latent
-generation, and steering-vector extraction.
+`run_all.sh` does the following:
+1. converts every benchmark under `datasets/`;
+2. builds the teacher traces once;
+3. for each seed, trains the curriculum and RL student and evaluates it;
+4. writes mean EX ± 95% CI to `outputs/<model>/results.md`.
 
-Tier 2 verifies **shapes, masks, caches, hooks and schedules** — not model
-quality. A tiny model cannot write SQL; the point is that nothing is broken
-before you spend a GPU-week.
-
-See [§13 Smoke-test results](#13-smoke-test-results) for the full recorded run.
-
-### See which local models you have
+Environment variables:
 
 ```bash
-python scripts/00_list_models.py --hub /mnt/win_d/hub --max-params 7
+SEEDS="0"                       # seeds to run
+DATASETS=datasets               # raw benchmark root
+LIVESQLBENCH_GT=<file.jsonl>    # LiveSQLBench solutions
+PY=python                       # interpreter
+EXTRA="--set rl.verifier=mutation"   # extra overrides passed to every step
 ```
 
-Prints name / parameter count / path for every causal LM in the hub. Put a name
-from that list into `llm.model` (teacher) and `sft.model_name_or_path` (student).
-
-### Full pipeline on BIRD + Spider combined
-
-[`configs/mix_local.yaml`](configs/mix_local.yaml) — a 7B teacher distilled
-into a 3B student over one set drawn from **both** benchmarks:
-
-```bash
-python scripts/01_build_traces.py --config configs/mix_local.yaml --limit 600
-python scripts/02_sft.py          --config configs/mix_local.yaml
-python scripts/03_grpo.py         --config configs/mix_local.yaml
-python scripts/04_eval.py         --config configs/mix_local.yaml \
-    --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas,student,latent
-```
-
-### Full pipeline on BIRD
-
-```bash
-python scripts/01_build_traces.py --config configs/bird_local.yaml --limit 3000
-python scripts/02_sft.py          --config configs/bird_local.yaml
-python scripts/03_grpo.py         --config configs/bird_local.yaml
-python scripts/04_eval.py         --config configs/bird_local.yaml \
-    --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas,student,latent
-python scripts/05_steering.py     --config configs/bird_local.yaml --compare-base
-```
-
-### Current COCONUT-style latent run
-
-The latest recorded latent compression experiment is documented in
-[docs/COCONUT_LATENT_TRAINING.md](docs/COCONUT_LATENT_TRAINING.md). It uses a
-CHESS-step SQL-direct curriculum over:
+Output layout:
 
 ```text
-information_retriever, schema_linker, query_classifier, candidate_generator,
-query_fixer, unit_tester, consensus
+outputs/<model>/
+├── teacher/traces.jsonl, summary.json
+├── seed_<s>/latent/stage_{0,1,2,3}/, final/
+├── seed_<s>/rl/final/
+├── seed_<s>/eval/predictions.jsonl, report.json
+├── results.md
+└── logs/
 ```
 
-The completed stage-6 full latent eval is:
-
-| Run | n | EX (%) | EX bird (%) | EX spider (%) | Avg tokens | Avg output tokens | Token saved vs previous SFT |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Previous SFT student | 90 | 56.67 | 31.11 | 82.22 | 2922.8 | 1339.3 | - |
-| Full latent after stage 6 | 90 | 52.22 | 33.33 | 71.11 | 1638.0 | 67.5 | 43.96% |
-
-`Avg tokens` is `prompt_tokens + completion_tokens`; latent hidden-state steps
-are tracked separately as `extra.latent_steps`, not counted as decoded output
-tokens. The stage-6 full latent run used six latent roles and two latent steps
-per role, so each prediction used twelve latent steps before/around consensus
-generation.
-
-Individual held-out DAIL/DIN/CHESS/CHASE eval tables are not currently saved in
-the output tree. The saved teacher reference is the 900-sample trace-generation
-panel consensus, not a matched 90-example standalone-baseline eval.
-
----
-
-## 4. Local-first execution
-
-Everything defaults to **open-weight models loaded from the local hub**
-(`/mnt/win_d/hub`). No network call, no API key.
-
-```yaml
-llm:
-  backend: hf          # default
-  local_only: true     # refuse to fall back to the network
-  model: Qwen/Qwen2.5-Coder-7B-Instruct
-  model_fallbacks: [ ... ]   # tried in order if the first is not in the hub
-```
-
-`resolve_model_path()` searches the HF cache layout
-(`models--org--model/snapshots/<rev>`) *and* plain mirrors (`<hub>/org/model`,
-`<hub>/model`). If nothing matches it fails loudly and **lists the causal LMs it
-did find**, rather than silently downloading.
-
-The OpenAI-compatible backend is fully implemented
-([openai_compat.py](latentsql/llm/openai_compat.py)) and drives the identical
-agent code — it is simply never selected by default. Opt in with
-`configs/teacher_openai.yaml`. The same file points at any OpenAI-compatible
-server (vLLM, SGLang, Ollama) via `base_url`.
-
-There is also a `mock` backend. **It is a test double, not a model**: it reads
-the gold SQL and returns per-agent perturbations of it so the orchestration can
-be exercised offline. Numbers produced under `backend: mock` measure plumbing
-only and must never be reported.
-
----
-
-## 5. The teacher: FusionSQL
-
-Not a re-run of any one paper — a fusion that takes each component from the
-system that does it best. Every module is in
-[latentsql/mas/agents.py](latentsql/mas/agents.py) with the source section named
-in its docstring.
-
-| Stage | Taken from | Implementation |
-|---|---|---|
-| Keyword extraction + value retrieval | CHESS §3.1 "retrieve entity", CHASE §3.2 | MinHash-LSH over character trigrams, re-ranked by edit distance; optional embedding re-rank |
-| Schema linking | DIN-SQL §4.1 | CoT prompt → `Tables:` / `Columns:` / `Conditions:`, parsed back onto real identifiers |
-| Schema pruning | CHESS Schema Selector §3.1 | Skipped below 40 columns — CHESS §3.3 reports pruning *hurts* on small schemas. Join keys are always kept |
-| Classification + decomposition | DIN-SQL §4.2 | EASY / NON-NESTED / NESTED; NESTED also gets sub-questions |
-| Candidate agent 1 | CHASE-SQL §3.3 Alg. 1 | Divide-and-Conquer CoT |
-| Candidate agent 2 | CHASE-SQL §3.3 | Query-Plan CoT |
-| Candidate agent 3 | DAIL-SQL §3.1–3.3 | `CR^p` code representation, masked-question + query-skeleton example selection, DAIL organisation |
-| Debate rounds | Du et al. 2023 | Each agent revises after seeing the others' answers **and their execution results** |
-| Fixer | CHASE §3.4 / CHESS "revise" / DIN-SQL §4.4 | Execution-guided repair loop, ≤3 attempts |
-| Selector | CHESS Unit Tester (default), CHASE §3.5 pairwise (option) | Discriminating assertions → vote; candidates grouped by execution signature first |
-
-Two deliberate deviations, both because we have an executor the papers' prompt
-chains do not always use:
-
-1. **Execution feedback is inside the debate.** Round 2 agents see each other's
-   *results*, not just their SQL. This is what makes the transcript worth
-   distilling — the student learns which query shapes fail.
-2. **Selection groups by execution signature before asking the LLM.** Candidates
-   that return identical rows are one group, so the selector compares
-   *semantically distinct* options, not near-duplicates.
-
-The panel is intentionally **diverse rather than an ensemble of one prompt**:
-CHASE-SQL §3.3 shows diversity is what makes multi-path generation pay, and
-IMAD §3 shows distinct personas are what produce separable agent subspaces
-after internalisation.
-
-### Baselines
-
-Each published system is also available standalone, on the same schema
-rendering, executor and scorer, so comparisons are apples-to-apples rather than
-numbers copied from four papers:
-
-```bash
-python scripts/04_eval.py --methods single,din_sql,dail_sql,chess,chase_sql,fusion_mas
-```
-
-### Option: make the four systems *be* the panel
-
-The default panel is three prompt personas. The four published systems can
-instead sit on the panel themselves, so the debate the student internalises is
-an argument **between DIN-SQL, DAIL-SQL, CHESS and CHASE-SQL**:
-
-```yaml
-mas:
-  agents: [din_sql, dail_sql, chess, chase_sql]
-```
-
-Round 1 runs each system's own published pipeline end to end and takes its
-winning candidate; round 2+ uses the shared debate prompt, so the systems argue
-over each other's answers with execution feedback attached. Tags come out as
-`<|agent din_sql|>`, `<|agent chess|>`, … and the reasoning behind each
-system's selected candidate is preserved
-([`_pick`](latentsql/mas/baselines.py)), which is what makes the transcript
-worth training on.
-
-Why it is worth the cost with a 7B teacher: `trace.require_correct` throws away
-every question the teacher gets wrong, so **trace yield is the binding
-constraint**, and four independent pipelines give four shots at a correct
-candidate instead of three prompt variants of one.
-
-The price is that each panellist is itself multi-call. Measured on the
-workstation (Qwen2.5-7B-Instruct, bf16, one RTX 4090, `rounds: 2`, one prompt
-at a time through `model.generate`):
-
-| Panel | s / question | LLM calls | Output tokens | 3 000-question pass |
-|---|---:|---:|---:|---:|
-| `[din_sql, dail_sql, chess, chase_sql]` | 49.6 | 26.2 | 2 134 | ~41 h |
-| `[divide_conquer, query_plan, dail_icl]` | 18.6 | 13.8 | 968 | ~16 h |
-
-Cost is strongly split-dependent — BIRD questions ran 62-84 s against Spider's
-23-30 s, tracking schema size. Only the questions the teacher gets *right*
-survive into the corpus, so size a pass by target trace count, not question
-count.
-
-On the same four questions both panels scored 1/4 correct, but only the
-four-system panel also **reached consensus** on the one it got right, so it
-yielded 1 usable trace against the persona panel's 0. That is n = 4 — an
-illustration of where the extra 2.7x cost can pay (yield through
-`require_consensus`, not raw accuracy), *not* evidence. Run a yield probe over
-60-100 mixed questions before committing a multi-day pass.
-
-The single biggest lever is not the panel: it is that `HFLocalBackend.chat`
-generates **one prompt at a time**. Serving the same weights behind vLLM and
-switching to `backend: openai` + `base_url` (already supported, see
-[configs/teacher_openai.yaml](configs/teacher_openai.yaml)) buys continuous
-batching on the same GPU. Do that before scaling the question count.
-
----
-
-## 6. The trace format
-
-The transcript the student learns to produce
-([trace.py](latentsql/mas/trace.py)):
-
-```
-<|schema_link|> Tables: … Columns: … Values: … <|/schema_link|>
-<|classify|> NON-NESTED <|/classify|>
-<|round 1|>
-  <|agent divide_conquer|> …reasoning… ```sql …``` <|exec|> …result/error… <|/exec|> <|/agent|>
-  <|agent query_plan|>     …
-  <|agent dail_icl|>       …
-<|/round|>
-<|round 2|>  …each agent revises after seeing the others…  <|/round|>
-<|consensus|> ```sql <final query> ``` <|/consensus|>
-<|endofdebate|>
-```
-
-IMAD §2.1 is explicit that the tags carry the method: without them "the
-distinction between agents becomes difficult to make", and the §3 agent
-subspaces come out less separable. `REQUIRED_TAGS` drives `R_fmt`, and
-`extract_final_sql` degrades gracefully — after RL the student legitimately
-drops the tags and emits a bare fenced query, which still parses.
-
-**Filtering** ([build_dataset.py](latentsql/distill/build_dataset.py)) follows
-IMAD §2.1 — no-consensus debates are discarded — and goes further, because gold
-SQL gives a free execution label: traces whose consensus query is *wrong* are
-dropped too. Reported as e.g.
-`412/500 traces kept (dropped: no_consensus=31, incorrect=52, …)`.
-
----
-
-## 7. Stage 1 — SFT (IMAD §2.2)
-
-Next-token prediction over the **entire transcript**, prompt masked out of the
-loss, LoRA by default.
-
-Training on the full trace rather than only the final answer is the whole
-difference between IMAD and DebateGPT (IMAD Table 1: DebateGPT is cheapest but
-underperforms, because "without access to the full debate trace, it cannot
-leverage the intermediate interactions"). That ablation is one flag:
-
-```bash
-python scripts/02_sft.py --consensus-only     # = DebateGPT
-```
-
----
-
-## 8. Stage 2 — GRPO internalisation (IMAD §2.3)
-
-Self-contained GRPO ([grpo.py](latentsql/distill/grpo.py)) rather than a TRL
-dependency, because the method *is* the two things TRL does not expose cleanly:
-a reward whose weights change every step, and a length clip that shrinks every
-step.
-
-Per step: sample `group_size` completions → score at the current `(w_fmt, l)` →
-advantage `(r − mean)/std` within the group → clipped policy gradient with a k3
-KL penalty to the frozen SFT reference (recovered by disabling the LoRA
-adapters, so no second copy of the weights).
-
-Reward terms:
-
-| Term | Weight | Meaning |
-|---|---|---|
-| `R_fmt` | `w_fmt`: 1.0 → 0.05 | fraction of required structure tags present |
-| `R(y; l)` | `w_clip` = 1.0 | correct SQL **inside the first `l` tokens**, `l`: 2000 → 500 |
-| `R_exec` | 0.1 | the clipped query at least parses and runs |
-| `R_order` | 0.1 | tags appear in canonical order |
-
-The two IMAD terms dominate by design; the SQL-specific shaping terms are small.
-Clipping happens in **token** space via the tokenizer, not characters, so the
-schedule is not model-dependent.
-
----
-
-## 9. Latent collaboration (LatentMAS) — optional inference-time layer
-
-LatentMAS is training-free and runs N separate models. We apply its two
-mechanisms to the *one* internalised student, so the roles it absorbed get
-explicit latent compute before it commits
-([latent.py](latentsql/distill/latent.py)):
-
-- **Latent thoughts (§3.1):** feed the last-layer hidden state back as the next
-  input embedding for `m` steps. Zero tokens emitted, one forward pass each.
-- **Input–output alignment (§3.1):** a raw hidden state is out of distribution
-  as an input embedding. `soft_embed` (default) computes
-  `e = softmax(h W_out / T) W_in` over the top-k logits — exact and cheap.
-  `linear` precomputes the single `d_h × d_h` matrix.
-  > **Note on eq. (3).** The paper writes `W_a ≈ W_out^† W_in` with a
-  > pseudo-inverse. Under the convention `logits = h W_out`, the composition
-  > mapping hidden → vocab → embedding is `W_out W_in`, which is what `linear`
-  > implements (rescaled once so its output matches the mean embedding norm —
-  > without that the latent steps are fed near-zero vectors). The two agree up
-  > to logit temperature. `soft_embed` sidesteps the ambiguity, which is why it
-  > is the default.
-- **Latent working memory (§3.2):** each role's layer-wise KV cache is kept and
-  the next role generates conditioned on it — lossless in the sense of their
-  Theorem 3.3. `share_working_memory: false` ablates it (the smoke test
-  confirms the decoder then attends to 7 positions instead of 630).
-
-```bash
-python scripts/04_eval.py --methods student,latent --latent-steps 8
-```
-
-There is also a COCONUT-style **latent-slot curriculum**
-(`latent_slot_curriculum`) that progressively replaces agent blocks with
-fixed-width latent slots during SFT — a second, discrete route to
-internalisation, useful as an ablation against IMAD's purely reward-driven one.
-
----
-
-## 10. Agent subspaces (IMAD §3)
-
-Does internalisation preserve the agents, or collapse them?
-
-```bash
-python scripts/05_steering.py --compare-base
-```
-
-For each agent, build contrastive pairs sharing the same context (question +
-debate history up to `<|agent i|>`) with the target agent's real response as
-positive and another agent's as negative; take the difference in means at a
-chosen layer; normalise. Reports pairwise cosine between the directions — lower
-magnitude means more separable subspaces — and the change from base model to
-internalised student.
-
-Beyond interpretability this has a concrete use here: steering toward
-`divide_conquer` vs `query_plan` at generation time is a cheap diversity knob,
-recovering some of CHASE-SQL's multi-path candidate generation from a *single*
-model.
-
----
-
-## 11. Evaluation
-
-Every method emits the same `Prediction` records, so accuracy and cost are
-directly comparable. Output is an IMAD-shaped table — accuracy **next to** token
-consumption:
-
-| Method | Dataset | n | EX (%) | VES | Avg tokens | Avg output tokens | Tokens vs MAS |
-|---|---|---:|---:|---:|---:|---:|---:|
-
-- **EX**: Spider `eval_exec_match` semantics — row multisets compared
-  order-insensitively unless the *gold* query has a **top-level** `ORDER BY`
-  (an `ORDER BY` inside a sub-query does not count); column order ignored;
-  numeric/string forms of the same value unified.
-- **VES**: BIRD's `sqrt(t_gold / t_pred)` for correct queries, median of 3 runs.
-- **Tokens**: input + output per question, matching IMAD Table 1.
-
-Execution is sandboxed: read-only URI connections, a progress-handler interrupt
-for runaway queries, and a guard that refuses any non-read-only statement
-(including one smuggled in after a comment or a second statement).
-
----
-
-## 11b. Run logs, quantization and the pilot
-
-### One JSONL record per unit of work
-
-Every stage writes an append-only log, flushed per record, so a killed run keeps
-everything it had produced ([telemetry.py](latentsql/utils/telemetry.py)):
-
-| File | One record per | Carries |
-|---|---|---|
-| `<run>/traces/teacher_samples.jsonl` | teacher question | latency, prompt/completion tokens, LLM calls, rounds, consensus, correct, trace size, GPU alloc/reserved/peak |
-| `<run>/sft/sft_log_steps.jsonl` | optimizer step | loss, lr, tokens seen, elapsed, GPU |
-| `<run>/grpo/grpo_log_steps.jsonl` | optimizer step | reward mean, `R_fmt`, `R_clip`, generated length, the `w_fmt`/`l` schedule, SQL executions, GPU |
-| `<run>/eval*/eval_samples.jsonl` | question x method | correct, tokens, latency |
-
-Each file opens with a header record naming the GPU, the torch/transformers
-versions, the model and the quantization, so a log identifies the run that
-produced it.
-
-[`scripts/06_report.py`](scripts/06_report.py) folds all of it into one
-`report.md`: accuracy per benchmark, token and latency cost against both the
-teacher and each published baseline, and the training curves.
-
-```bash
-python scripts/06_report.py --run outputs/pilot
-```
-
-### Quantization
-
-`llm.quantization` / `sft.quantization` / `grpo.quantization` take
-`none | 4bit | 8bit` (bitsandbytes NF4 + double quant; `4bit` on the student is
-QLoRA). On this workstation 4-bit is **faster**, not slower, for the teacher:
-
-| 7B teacher, four-system panel | s / question | GPU |
-|---|---:|---:|
-| bf16 | 49.6 | 15.7 GB |
-| 4-bit NF4 | 37.6 | 5.3 GB |
-
-Single-stream decode is memory-bandwidth bound, so quartering the weight traffic
-per token more than pays for bitsandbytes' dequantisation. Expect the ordering
-to flip once generation is batched (vLLM), where compute dominates.
-
-### The pilot
-
-[`configs/pilot_mix.yaml`](configs/pilot_mix.yaml) +
-[`scripts/run_pilot.sh`](scripts/run_pilot.sh) run the whole pipeline end to end
-on real local models, sized for ~1.5 h on one 24GB card:
-
-```bash
-N_TRACE=90 N_EVAL=24 bash scripts/run_pilot.sh
-```
-
-Five stages, each a separate process so **exactly one model is resident on the
-GPU at a time**: 7B teacher builds traces, 3B student takes SFT then GRPO, then
-two separate evaluation passes - the four published systems driven by the *same
-3B backbone as the student*, and the student itself. Trace building reads the
-`train` splits and evaluation reads `dev`, so nothing scored was ever seen by
-the teacher. Finished stages are skipped on rerun.
-
-This is a pipeline proof and a log generator, **not a result** - the corpus it
-produces is far too small to train on.
-
-### GRPO memory
-
-A GRPO group is `group_size` x (prompt + completion) tokens, and on BIRD the
-prompt alone runs to thousands of tokens. Two things made that fit in 24GB:
-
-- the group gradient accumulates in chunks of `grpo.micro_batch` rollouts
-  (default 1) instead of one activation graph over the whole group;
-- log-probabilities come from `cross_entropy` walked over the sequence in
-  512-position blocks. The natural `log_softmax(logits.float())` materialises a
-  `[batch, seq, vocab]` fp32 tensor - ~2.4GB per 4k-token sequence at Qwen's
-  152k vocabulary, and the transpose forces a second copy. That single line was
-  the difference between OOM and a 15GB peak.
-
-Both are exact: forward outputs are identical and gradients agree to 1e-8.
-
----
-
-## 11c. Pilot run 1 — recorded results (2026-08-23)
-
-First end-to-end run on real local models: 7B teacher -> 3B student, one RTX
-4090, 4-bit throughout, ~1.9 h wall-clock. Logs in `outputs/pilot/`, assembled
-by [`06_report.py`](scripts/06_report.py).
-
-**Read the caveats in "What this run does not show" before quoting any number.**
-
-### Headline — the internalised 3B student vs. the four systems at the same 3B
-
-24 held-out dev questions (12 BIRD + 12 Spider), same backbone
-(`Qwen2.5-Coder-3B-Instruct`), same schema rendering, same executor, same
-scorer. 95% Wilson intervals.
-
-| Method | EX (%) | 95% CI | bird | spider | Tokens | Output | Latency | No SQL |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Single agent | 45.83 | 27.9-64.9 | 25.0 | 66.7 | 1 585 | 180 | 3.6 s | 0 |
-| DIN-SQL | 54.17 | 35.1-72.1 | 33.3 | 75.0 | 3 186 | 321 | 6.4 s | 0 |
-| **DAIL-SQL** | **62.50** | 42.7-78.8 | 41.7 | 83.3 | 4 697 | 349 | 7.1 s | 0 |
-| CHESS | 41.67 | 24.5-61.2 | 16.7 | 66.7 | 7 253 | 1 079 | 26.6 s | 0 |
-| CHASE-SQL | 50.00 | 31.4-68.6 | 33.3 | 66.7 | 6 744 | 653 | 13.0 s | 0 |
-| **LatentSQL student (ours)** | 54.17 | 35.1-72.1 | 33.3 | 75.0 | 2 097 | 675 | 24.1 s | 2 |
-
-The student ties DIN-SQL at 66% of its tokens and beats CHESS and CHASE-SQL at
-~30% of theirs; it loses to DAIL-SQL. Against the 7B teacher panel that produced
-its training data (26 710 tokens, 27.0 LLM calls per question) it answers in
-**2 097 tokens and 1 call - 7.9% of the teacher's tokens**.
-
-**Every interval overlaps every other.** At n = 24 this table cannot separate any
-two methods; it shows the pipeline produces sane numbers, nothing more.
-
-Per-question agreement is the sharper picture: of 24 questions, **6 were solved
-by all six methods and 7 by none**, so only 11 discriminate at all. The student
-solved **0 questions that no other method solved**, and lost 2 that DAIL-SQL got.
-It also emitted 2 unparseable outputs, the only method to do so.
-
-### Teacher
-
-`Qwen2.5-7B-Instruct` 4-bit, panel `[din_sql, dail_sql, chess, chase_sql]`,
-2 rounds, 81 train questions, 66.8 min, GPU peak 8.8 GB.
-
-| | n | EX | Consensus | Latency (mean/med/p90) | Tokens (mean/med/p90) | Calls |
-|---|---:|---:|---:|---:|---:|---:|
-| all | 81 | 28.40% | 86.4% | 49.5 / 40.5 / 81.2 s | 26 710 / 23 148 / 48 759 | 27.0 |
-| bird | 42 | **54.76%** | 76.2% | 63.5 / 47.1 / 116.3 s | 30 550 / 25 748 / 56 896 | 30.8 |
-| spider | 39 | **0.00%** | 97.4% | 34.4 / 28.2 / 55.2 s | 22 574 / 19 388 / 34 661 | 22.8 |
-
-Spider's 0.00% is the loader bug described below, not a property of Spider.
-Filtering kept **19/81 (23.5%)**: 51 dropped incorrect, 11 no-consensus, 0 for
-any other reason - i.e. yield is bounded almost entirely by teacher accuracy.
-That is **~17 usable traces per GPU-hour** at this configuration.
-
-### Student training
-
-SFT: 19 traces, 14 steps, 35 s, 113k tokens, peak 8.9 GB, loss 0.63 -> 0.32.
-
-GRPO: 9 steps, 14.5 min, 50 773 tokens generated, 152 real SQL executions,
-peak 6.2 GB.
-
-| step | w_fmt | clip | reward | R_fmt | R_clip | gen_len |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.881 | 838 | 0.700 | 0.375 | 0.250 | 653 |
-| 3 | 0.644 | 712 | 0.529 | 0.562 | 0.000 | 671 |
-| 5 | 0.406 | 588 | 0.613 | 0.500 | 0.250 | 681 |
-| 7 | 0.169 | 462 | 0.640 | 0.312 | 0.500 | 796 |
-| 9 | 0.050 | 400 | 0.309 | 0.188 | 0.250 | 746 |
-
-The schedule ran correctly - `w_fmt` annealed 0.88 -> 0.05 and the clip 838 ->
-400 - but **generated length did not fall** (654 -> 746, no trend) and reward did
-not rise. The GRPO student scores identically to the SFT-only student
-(54.17%, 2 075 tokens). At 97 s/step, the several hundred steps this needs is
-~13.5 h, not 15 minutes.
-
-### What this run does *not* show
-
-1. **No internalisation happened.** 9 optimizer steps on 19 traces at lr 1e-6.
-   The mechanism is verified to run; it was not trained.
-2. **The corpus is BIRD-only.** The teacher ran before the Spider fix, so all 19
-   traces are BIRD. The student still scores 75% on Spider dev, which is
-   cross-benchmark transfer, but it is not the mixed corpus the config asks for.
-3. **n = 24 and 19 traces.** Nothing here is statistically meaningful.
-
-### Two bugs this run surfaced
-
-**Spider gold SQL was never loaded.** Canonical Spider `dev.json` stores the
-*parsed* query tree under `sql` and the query *string* under `query`; the field
-probe took `sql` first and stringified the dict, so every Spider gold was a
-Python repr that cannot execute and every Spider question scored wrong -
-silently. It showed up only as Spider reading 0.00% against BIRD's 54.76%, when
-Spider is the *easier* benchmark. Fixed in `_get`, which now skips containers;
-regression test in `tests/test_core.py`.
-
-**GRPO OOMed on a 24GB card**, three compounding causes:
-
-| Cause | Fix | Peak |
-|---|---|---:|
-| whole rollout group in one activation graph | accumulate per rollout (`grpo.micro_batch`) | 23.3 GB (OOM) -> 15.0 |
-| `log_softmax(logits.float())` = fp32 `[1, 4k, 152k]` | time-chunked `cross_entropy` | -> 13.6 |
-| **gradient checkpointing never wired into GRPO** | `gradient_checkpointing_enable()` + `enable_input_require_grads()` | -> **4.6** |
-
-All three are exact: forward outputs identical, gradients agree to 1e-8.
-
----
-
-## 11d. Pilot run 2 — the Spider fix, and the first sign GRPO works
-
-Same pipeline, same seed, same 24 held-out questions; the only change upstream
-is that Spider gold SQL now loads correctly. `outputs/pilot2/`.
-
-| | run 1 | run 2 |
-|---|---:|---:|
-| teacher EX | 28.4% | **63.0%** |
-| traces kept | 19/81 (23.5%) | **46/81 (56.8%)** |
-| SFT final loss | 0.32 | **0.15** |
-| GRPO steps with a live gradient | 4/9 (44%) | **13/15 (87%)** |
-| SFT-only student | 54.17% | 41.67% |
-| **GRPO student** | 54.17% (Δ 0.0) | 50.00% (**Δ +8.3**) |
-
-**The result that matters: GRPO produced +8.3 EX in run 2, all of it on Spider
-(58.3 → 75.0).** That is the first evidence here that stage 2 does anything at
-all, and it appeared exactly when the gradient stopped being degenerate. In run
-1, with 44% dead steps, GRPO moved the weights by 6e-04 and changed nothing.
-
-The absolute number is still below run 1 because run 2's *SFT* is worse
-(41.67%), despite 2.4x the traces and half the loss - it fits the transcripts
-tightly and emits 993 output tokens against run 1's 653. Both runs sit inside
-each other's confidence intervals at n = 24.
-
-### Two failure modes the new diagnostics caught
-
-`grpo_log_steps.jsonl` now records `reward_std_mean` and `adv_nonzero_frac`.
-They exposed that a group can die from *either* end:
-
-| step | R_clip | adv_nonzero_frac | what happened |
-|---:|---:|---:|---|
-| 8 | 1.00 | **0.00** | every rollout correct *and* identically formatted - no spread |
-| 9 | 1.00 | **0.00** | fully saturated on every term |
-| 12 | 0.00 | 1.00 | every rollout wrong; rescued only by a weak R_fmt spread (std 0.05) |
-
-Run 1 died of all-wrong groups; run 2 also hits all-*correct* ones. Both give
-zero gradient. This exposes a real gap: **nothing in the reward distinguishes
-two correct rollouts of different lengths** - both score `R_clip = 1`, so GRPO
-cannot learn "be correct *and* shorter" from a saturated group, which is the
-entire internalisation objective. IMAD's length pressure only bites when the
-answer appears *late*; here the student emits the query early and keeps writing.
-
-### The student does not reliably close the debate
-
-Re-evaluating with `--max-new-tokens 3072` instead of 1024:
-
-| budget | EX | hit cap | reached `<\|consensus\|>` |
-|---|---:|---:|---:|
-| 1024 | 50.00% | 17/24 | 1/24 |
-| 3072 | 50.00% | 2/24 | 11/24 |
-
-Accuracy is *identical*. Truncation was not costing accuracy - a tempting
-hypothesis, tested and refuted (questions with short traces are simply the
-easier ones). What it does show is that even with ample room the student emits
-`<|consensus|>` on only 11 of 24 questions, so the fallback extractor is
-scraping a mid-debate query half the time. That is a format-adherence failure,
-not a budget failure.
-
----
-
-## 11e. A full worked example — real inference output, end to end
-
-Everything below is copied verbatim from an actual completed run, not written
-for illustration. Source: `outputs/imad_boost/eval/preds_student.jsonl`,
-record `qid: spider_dev_430`, checkpoint `outputs/imad_boost/grpo` (**Run 5**,
-`RESULTS.md` §5d - text-mode LatentSQL + speculative decoding, 62/252 GRPO
-steps, 53.33% EX on n = 90). Note: speculative decoding accelerated the
-*rollout generation during GRPO training* for this checkpoint; the eval run
-that produced this transcript used plain, unaccelerated `model.generate()`
-- see [§8](#8-stage-2--grpo-internalisation-imad-23) for where speculative
-decoding actually sits in the pipeline.
-
-### What actually happens at inference (recap)
-
-Per the step-by-step explanation given during this project's development: the
-question + schema are rendered into one prompt, tokenized once, and then
-LatentSQL decodes **token by token, autoregressively** - a forward pass
-produces logits, one token is picked (greedy at eval time, `temperature: 0.0`),
-appended, and the cycle repeats until an end token or the length cap. Nothing
-below is templated or hand-assembled; it is the literal sequence of tokens the
-trained weights produced, one at a time, in that loop.
-
-### The input
-
-| | |
-|---|---|
-| Dataset | Spider dev, db `wta_1` |
-| Question | *"How many players are there?"* |
-| Gold SQL | `SELECT count(*) FROM players` |
-| Prompt tokens | 1,232 |
-
-### The full raw output (every token LatentSQL generated - the "thinking text")
-<div class="my-block-box">
-  ```text
-<|schema_link|>
-Tables: players
-Columns: players.player_id
-Conditions: none
-Values: none
-<|/schema_link|>
-<|classify|> EASY <|/classify|>
-<|round 1|>
-<|agent din_sql|>
-1. The table `players` holds the requested information.
-2. Scan the `players` table to count the number of rows.
-3. Return the count as the result.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent dail_sql|>
-This question is asking for the total number of records in the `players` table.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent chess|>
-1. The table `players` holds the requested information.
-2. Scan the `players` table to count the number of rows.
-3. Return the count as the result.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent chase_sql|>
-DIVIDE:
-1. Count the number of players.
-
-CONQUER:
-1. SELECT COUNT(*) FROM players
-
-ASSEMBLE:
-
-OPTIMIZE:
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|/round|>
-<|round 2|>
-<|agent din_sql|>
-My initial query was correct and produced the right result. No changes are needed.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent dail_sql|>
-My initial query was correct and produced the right result. No changes are needed.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent chess|>
-My initial query was correct and produced the right result. No changes are needed.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|agent chase_sql|>
-My initial query was correct and produced the right result. No changes are needed.
-```sql
-SELECT COUNT(*) FROM players
-```
-<|exec|> COUNT(*)
-(100000,) <|/exec|>
-<|/agent|>
-<|/round|>
-<|consensus|>
-```sql
-SELECT COUNT(*) FROM players
-```
-<|/consensus|>
-<|endofdebate|>
-</div>
-
-### Extraction, execution, and the verdict
-
-| | |
-|---|---|
-| Extracted SQL (`extract_final_sql`, pulls the last fenced block after `<\|consensus\|>`) | `SELECT COUNT(*) FROM players` |
-| Executed against `wta_1.sqlite` | `(100000,)` |
-| Gold executed | `(100000,)` |
-| **EX verdict** | **correct** |
-| Completion tokens | 645 |
-| Latency | 20.89 s |
-
-### Analysis
-
-**What this demonstrates working.** The Run 5 checkpoint faithfully
-reproduces all four teacher systems' *distinct reasoning styles* from one set
-of weights: DIN-SQL's and CHESS's numbered decomposition, DAIL-SQL's short
-direct justification, and CHASE-SQL's DIVIDE/CONQUER/ASSEMBLE/OPTIMIZE
-framework are all present, in the correct order, with no cross-contamination
-between agents' voices. All four independently reach the same correct query
-in round 1; round 2 has every agent explicitly self-critique and confirm "no
-changes are needed" rather than skip the step - LatentSQL learned the
-debate's *shape*, not just its final answer. The `<|consensus|>` block and
-`<|endofdebate|>` marker both fire cleanly, so the extractor did not need to
-fall back to scraping a mid-debate query here.
-
-**What this demonstrates NOT working - internalisation.** This is a one-line
-`COUNT(*)` query that a single forward pass could answer directly, yet the
-model still writes a full two-round, four-agent, 645-token transcript to get
-there - the exact failure mode `RESULTS.md` §0.1 and §5.2 document: **EX
-holds, but output tokens never collapse.** A genuinely internalised LatentSQL
-would emit something close to the extracted SQL alone (a handful of tokens)
-instead of re-deriving and re-confirming it eight times. This checkpoint's
-compression anneal had only completed ~25% of its schedule when the 10-hour
-training window ran out (`RESULTS.md` §5d), which is the direct, measured
-reason the collapse has not happened yet - not evidence it cannot happen.
-
----
-
-## 12. Data
-
-Expected layout (auto-detected; vanilla BIRD/Spider layouts also work):
-
-```
-<bird_root>/dev/dev.json          + dev/dev_databases/<db_id>/<db_id>.sqlite
-<bird_root>/train/train.json      + train/train_databases/<db_id>/<db_id>.sqlite
-<spider_root>/dev.json            + database/<db_id>/<db_id>.sqlite
-<spider_root>/train_spider.json   + database/<db_id>/<db_id>.sqlite
-```
-
-Override with `paths.bird_root` / `paths.spider_root` or
-`$LATENTSQL_BIRD_ROOT` / `$LATENTSQL_SPIDER_ROOT`. The database root is chosen
-per split, so `split: train` reads `train_databases` rather than silently
-resolving train questions against the dev databases.
-
-> **On this workstation:** `/mnt/win_d/data_FusionSQL/bird` contains only
-> unfetched **git-lfs pointers** — 131-byte text files where the manifests and
-> `.sqlite` files should be. The complete copy is
-> `/mnt/win_d/data/sft_data_collections/{bird,spider}` (BIRD 1 534 dev / 9 428
-> train, Spider 1 034 dev / 8 659 train), which is what `mix_local.yaml`
-> points at. Manifest probing now rejects LFS pointers and zero-byte files
-> instead of failing three frames deep in `json.load`.
-
-### The combined BIRD + Spider set
-
-`dataset: mix` (also `bird+spider`) builds one set from both benchmarks:
-
-```yaml
-mix:
-  bird: 1500
-  spider: 1500
-  bird_split: train
-  spider_split: train
-```
-
-Each half is sampled independently under `seed` and the two are **interleaved
-by ratio**, so any prefix holds the configured mixture — `--limit 200` on a
-50/50 mix gives 100 + 100, not 200 BIRD. Every example keeps its `dataset`
-field through prediction and scoring, so `04_eval.py` reports EX per benchmark
-next to the blended number:
-
-```
-| Method | Dataset | n | EX (%) | EX bird (%) | EX spider (%) | VES | ... |
-```
-
-That split matters: BIRD and Spider differ sharply in difficulty, only BIRD
-carries the `evidence` hint, and VES is a BIRD metric — so it is averaged over
-the BIRD rows only. A single combined EX number is not comparable to any
-published result on either benchmark; report the per-benchmark columns.
-
-DAIL-SQL few-shot examples are drawn **only from the teacher-train split**;
-`split_train_dev` holds out a deterministic slice written to `heldout.jsonl`,
-which `04_eval.py --heldout` consumes. Nothing evaluated is ever in the shot pool.
-
-If neither benchmark is present, everything falls back to the synthetic fixture
-(30 questions, 2 databases) and **says so in the output**, so a fallback can
-never be mistaken for a real result.
-
----
-
-## 13. Smoke-test results
-
-Recorded run, this machine: **Windows 11, CPU-only, torch 2.13.0+cpu,
-transformers 5.15.1, peft 0.20.0**, tier-2 model
-`hf-internal-testing/tiny-random-LlamaForCausalLM` (auto-downloaded; a local hub
-model is preferred when one is present). Raw logs are committed at
-[outputs/smoke_test_output.txt](outputs/smoke_test_output.txt) and
-[outputs/unit_test_output.txt](outputs/unit_test_output.txt).
-
-```
-$ python scripts/smoke_test.py --tier 2 --n 8
-28/28 checks passed
-
-$ python tests/test_core.py
-Ran 25 tests ... OK
-```
-
-### Tier 1 — data, database layer (no torch)
-
-| Check | Result |
-|---|---|
-| synthetic benchmark builds | 30 questions, 2 databases |
-| gold queries all execute | 30/30 ok |
-| execution accuracy metric is sound | match / mismatch / order-sensitivity all correct |
-| write statements are refused | `DROP` rejected |
-| schema introspection + `CR^p` rendering | 4 tables, 17 cols, 3 FKs |
-| LSH value index retrieves cell values | exact + fuzzy hits (`singer.country = 'France'`) |
-
-### Tier 1 — teacher multi-agent system
-
-| Check | Result |
-|---|---|
-| FusionSQL teacher produces a labelled trace | EX=8/8, agents=`[dail_icl, divide_conquer, query_plan]`, max_rounds=2 |
-| debate beats its own panellists | debate=8/8 vs best single agent=8/8 |
-| trace renders, parses and round-trips through jsonl | 1720 chars, 2 rounds, 6 turns |
-| SFT corpus filtering | 8/8 kept (no_consensus=0, incorrect=0, no_sql=0, exec_failed=0, too_long=0, duplicate=0) |
-| all four baselines run | `single:5/8@462tok` · `din_sql:7/8@1250tok` · `dail_sql:7/8@2323tok` · `chess:8/8@2803tok` · `chase_sql:8/8@2719tok` |
-
-### Tier 1 — IMAD reward function
-
-| Check | Result |
-|---|---|
-| reward schedule anneals `w_fmt` and `l` | `w_fmt` 1.00→0.05, `l` 2000→500 |
-| `R_fmt` + `R(y;l)` behave as IMAD eq. 1–2 | full=2.200, internalised=1.225, late_full=1.250, wrong=0.225 |
-| length clipping actually clips | verbose trace earns 0 under a 12-token clip |
-| GRPO group advantages normalise within a group | `[1.732, -0.577, -0.577, -0.577]` |
-
-The reward row is the one worth reading closely, because it is the mechanism
-of the whole method. At **step 0** the full transcript scores 2.200 and a bare
-answer would score less — the model is paid to verbalise the debate. By the
-**last step** the same full transcript is down to 1.250 while the internalised
-bare answer holds 1.225, and a *wrong* bare answer collapses to 0.225. So the
-gradient of the reward has flipped from "show the debate" to "be right, briefly"
-— exactly IMAD §2.3 — and correctness, not brevity, is what carries the weight.
-
-### Tier 2 — training, latent, steering (torch)
-
-| Check | Result |
-|---|---|
-| student loads with LoRA attached | 1.1M params, 24K trainable |
-| prompt tokens are masked out of the SFT loss | 653 prompt tokens masked; full-trace supervises 371 target tokens vs 36 for consensus-only |
-| SFT runs and the loss is finite | 2 steps, loss=10.373 |
-| GRPO takes a real optimizer step | 2 steps, 3 SQL executions, `l`=8 |
-| GRPO updates parameters under reward variance | 28/28 LoRA tensors updated |
-| input–output aligners map hidden→embedding space | `soft_embed` ‖e‖=0.02, `linear` ‖e‖=0.06, `identity` ‖e‖=3.18 (embedding reference 0.08) |
-| latent roles run, only the final query is decoded | 6 latent steps emitted **0** tokens; 12 tokens decoded |
-| latent working memory carries earlier roles forward | 684 attended positions shared vs 7 isolated, same 6 latent steps |
-| latent-slot curriculum replaces agent blocks | 1720 → 1497 → 1185 chars |
-| contrastive pairs are built from the traces | 8 pairs, context ends at the target agent tag |
-| steering vectors extract and are separable | 3 unit vectors; pairwise cos `dail_icl\|divide_conquer=-0.51`, `dail_icl\|query_plan=+0.51`, `divide_conquer\|query_plan=-1.00` |
-| steering hook changes generation | steering altered greedy decoding |
-| student evaluation produces scored predictions | n=2, EX=0%, avg_tokens=672 |
-
-Three of these rows deserve a caveat rather than a celebration:
-
-- **`debate beats its own panellists` was 8/8 vs 8/8** — a tie, not a win. On 8
-  synthetic questions with a mock teacher the panellists already saturate, so
-  this check can only catch a *regression* (debate scoring below its best
-  member), not demonstrate a gain. The real comparison is §11 on BIRD.
-- **`GRPO takes a real optimizer step` reports `params_changed=False`.** That is
-  correct: a random-init model earns reward 0 on every rollout, so all
-  advantages are 0 and nothing should backpropagate. The separate
-  `GRPO updates parameters under reward variance` check injects reward variance
-  precisely so the gradient path is actually exercised — it moves 28/28 tensors.
-- **`student evaluation` reports EX=0%.** Expected and meaningless: the tier-2
-  model is randomly initialised. The check verifies the evaluation path
-  (prompting, decoding, SQL extraction, scoring, token accounting), not accuracy.
-
-`identity` alignment produces vectors ~40× the true embedding norm (3.18 vs
-0.08), which is the out-of-distribution failure LatentMAS §3.1 warns about, and
-why `soft_embed` is the default.
-
-### What this does *not* establish
-
-No accuracy claim. The teacher is a mock, the benchmark is a 30-question
-fixture, and the tier-2 model is random-init. What passes is that every
-component runs, composes and computes what it says it computes.
-
----
-
-## 14. Required ablations
-
-[NOVELTY_SEARCH.md](NOVELTY_SEARCH.md) surveys the neighbouring literature and
-concludes the composition is unoccupied — but it also names three ablations that
-a reviewer *will* demand, because a nearby paper already makes the competing
-claim. All three are one flag or one config line.
-
-| Ablation | Command | Answers the objection |
-|---|---|---|
-| **Full trace vs. final answer only** | `02_sft.py --consensus-only` | "is the debate transcript doing anything, or just the answers?" (DebateGPT, IMAD Table 1) |
-| **Debate panel vs. one structured format** | `mas.agents: [query_plan]` | "Struct-SQL shows a single execution-plan CoT is enough" ([arXiv:2512.17053](https://arxiv.org/pdf/2512.17053)) |
-| **GRPO from base, no teacher at all** | `03_grpo.py --from-examples bird --sft /nonexistent` | "Arctic-Text2SQL-R1 hits 68.9% BIRD with only an execution reward — is the teacher earning its cost?" ([arXiv:2505.20315](https://arxiv.org/pdf/2505.20315)) |
-
-The third is the uncomfortable one and must be reported even if unflattering.
-The honest bar for this project is not "beats the explicit MAS" — it is
-**Arctic-Text2SQL-R1-7B at 68.9% BIRD dev** and **SLM-SQL-1.5B at 67.1%**.
-
----
-
-## 15. Status and honest limits
-
-**Verified on this machine:** all 28 smoke-test checks and all 25 unit tests
-pass, CPU-only — see [§13](#13-smoke-test-results) for the recorded run. That
-covers the teacher, the four baselines, trace serialisation, every reward term
-and schedule, SFT (including loss masking and the DebateGPT ablation), a GRPO
-optimizer step *and* the gradient path under non-zero advantage, all three
-latent aligners, latent working memory, CAA extraction and steering hooks, and
-the student evaluation path.
-
-**Not yet run:** the real experiment. No BIRD/Spider results are reported here
-because this machine has neither the datasets (`/mnt/win_d` does not exist on
-it) nor the models nor a GPU. The table in §11 is a schema, not results. Nothing
-in this repository should be cited as a number until `04_eval.py` has been run
-on the workstation.
-
-**Known limitations:**
-
-- The teacher's quality bounds the student's. With a 7B local teacher, expect
-  weaker traces than the GPT-4-class teachers in the original papers — the
-  execution-based trace filter compensates by discarding wrong traces, but it
-  cannot manufacture correct ones. If teacher EX is low, use
-  `configs/teacher_openai.yaml` for trace generation only; the student stays local.
-- GRPO rollouts are the bottleneck: `group_size` × prompts generations per step,
-  each scored by executing SQL. Budget accordingly, and note that the
-  `ExecutionOracle` cache is what makes it tractable.
-- `latent` mode decodes token-by-token in Python (no KV-cache fast path through
-  `generate`), so it is slower per token than `student` mode even though it
-  emits far fewer tokens. Wall-clock comparisons should say which mode was used.
-- The mock backend's numbers are plumbing checks, never results.
-
----
-
-## 16. References
-
-Run `scripts/fetch_papers.sh` to download all six into `pdfs/` (they are not
-committed — copyright and repo size).
-
-- Yi, Mueller, Lee. *Latent Agents: A Post-Training Procedure for Internalized
-  Multi-Agent Debate.* ACL 2026. [aclanthology.org/2026.acl-long.709](https://aclanthology.org/2026.acl-long.709/)
-- Zou et al. *Latent Collaboration in Multi-Agent Systems (LatentMAS).* ICML 2026. [arXiv:2511.20639](https://arxiv.org/abs/2511.20639)
-- Pourreza & Rafiei. *DIN-SQL.* NeurIPS 2023. [arXiv:2304.11015](https://arxiv.org/abs/2304.11015)
-- Gao et al. *Text-to-SQL Empowered by LLMs (DAIL-SQL).* VLDB 2024. [arXiv:2308.15363](https://arxiv.org/abs/2308.15363)
-- Talaei et al. *CHESS.* 2024. [arXiv:2405.16755](https://arxiv.org/abs/2405.16755)
-- Pourreza et al. *CHASE-SQL.* ICLR 2025. [arXiv:2410.01943](https://arxiv.org/abs/2410.01943)
-- Du et al. *Improving Factuality and Reasoning via Multiagent Debate.* 2023.
-- Shao et al. *DeepSeekMath (GRPO).* 2024.
-- Rimsky et al. *Steering Llama 2 via Contrastive Activation Addition.* ACL 2024.
-
----
-
-## 17. GRPO on the CHESS-step latent student — recorded results (2026-08-31)
-
-Full detail, commands and the code changes are in
-[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md); this is
-the summary.
-
-`outputs/latent_sft_1000/chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200`
-is the stage-6 CHESS-step SQL-direct student (six latent roles, `latent_steps=2`,
-only the consensus SQL decoded) after 50 GRPO steps on 50 hard prompts with the
-brevity reward enabled. Evaluated on the held-out n=90 BIRD+Spider mix.
-
-### GRPO moved the student, and shortened it
-
-| | SFT (pre-GRPO) | after GRPO | Δ |
-|---|---:|---:|---:|
-| EX (n=90) | 52.22% | **58.89%** | **+6.67** |
-| bird EX | 33.33% | **37.78%** | +4.45 |
-| spider EX | 71.11% | **80.00%** | +8.89 |
-| Avg output tokens | 67.5 | **61.9** | −5.6 |
-| Unparseable | 4 | **0** | −4 |
-
-Accuracy rose while output length fell — the brevity reward doing what it was
-shaped to do — and every one of the 90 generations stayed parseable, so the
-latent → `<|consensus|>` → SQL format survived GRPO. The gain is concentrated on
-Spider. Note that GRPO's training prompts came from the same pool under the same
-length filter as the eval split, so the Spider number is the more robust half of
-this result; and the 63.33% quoted earlier for a probe checkpoint was n=30, not
-comparable to this n=90.
-
-### Speculative decoding with a same-size draft is a loss
-
-Same checkpoint and questions, drafting with the *untrained* base
-Qwen2.5-Coder-7B-Instruct (4-bit, k=3):
-
-| | greedy | speculative (7B draft) |
-|---|---:|---:|
-| EX (n=90) | **58.89%** | 57.78% |
-| **Latency / sample** | **2.09 s** | 4.26 s |
-| Total wall-clock | **188 s** | 383 s |
-| Peak GPU | **15.9 GB** | 21.8 GB |
-| Acceptance length | — | 2.34 |
-
-**2.03x slower.** A 7B draft costs about what the 7B target costs per proposed
-token, so an acceptance length of 2.34 cannot pay for the draft's forwards (317
-of the 383 s went inside the sampler), and the 4-bit quantization needed to fit
-both models on a 24 GB card makes the draft slower per token than the bf16
-target. Speculation is worth it only with a genuinely small draft —
-`--spec-draft-model` still defaults to the 0.5B. On the latent path there is
-also less to speculate on: only the ~62 decoded SQL tokens are drafted, never
-the latent prefix, and the draft cannot see the latent thoughts (it conditions
-on the plain text prompt), which holds acceptance to 0.446.
-
-The 1.11-point EX gap is decode noise, not a distributional effect: at
-`temperature 0.0` verification is lossless, 86/90 predictions are byte-identical
-and 89/90 agree on correctness. The four that differ do so because batched
-k+1-token verification is not bit-identical to one-token-per-forward greedy
-decoding in bf16; three land on equivalent SQL, one flips.
-
-`--spec-decode` previously applied only to `--methods student` and was silently
-ignored on `latent`. It is now wired through `LatentReasoner.generate()`, and
-`--spec-draft-quantization` lets the draft be quantized independently of the
-target. See section 15's note that wall-clock comparisons should always say
-which mode was used — these two rows are the same mode, `latent`, differing only
-in the sampler.
-
----
-
-## 18. Speculative decoding on the latent path — a measured dead end (2026-08-31)
-
-Section 17 closed by suggesting a *small* draft would make speculative decoding
-pay off. That was an extrapolation from a single 7B-draft run, and measuring it
-at three draft sizes shows it is **wrong**. Full detail in
-[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
-
-Same checkpoint, same held-out n=90, `--methods latent`; only the draft changes:
-
-| draft | EX | Latency/sample | Total | vs greedy | Acc. length | Peak GPU |
-|---|---:|---:|---:|---:|---:|---:|
-| none (greedy) | **58.89%** | **2.09 s** | **188 s** | **1.00x** | — | **15.9 GB** |
-| Coder-0.5B bf16 | 57.78% | 2.99 s | 269 s | 0.70x | 2.26 | 17.3 GB |
-| Coder-3B bf16 | 57.78% | 3.39 s | 305 s | 0.62x | 2.37 | 22.3 GB |
-| Coder-7B 4bit | 57.78% | 4.26 s | 383 s | 0.49x | 2.34 | 21.8 GB |
-
-**Speculation is slower at every draft size**, and the two numbers that explain
-why are: acceptance length is flat across a 14x range of draft size (2.26 →
-2.37), and shrinking the draft 14x improved wall-clock only 1.42x. Draft quality
-is not the limiter; fixed per-round overhead is. One structural cause is
-specific to this path — the target starts decoding with the latent prefix in its
-KV cache, but the draft cannot see latent thoughts, so it re-prefills the whole
-~1570-token prompt per sample to cover only ~62 generated tokens. Speculation
-needs long generations; this student's whole point is that it emits few tokens.
-
-`copy.deepcopy` of the KV cache was measured and ruled out (0.94 ms for a
-realistic 88 MB cache, ~50 ms/sample against a ~900 ms gap). The leading
-unmeasured suspect is the ~400-500 CUDA syncs per sample forced by the
-`float(...)`/`.item()` calls in the accept/reject loop.
-
-**Practical guidance: use greedy for `--methods latent`.** The `student` path,
-which emits a whole debate rather than ~62 tokens of SQL, was not measured and
-may still benefit.
-
-All four runs agree on 89/90 questions; the EX spread (58.89 vs 57.78, one
-question) is bf16 batched-verification noise, documented in section 17.
-
-### Bug this surfaced
-
-Qwen pads each model's embedding independently — Coder-7B is `vocab_size`
-152064, while 0.5B/1.5B/3B are 151936 — and the sampler's rejection step
-computes `p - q` elementwise. **`--spec-decode` only ever worked when the draft
-was the 7B target itself**; the documented default draft (Coder-0.5B) would have
-crashed, on the `student` path as well as `latent`. Fixed in
-`latentsql/distill/speculative.py` by truncating both logit vectors to the
-common vocab prefix before the softmax (which renormalises exactly; the dropped
-slots are padding no valid token id reaches). The 7B path is a no-op, so
-section 17's numbers stand.
-
----
-
-## 19. Workspace cleanup (2026-08-31)
-
-`outputs/` went **4.1 GB → 1.6 GB**. Following the same policy as the previous
-pass, nothing was deleted — everything was *moved* to
-`/tmp/latent_agent_text2sql_removed_checkpoints_20260831_0146`, so it is
-recoverable until the next reboot. Per-item rationale is in
-[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
-
-Moved (2.5 GB): a stage-6 checkpoint that was a byte-identical duplicate of the
-live adapter (md5 verified), two resume-only `optim_state.pt` files for runs
-that have finished or been superseded (617 MB each), and three GRPO smoke probes
-of 1–2 optimizer steps apiece.
-
-Kept — the five adapters that matter:
-
-| Adapter | Why |
-|---|---|
-| `sft_7b_bf16` | SFT baseline |
-| `chess_coconut_sql_direct/latent_sft` | stage-6 latent student; the 52.22% EX baseline and GRPO's starting point |
-| `chess_coconut_sql_direct_grpo_spec7b_hard50_brevity_cap1200` | 58.89% EX (section 17); superseded, weights deleted in section 23 |
-| `curriculum_chain_7b_bf16_multipass_fixed/latent_sft` | earlier documented arm |
-| `coconut_staged/latent_sft` | earlier documented arm |
-
-For the two earlier arms only the optimizer state was dropped, never the
-weights. `traces/` and all 40 eval-result directories were kept — they are ~1 MB
-each and hold the recorded numbers, including the predictions behind the 63.33%
-(n=30) probe figure whose adapter is now gone.
-
-## 20. Why stage 4 of the latent curriculum collapsed (2026-09-03)
-
-Section 11-era results recorded the CHESS-step curriculum dropping to **26.67 EX
-at stage 4**, between a 63.33 EX stage 3 and a 56.67 EX stage 5, and called it "an
-optimization/representation instability". That was wrong. The training log says
-the opposite: **stage 4 has the lowest mean loss and the lowest max loss of any
-stage.**
-
-| n_latent_roles | train loss (mean) | probe EX (n=30) | avg output tokens |
-|---:|---:|---:|---:|
-| 1 | 0.1332 | 66.67 | 62.7 |
-| 2 | 0.0186 | 66.67 | 67.8 |
-| 3 | 0.0019 | 63.33 | 61.0 |
-| **4** | **0.0008** | **26.67** | **125.7** |
-| 5 | 0.0015 | 56.67 | 72.4 |
-| 6 | 0.0014 | 63.33 | 67.4 |
-
-Three things compound, none of which the objective can see:
-
-**1. The objective is saturated by stage 3.** `text_loss` is `null` in all 1908
-step records - the SQL-direct format supervises *only* the ~62 gold-SQL tokens
-after `<|consensus|>`, because `_coconut_sequence_loss` breaks out of the role
-loop at `idx >= n_latent_roles` and never re-adds the remaining roles as text
-([`latentsql/distill/latent_sft.py:113`](latentsql/distill/latent_sft.py)). At 94
-records x 3 epochs, a per-token cross-entropy of 8e-4 means those 94 SQL strings
-are memorised. Stage 4 has no signal left to learn from.
-
-**2. Adam steps into that noise at full size.** `grad_accum` equals the batch
-size, so there are only **18 optimizer steps per stage**, and the runner wipes the
-momentum at each stage boundary. Adam divides by `sqrt(v_hat)`, so a 1e-4 gradient
-moves the weights just as far as a 1e-1 one - and freshly reset moments make the
-first steps exactly `lr * sign(g)`. At `lr=5e-5` that is real LoRA drift in a
-direction set by whichever one or two of 16 records still have non-trivial loss.
-
-**3. The drift lands on the base model's transcript prior.** 14 of 30 stage-4
-predictions were unparseable, all the same way - `schema_linker` body text after
-the consensus marker, looped to the 200-token cap:
+## 7. Implementation notes
+
+- **Schema score (Eq. 13).**
+  - The paper writes `π_c ∝ exp(⟨W_S z, e_S(c)⟩/τ)`. The code computes the score as `s · cos(A(z) + W_S z, e_S(c))`, with `W_S` initialised at zero and a learned scale `s`. At initialisation π̂ then reflects the tokens the latent state predicts, and the cosine keeps the score independent of the hidden-state norm.
+  - `W_S` and `s` are trained by `L_schema` with their own AdamW (`curriculum.schema_lr`) and saved as `schema_aligner.pt` next to the adapter.
+  - `e_S(c)` is the mean input embedding of the item's name, type and sampled values, rescaled to the average token-embedding norm.
+- **Probe loss.** j* is drawn uniformly from {0, …, k−1}; j* = 0 decodes directly after x.
+- **Training data.**
+  - The curriculum uses the questions whose teacher trace passed the EX filter.
+  - RL uses all training questions with their gold SQL.
+- **Dr. GRPO.** The token sum is divided by the constant `group_size × max_new_tokens`. One update is taken per rollout group.
+- **Multi-turn input.** H contains the earlier questions of the dialogue, not earlier gold queries.
+- **Teacher sampling.** Temperature and top-p are left at the provider default, because GPT-5-family models reject other values.
+- **Latency** covers value retrieval, latent steps and SQL decoding, measured per question at batch size 1.
+
+## 8. Repository map
 
 ```text
-<|consensus|>Tables:
-Tables: visitor, visit, museum
-Tables:
-Tables: visitor, visit, museum
-... (to the cap)
+assets/                         paper figures used above
+configs/default.yaml            hyperparameters of Table 3
+configs/<model>.yaml            the five students of Table 1; smoke.yaml for a plumbing check
+latentsql/config.py             all settings and their defaults
+latentsql/prompts.py            student input x, role tags, teacher role prompts
+latentsql/data/convert.py       official releases -> common format (8 benchmarks)
+latentsql/data/loaders.py       examples, splits, 70:30 split
+latentsql/data/inputs.py        x = (q, S, K, H) + retrieved values
+latentsql/data/synthetic.py     offline fixture for configs/smoke.yaml
+latentsql/db/execute.py         read-only SQLite execution and EX
+latentsql/db/schema.py          schema introspection and rendering
+latentsql/db/value_index.py     MinHash-LSH value retrieval
+latentsql/db/instances.py       initial database instances I(Y*) (Appendix B)
+latentsql/db/counterexample.py  counterexample-guided pool growth, VeriEQL
+latentsql/teacher/roles.py      three-role teacher and EX filter
+latentsql/teacher/trace.py      T(x) = <r1>T1 <r2>T2 <r3>T3 <sql>Y_T
+latentsql/latent/reasoner.py    token alignment A, latent inference, language-mode probe
+latentsql/latent/schema_align.py schema alignment A_S with FK propagation
+latentsql/latent/curriculum.py  warm-up, stages, L_main / L_probe / L_schema
+latentsql/latent/student.py     SLM + LoRA loading and saving
+latentsql/rl/atomic.py          R_atomic (atomic SQL operations)
+latentsql/rl/rewards.py         s(Y) = R_atomic + 1[EX=1] R_spur, instance pool
+latentsql/rl/grpo.py            Dr. GRPO through the latent steps
+latentsql/eval/evaluate.py      greedy latent inference and scoring
+latentsql/eval/metrics.py       EX, efficiency counters, mean +- 95% CI
+latentsql/llm/                  teacher backends: OpenAI-compatible, HuggingFace, mock
+scripts/prepare_data.py         convert one benchmark
+scripts/teacher_traces.py       step 1
+scripts/train_latent.py         step 2
+scripts/train_rl.py             step 3
+scripts/evaluate.py             step 4
+scripts/aggregate.py            mean EX +- 95% CI over runs
+scripts/run_all.sh              full pipeline over seeds
+scripts/run_ablations.sh        Table 2
+scripts/verieql_worker.py       VeriEQL subprocess (runs in VeriEQL's environment)
+scripts/analysis/               Table 5, Table 6, Figure 9
 ```
-
-The starting adapter `sft_7b_bf16` was trained on full debate transcripts, so
-"after a role tag comes `Tables: ...`" is baked into the weights. Latent training
-never penalises it, because on the *training* records the model does emit SQL
-correctly. The prior only fires off-distribution - which is precisely why the loss
-curve looks perfect while the held-out probe craters. The doubled output length is
-the same fact from the other side: cap-length loops, not longer queries.
-
-**The fix that was already wired in did nothing at the stage it targeted.** The
-`SQL_READY_ROLE=4` auxiliary probe fires on `idx + 1 == sql_ready_role`, so at
-stage 4 it fires after the *last* latent role - identical prefix, same gold SQL, a
-weighted duplicate of the main loss. It only became a genuine mid-curriculum
-anchor at stages 5 and 6, which were never the problem.
-
-**Retrain in flight.** Resumed from the stage-3 checkpoint into a new run dir
-`chess_coconut_sql_direct_s4fix`, leaving the original run and the GRPO checkpoint
-untouched: `lr` at stage >= 4 lowered **5e-5 -> 1e-5** (mechanism 2) and
-`SQL_READY_ROLE` moved **4 -> 3** so the probe is a real mid-prefix anchor at all
-of stages 4/5/6 (mechanism 3). Caveat recorded up front: `sql_ready_loss` is
-logging ~1e-4, i.e. saturated too, so the lower learning rate is doing nearly all
-the work. If stage 4 still collapses the next lever is structural, not a
-hyperparameter.
-
-Two unrelated infrastructure failures had to be fixed to get the retrain running,
-both at a batch boundary and both traceable to the same fact - a process exiting
-does not mean its CUDA context is released:
-
-1. **OOM.** Two per-batch processes overlapped (17.47 + 5.91 GB against a
-   22.57 GB budget) and the run aborted. The runner now has a `gpu_settle` helper
-   that waits for the card to drain before each batch and each eval.
-2. **A silent CPU downgrade, which was worse.** The next attempt logged zero
-   steps in 48 minutes while burning 1h53m of CPU time - `torch.cuda.is_available()`
-   was transiently False, `resolve_device("auto")` returned `"cpu"`, and the 7B
-   trained in host RAM ~500x too slowly without erroring. An OOM at least aborts
-   loudly; this would have quietly produced a "successful" run days later.
-   `LATENTSQL_REQUIRE_CUDA=1` now makes that path raise, the runner sets it
-   everywhere, and each batch retries once after 20 s.
-
-Full detail, including the loss tables and code references, is in
-[`docs/COCONUT_LATENT_TRAINING.md`](docs/COCONUT_LATENT_TRAINING.md).
-
-## 21. Stage-4 retrain — results (2026-09-03)
-
-Stages 4–6 were retrained from the stage-3 checkpoint with the two changes from
-section 20 (`lr` 5e-5 → 1e-5 for stage ≥ 4, `SQL_READY_ROLE` 4 → 3), into a new
-run directory `chess_coconut_sql_direct_s4fix`. The original run and the GRPO
-adapter were left untouched.
-
-**Stage probes (n=30):**
-
-| Stage | EX old | EX new | unparseable | hit 200-cap | out tokens |
-|---:|---:|---:|---:|---:|---:|
-| 4 | 26.67 | **66.67** | 14 → **0** | 14 → **0** | 125.7 → **61.6** |
-| 5 | 56.67 | **66.67** | 3 → **0** | 2 → **0** | 72.4 → **61.2** |
-| 6 | 63.33 | 63.33 | 0 → 0 | 1 → **0** | 67.4 → **62.2** |
-
-The collapse is gone (+40.00 EX at stage 4) and the `Tables:` loop failure mode is
-eliminated outright. Note also that the old run's stage-5 "recovery" was never
-complete — it still carried 3 unparseable predictions and a 72.4-token output
-length, i.e. stages 5 and 6 were partly spending capacity undoing stage-4 damage.
-
-**Full held-out latent eval (n=90) — the number that matters:**
-
-| Run | n | EX | bird | spider | Avg out tokens | Unparseable | Latency/sample |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| stage 6, original | 90 | 52.22 | 33.33 | 71.11 | 67.5 | 4 | 2.212 s |
-| stage 6, **retrained 4–6** | 90 | **57.78** | **37.78** | **77.78** | **61.2** | **0** | **2.073 s** |
-
-**+5.56 EX**, improving on both datasets, with output length down 9.3%, latency
-down 6.3%, and every unparseable prediction eliminated. The n=30 probe is flat at
-stage 6 (63.33 both runs) — the advantage only shows on the full set, which is the
-same probe-optimism already documented for the original run.
-
-**Attribution caveat.** Two knobs moved at once, so this is not a clean ablation.
-The evidence favours the learning rate: `sql_ready_loss` logged ~1e-4 throughout,
-i.e. the auxiliary probe was as saturated as the main objective and contributed
-almost no gradient. The supported claim is "lowering the late-stage learning rate
-fixes the stage-4 collapse", not "the SQL-readiness probe fixes it".
-
-**Relationship to section 17.** GRPO lifted the *original* stage-6 adapter from
-52.22 to 58.89 EX. The retrained stage-6 adapter reaches 57.78 EX **with no GRPO
-at all** — essentially the same place from a curriculum fix rather than a
-reinforcement stage. These are independent levers and the numbers must not be
-added: GRPO's +6.67 was measured from a base with a broken stage 4 in its history.
-The correct next experiment is GRPO from the new stage-6 adapter.
-
-## 22. What the SQL-readiness probe is, explained from scratch
-
-Sections 20 and 21 refer to moving `SQL_READY_ROLE` from 4 to 3 and call the
-original setting "a weighted duplicate of the main loss". That is compressed to
-the point of being useless if you have not read the training code. This section
-builds the idea up from nothing. No prior knowledge of this repo is assumed.
-
-### Step 1 — What the model is actually trained on
-
-The teacher pipeline has six reasoning steps, then a final answer:
-
-```
-information_retriever → schema_linker → query_classifier
-   → candidate_generator → query_fixer → unit_tester → <|consensus|> → SQL
-```
-
-In ordinary text training you would write all six steps out as words, then the
-SQL. COCONUT-style latent training replaces a step's *words* with a small number
-of **vectors** — numbers the model passes to itself, that never get turned into
-text. We use 2 vectors per step.
-
-So one training example looks like this, where `●` is one latent vector:
-
-```
-[the question + database schema]  <|schema_linker|> ● ●  ...  <|consensus|> SELECT ...
- └──────── plain text ─────────┘  └── tag + 2 latent vectors ──┘  └─ the answer ─┘
-```
-
-Only the SQL at the end is graded. Everything before it is context the model
-reads but is not scored on. That single fact drives everything below.
-
-### Step 2 — What "stage 4" means
-
-The curriculum hides one more step per stage. At stage *k*, the **first k steps**
-become latent vectors, and any step after that is dropped from the sequence
-entirely. So:
-
-```
-stage 3:  prompt │ r1 ●● │ r2 ●● │ r3 ●●         │ <|consensus|> │ SQL
-stage 4:  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
-                                                                   ↑
-                                                        the only graded part
-```
-
-`r1…r4` are the first four pipeline steps. Stage 4 is just stage 3 with one more
-tag and two more vectors inserted.
-
-### Step 3 — What went wrong at stage 4
-
-The model stopped writing SQL after `<|consensus|>` and instead wrote schema
-notes, over and over, until it hit the output limit:
-
-```
-<|consensus|>Tables:
-Tables: visitor, visit, museum
-Tables:
-Tables: visitor, visit, museum
-... (repeats until cut off)
-```
-
-14 of 30 test questions failed this way. The model had lost the rule
-**"`<|consensus|>` means: start writing SQL now."**
-
-### Step 4 — What the probe is supposed to do
-
-The probe is a second, cheaper question asked during the same training step. It
-takes the sequence built *so far*, tacks `<|consensus|>` onto it, and grades the
-model on just the first ~20 tokens of SQL:
-
-```
-probe:  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ <|consensus|> │ SELECT name FROM ...
-                                                          └── graded, ~24 tokens ──┘
-```
-
-Its purpose is to drill the rule directly: *whenever you see `<|consensus|>`,
-SQL comes next* — so the rule survives even as more steps get hidden.
-
-`SQL_READY_ROLE` decides **where** to insert that probe: after which step.
-
-### Step 5 — Why `SQL_READY_ROLE=4` did nothing
-
-At stage 4, "after step 4" is the same place the real answer already starts.
-Compare:
-
-```
-probe (role=4):  prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL[:16]
-main loss:       prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
-```
-
-Identical sequence, identical position, identical target — the probe is just a
-shorter copy of the grading that already happens. It teaches the model nothing
-new; it only counts the same thing twice.
-
-This is why the fix, as originally configured, could not have helped stage 4. It
-only landed somewhere new at stages 5 and 6 — which were never the problem.
-
-### Step 6 — Why `SQL_READY_ROLE=3` works
-
-Put the probe one step earlier and it lands somewhere the main loss never looks:
-
-```
-probe (role=3):  prompt │ r1 ●● │ r2 ●● │ r3 ●●         │ <|consensus|> │ SQL[:24]
-main loss:       prompt │ r1 ●● │ r2 ●● │ r3 ●● │ r4 ●● │ <|consensus|> │ SQL
-                                          ↑ probe cuts in here, one step early
-```
-
-Now the model is graded on starting SQL from **two different prefix lengths** in
-the same training step. It can no longer rely on "SQL follows this one exact
-sequence I have memorised"; it has to learn the general rule "`<|consensus|>`
-means SQL, regardless of what came before".
-
-There is a second benefit. The probe sits at step 3, while stages 4, 5 and 6 use
-4, 5 and 6 latent steps — so it stays *earlier than the end* in all three stages,
-and keeps drilling the rule throughout the rest of the curriculum. At `=4` it
-would have been a duplicate at stage 4 and only become useful later.
-
-### Step 7 — The honest part
-
-Moving the probe was one of two changes; the other was lowering the learning rate
-5e-5 → 1e-5 (see section 20 for why that matters). **The learning rate almost
-certainly did nearly all the work.** During the retrain the probe's own loss
-measured about 1e-4, meaning the model was already answering it essentially
-perfectly, so it pushed the weights very little.
-
-The reasoning above explains why `=3` is the *correct* setting and `=4` was a
-no-op. It does not prove `=3` is what produced the +40 EX. Establishing that
-would need one more run at `lr=1e-5` with the probe switched off.
-
-## 23. Workspace cleanup (2026-10-07)
-
-`outputs/` went **11 GB → 2.8 GB**. Unlike section 19, this pass **deleted**
-files — nothing is recoverable. Every reported number survives: each run's
-`.json`/`.jsonl`/`.md`/`.log` files (predictions, eval reports, step logs) were
-kept; only adapter weights, tokenizer copies and optimizer state were removed.
-
-Kept in full:
-
-| Path | Why |
-|---|---|
-| `latent_sft_1000/chess_two_role_ex1/` | current runs: two-role latent SFT and its GRPO arms (binary, spurious, std-advantage), evals, true-EX audits |
-| `latent_sft_1000/sft_7b_bf16` | SFT base the latent run starts from |
-| `latent_sft_1000/traces/` | training data |
-| `latent_sft_1000/cache/value_indexes` | retrieval value index used at eval (slow to rebuild) |
-
-Weights deleted, results kept: `chess_coconut_sql_direct`,
-`chess_coconut_sql_direct_s4fix`, `…_grpo_spec7b_hard50_brevity_cap1200`
-(section 17's 58.89% EX, superseded by `chess_two_role_ex1` at 63–64% EX),
-`coconut_staged`, `curriculum_chain_7b_bf16_multipass_fixed`,
-`large_reward_ablation`, `pilot3` (plus its copy on `/mnt/win_d`).
-
-Deleted entirely: `chess_coconut_large_677_INVALID_retrieval_role_20261005`
-(invalid run), `chess_two_role_ex1/checkpoints` (intermediate SFT stages),
-`chess_two_role_ex1/optim_state.pt` (resume-only), `pilot3/cache`.
-
-Second pass (2026-10-11), `outputs/` 7.9 GB → 3.7 GB, same rule (weights
-deleted, every `.json`/`.jsonl`/`.md`/`.log` kept; each emptied adapter dir has a
-`WEIGHTS_DELETED.txt`). The 300-question audit
-(`chess_three_role_r3/scale/true_ex/results.md`) has two-role SFT and role-credit
-GRPO best (64.3–64.7% EX, 60.3% true EX), so only those keep weights:
-
-- weights deleted: `chess_two_role_ex1/grpo_{binary,stdadv,spurious}`,
-  `chess_three_role_r3/{latent_sft,grpo_paper,scale/grpo_paper_1000}`,
-  `chess_three_role_r3/checkpoints/stage_{1,2,3}`;
-- deleted entirely: `chess_three_role_r3/optim_state.pt` (resume-only) and
-  `chess_three_role_r3/outputs/` (a stray duplicate of `cache/value_indexes`).

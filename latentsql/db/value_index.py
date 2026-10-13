@@ -1,9 +1,9 @@
-"""Database-value retrieval for the Information-Retriever agent.
+"""Database-value retrieval with locality-sensitive hashing (Sec. 4.1).
 
-This is the CHESS "retrieve entity" tool (section 3.2) and CHASE-SQL's value
-retrieval (section 3.2): index every distinct cell value with MinHash LSH over
-character trigrams, probe it with the keywords extracted from the question,
-then re-rank the shortlist by edit-distance similarity.
+As in CHESS: every distinct cell value is indexed once with MinHash LSH over
+character trigrams, the index is probed with keywords extracted from the
+question, and the shortlist is re-ranked by edit-distance similarity. The
+retrieved values are appended to the input x in training, RL and inference.
 
 Only the standard library is used, so it runs anywhere. Embedding-based
 re-ranking is an optional third stage - pass an ``embed_fn`` to enable it.
@@ -359,7 +359,7 @@ def retrieve_value_hints(
     This helper is the single train/GRPO/eval entry point.  It never invokes
     an LLM and returns an empty list when retrieval is disabled or unavailable.
     """
-    if cfg is not None and not bool(getattr(cfg, "use_value_retrieval", True)):
+    if cfg is not None and not bool(getattr(cfg, "enabled", True)):
         return []
     if not db_path or not os.path.exists(db_path):
         return []
@@ -369,16 +369,16 @@ def retrieve_value_hints(
             db_id=db_id,
             cache_dir=cache_dir,
             max_values_per_column=int(
-                getattr(cfg, "max_values_indexed_per_column", 5000)
+                getattr(cfg, "max_values_per_column", 5000)
             ),
             num_perm=int(getattr(cfg, "lsh_signature_size", 64)),
             bands=int(getattr(cfg, "lsh_bands", 16)),
         )
         hits = index.search_many(
             extract_value_keywords(question, evidence),
-            top_k=int(getattr(cfg, "value_top_k", 5)),
-            min_similarity=float(getattr(cfg, "value_min_similarity", 0.72)),
+            top_k=int(getattr(cfg, "top_k", 5)),
+            min_similarity=float(getattr(cfg, "min_similarity", 0.72)),
         )
-        return [hit.as_text() for hit in hits[: int(getattr(cfg, "value_top_k", 5)) * 2]]
+        return [hit.as_text() for hit in hits[: int(getattr(cfg, "top_k", 5)) * 2]]
     except Exception:
         return []

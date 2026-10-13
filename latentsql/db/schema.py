@@ -1,11 +1,7 @@
 """SQLite schema introspection and prompt rendering.
 
-Rendering follows DAIL-SQL's finding (section 3.1) that the *code
-representation* ``CR^p`` - literal ``CREATE TABLE`` DDL including primary and
-foreign keys, plus a few example rows - is the strongest question
-representation for code-pretrained LLMs. ``render_schema`` produces that, and
-``prune`` implements the CHESS Schema-Selector / DIN-SQL schema-linking
-narrowing on top of it.
+``render_schema`` writes CREATE TABLE statements with primary and foreign keys
+and a few sample values per column.
 """
 from __future__ import annotations
 

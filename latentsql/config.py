@@ -1,39 +1,38 @@
-"""Configuration objects for the LatentSQL pipeline.
+"""Configuration for the LatentSQL pipeline.
 
-Everything is a plain dataclass so configs can round-trip through YAML/JSON
-without extra dependencies. ``load_config`` merges a YAML file on top of the
-defaults, so config files only need to state what they change.
+Every setting is a field of a plain dataclass. ``load_config`` reads a YAML or
+JSON file on top of the defaults, so a config file only lists what it changes.
+The defaults are the hyperparameters of the paper (Appendix A.3, Table 3).
 """
 from __future__ import annotations
 
 import dataclasses
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+#: the eight benchmarks of the paper (Appendix A.1)
+BENCHMARKS = (
+    "wikisql", "bird", "spider", "kaggledbqa", "sparc", "cosql", "ehrsql", "livesqlbench",
+)
 
-# --------------------------------------------------------------------------
-# paths
-# --------------------------------------------------------------------------
+#: the three teacher roles (Sec. 4.1): schema selection, candidate generation, revision
+ROLES = ("schema_selector", "candidate_generator", "reviser")
+
+
 @dataclass
 class PathConfig:
-    """Where data / models / outputs live.
-
-    Defaults follow the layout on the thesis workstation
-    (``/mnt/win_d/data_FusionSQL`` plus a HuggingFace hub cache at
-    ``/mnt/win_d/hub``). Override in a YAML config or via ``LATENTSQL_*``
-    environment variables when running elsewhere.
-    """
-
-    bird_root: str = "/mnt/win_d/data_FusionSQL/bird"
-    spider_root: str = "/mnt/win_d/data_FusionSQL/spider"
-    hf_hub: str = "/mnt/win_d/hub"
-    output_dir: str = "outputs"
+    #: converted benchmarks (``scripts/prepare_data.py`` writes here)
+    data_dir: str = "data"
+    output_dir: str = "outputs/latentsql"
+    #: LSH value indexes and database instances
     cache_dir: str = "outputs/cache"
+    #: optional local HuggingFace cache; ``None`` uses the default HF cache
+    hf_hub: Optional[str] = None
 
     def resolve_env(self) -> "PathConfig":
-        """Apply ``LATENTSQL_BIRD_ROOT`` / ``LATENTSQL_SPIDER_ROOT`` / ``LATENTSQL_HF_HUB``."""
+        """``LATENTSQL_DATA_DIR`` / ``LATENTSQL_OUTPUT_DIR`` / ... override the file."""
         for f in dataclasses.fields(self):
             env = os.environ.get("LATENTSQL_" + f.name.upper())
             if env:
@@ -41,393 +40,183 @@ class PathConfig:
         return self
 
 
-# --------------------------------------------------------------------------
-# teacher multi-agent system
-# --------------------------------------------------------------------------
 @dataclass
-class LLMConfig:
-    """Backend used to drive the teacher MAS (or to run a baseline).
-
-    Local-first by design: the default backend is ``hf``, i.e. an open-weight
-    model resolved out of the offline hub at ``paths.hf_hub``
-    (``/mnt/win_d/hub``). The OpenAI-compatible backend is fully implemented
-    and can drive the same agents, but it is never selected by default - you
-    have to ask for it explicitly with ``backend: openai``.
-    """
-
-    backend: str = "hf"             # hf (default, local) | openai | mock
-    #: teacher model. Resolved against ``paths.hf_hub`` first, then the HF Hub.
-    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    #: ordered fallbacks tried when ``model`` is not present in the local hub
-    model_fallbacks: List[str] = field(
-        default_factory=lambda: [
-            "Qwen/Qwen2.5-Coder-7B-Instruct",
-            "Qwen/Qwen2.5-7B-Instruct",
-            "Qwen/Qwen2.5-Coder-3B-Instruct",
-            "meta-llama/Llama-3.1-8B-Instruct",
-            "Qwen/Qwen2.5-Coder-1.5B-Instruct",
-        ]
-    )
-    local_only: bool = True         # never hit the network for backend == "hf"
-    base_url: Optional[str] = None  # for vLLM / any OpenAI-compatible server
-    api_key_env: str = "OPENAI_API_KEY"
-    temperature: float = 0.7
-    max_tokens: int = 1024
-    top_p: float = 0.95
-    seed: int = 0
-    request_timeout: float = 120.0
-    max_retries: int = 3
-    # only used by backend == "hf"
-    device: str = "auto"
-    dtype: str = "auto"
-    #: none | 4bit | 8bit - bitsandbytes weight quantisation. Lets a 7B teacher
-    #: and a 3B student share one card by taking turns; slower than bf16 when
-    #: the model already fits, because bnb dequantises on every forward pass.
-    quantization: str = "none"
-    hub_dir: Optional[str] = None   # filled from paths.hf_hub by load_config
-    max_batch: int = 8              # batched generation for candidates_per_agent > 1
+class DataConfig:
+    #: benchmarks whose training split is used (Appendix A.1, "Training and evaluation splits")
+    train_benchmarks: List[str] = field(default_factory=lambda: list(BENCHMARKS))
+    #: benchmarks evaluated on their development/test split
+    eval_benchmarks: List[str] = field(default_factory=lambda: list(BENCHMARKS))
+    #: cap on training questions per benchmark (``None`` = all)
+    max_train_per_benchmark: Optional[int] = None
+    #: cap on evaluation questions per benchmark (``None`` = all)
+    max_eval_per_benchmark: Optional[int] = None
+    #: KaggleDBQA and LiveSQLBench have no training split: random 70:30 split
+    heldout_fraction: float = 0.3
+    split_seed: int = 0
+    #: EHRSQL unanswerable questions (gold query "nan") have no EX; dropped by default
+    keep_unanswerable: bool = False
+    #: schema text longer than this is truncated in the student prompt
+    max_schema_chars: int = 12000
 
 
 @dataclass
-class MASConfig:
-    """The FusionSQL teacher: a hybrid of DIN-SQL / DAIL-SQL / CHESS / CHASE-SQL."""
+class RetrievalConfig:
+    """Database values indexed once with MinHash LSH (Sec. 4.1, after CHESS)."""
 
-    # --- retrieval (CHESS "Information Retriever" + CHASE "value retrieval") ---
-    use_value_retrieval: bool = True
-    value_top_k: int = 5
-    value_min_similarity: float = 0.72
+    enabled: bool = True
+    top_k: int = 5
+    min_similarity: float = 0.72
     lsh_signature_size: int = 64
     lsh_bands: int = 16
-    max_values_indexed_per_column: int = 5000
+    max_values_per_column: int = 5000
 
-    # --- schema linking (DIN-SQL module 1 + CHESS "Schema Selector") ---
-    use_schema_selector: bool = True
-    schema_keep_all_below_columns: int = 40   # skip pruning for tiny schemas
-    schema_max_tables: int = 8
-    schema_max_columns_per_table: int = 12
 
-    # --- classification & decomposition (DIN-SQL module 2) ---
-    use_classifier: bool = True
+@dataclass
+class TeacherConfig:
+    """The three-role teacher (Sec. 4.1). The paper uses GPT-5.4."""
 
-    # --- candidate generators = the debate panel (CHASE-SQL 3.3 + DAIL-SQL) ---
-    #     each entry is an agent id defined in latentsql/mas/agents.py
-    agents: List[str] = field(
-        default_factory=lambda: ["divide_conquer", "query_plan", "dail_icl"]
-    )
-    rounds: int = 2                 # IMAD uses m = 2 debate rounds
-    candidates_per_agent: int = 1   # >1 => temperature sampling per agent
-
-    # --- fixer (CHASE 3.4 / CHESS "revise" / DIN-SQL module 4) ---
-    use_fixer: bool = True
-    max_fix_attempts: int = 3
-
-    # --- selection (CHASE 3.5 selection agent + CHESS unit tester) ---
-    selector: str = "unit_test"     # exec_consistency | pairwise | unit_test
-    n_unit_tests: int = 3
-
-    # --- few-shot pool for the DAIL-SQL in-context-learning agent ---
-    dail_shots: int = 5
-    dail_query_similarity_threshold: float = 0.85
-
+    backend: str = "openai"             # openai | hf | mock
+    model: str = "gpt-5.4"
+    #: any OpenAI-compatible server (vLLM, SGLang, ...); ``None`` = api.openai.com
+    base_url: Optional[str] = None
+    api_key_env: str = "OPENAI_API_KEY"
+    #: None = the provider default (GPT-5-family models reject other values)
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: int = 2048
+    seed: int = 0
+    request_timeout: float = 120.0
+    max_retries: int = 5
+    #: the reviser executes the draft, reads the result or error and fixes it;
+    #: this many execute-and-fix rounds at most
+    max_revisions: int = 1
     execution_timeout: float = 30.0
-
-
-# --------------------------------------------------------------------------
-# distillation (IMAD) + latent collaboration (LatentMAS)
-# --------------------------------------------------------------------------
-@dataclass
-class TraceConfig:
-    """How teacher transcripts get turned into an SFT corpus."""
-
-    require_consensus: bool = True   # IMAD 2.1: drop debates with no consensus
-    require_correct: bool = True     # keep only traces whose final SQL matches gold
-    require_execution: bool = True   # drop traces whose final SQL errors out
-    #: when the selector picks a wrong candidate but another panellist was
-    #: right, keep the debate and promote that panellist's query. Recovers the
-    #: ~19% of questions where a correct answer existed and was discarded.
-    rescue_correct_agent: bool = False
-    max_trace_chars: int = 12000
-    dedup: bool = True
-    min_agents_agree: int = 1
+    # backend == "hf" only
+    device: str = "auto"
+    dtype: str = "auto"
+    quantization: str = "none"
+    hub_dir: Optional[str] = None
 
 
 @dataclass
-class SFTConfig:
-    """Stage 1 - debate structure learning (IMAD 2.2)."""
+class StudentConfig:
+    """The small language model and its LoRA adapters (Table 3)."""
 
-    model_name_or_path: str = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-    output_dir: str = "outputs/sft"
-    epochs: float = 3.0
-    lr: float = 1e-4
-    batch_size: int = 1
-    grad_accum: int = 8
-    max_seq_len: int = 4096
-    warmup_ratio: float = 0.03
-    weight_decay: float = 0.0
-    lora: bool = True
+    model: str = "Qwen/Qwen3-8B"
+    bf16: bool = True
+    quantization: str = "none"          # none | 4bit | 8bit
+    device: str = "auto"
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(
-        default_factory=lambda: [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]
-    )
+    #: attention and MLP projections
+    lora_target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+    ])
     gradient_checkpointing: bool = True
-    bf16: bool = True
-    quantization: str = "none"      # none | 4bit | 8bit (4bit == QLoRA)
-    # loss is taken over the whole debate trace, not just the final SQL
-    # (IMAD 2.2, in contrast to DebateGPT)
-    train_on_full_trace: bool = True
-    seed: int = 0
-    logging_steps: int = 5
-    save_steps: int = 200
-    device: str = "auto"
-
-
-@dataclass
-class DPOConfig:
-    """Stage 1.5 - preference optimisation on the teacher's failures.
-
-    SFT can only raise the likelihood of debates that went right; DPO optimises
-    a margin, so a wrong panellist's turn is pushed *down*. Pairs are free from
-    the panel: same question, one system correct and another wrong.
-    """
-
-    model_name_or_path: str = "outputs/sft"
-    output_dir: str = "outputs/dpo"
-    beta: float = 0.1               # KL strength; the standard DPO default
-    lr: float = 5.0e-6
-    epochs: float = 1.0
-    grad_accum: int = 4
-    max_seq_len: int = 3072
-    round_one_only: bool = True     # round-2 turns have already seen each other
-    #: divide the completion log-prob by its length. Our chosen/rejected pairs
-    #: come from different pipelines with different verbosity (DAIL-SQL turns
-    #: average 427 chars, CHESS 824) and the chosen one is shorter in 84% of
-    #: pairs, so a summed margin would rank terseness rather than correctness.
-    length_normalize: bool = True
-    max_pairs_per_question: int = 4
-    seed: int = 0
-    logging_steps: int = 20
-    device: str = "auto"
-
-
-@dataclass
-class RewardConfig:
-    """IMAD eq. (1):  r = w_fmt * R_fmt + w_clip * R(y; l)."""
-
-    w_fmt_start: float = 1.0
-    w_fmt_end: float = 0.05
-    w_clip: float = 1.0
-    # length annealing  l0 -> l*  (IMAD 2.3)
-    len_start: int = 2000
-    len_end: int = 500
-    schedule: str = "linear"        # linear | cosine | step
-    # extra text-to-SQL shaping (kept small so IMAD's two terms dominate)
-    w_exec_ok: float = 0.1          # query parses and runs without error
-    w_tag_order: float = 0.1        # tags appear in the canonical order
-
-    # --- dense partial credit (FINER-SQL, ICDE 2026) -----------------------
-    # Binary R(y;l) gives a rollout group zero variance whenever every rollout
-    # is wrong, and GRPO then has no gradient. These two terms are awarded ONLY
-    # to wrong rollouts, so a near-miss outscores a badly-wrong one and the
-    # group always carries signal. Set both to 0 to recover pure IMAD.
-    w_atomic: float = 0.0           # atomic-SQL-op overlap with gold
-    w_memory: float = 0.0           # similarity to verified reasoning traces
-    # --- brevity among CORRECT rollouts ------------------------------------
-    # R(y;l) is 1 for a correct rollout whatever its length, so a group in which
-    # every rollout is right has zero reward variance and GRPO learns nothing -
-    # including nothing about being shorter, which is the entire point of
-    # internalisation. This term breaks that tie: among correct rollouts, fewer
-    # tokens scores higher. It is the mirror of w_atomic/w_memory, which only
-    # ever score *wrong* rollouts.
-    w_brevity: float = 0.0
-    #: token count that scores 0 brevity. 0 => filled in from grpo.max_new_tokens.
-    brevity_ref_tokens: int = 0
-    #: the memory term rewards *producing* trace-like reasoning, which fights
-    #: the length anneal. Annealing it on w_fmt's schedule lets it guide early
-    #: and fade as verbalisation stops paying. The atomic term scores the query,
-    #: not the prose, so it is not annealed.
-    anneal_memory_with_fmt: bool = True
-    memory_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    memory_top_k: int = 5
-    memory_same_db_only: bool = False
-    required_tags: List[str] = field(default_factory=list)  # empty => trace schema default
-
-    # --- spurious correctness, checked among CORRECT rollouts --------------
-    # R_clip only checks ONE database (the one the benchmark ships), so two
-    # queries that mean different things can agree there by coincidence - a
-    # "spuriously correct" rollout that is indistinguishable from a genuinely
-    # correct one under r_clip alone. This re-executes gold vs. the prediction
-    # on several synthetic stress instances (latentsql/db/spurious.py, EX-Ext
-    # from pool_text2sql_crowd_source_mixture/main_pool_eval.pdf Appendix B,
-    # adapted to need no per-example LLM call) and discounts the correctness
-    # credit by how many of them still agree. Mirror of w_brevity: both only
-    # ever score rollouts that *already* passed r_clip, so a saturated
-    # all-correct GRPO group (zero variance, Corollary in the proof doc) can
-    # split into robustly-correct vs. merely-lucky instead of staying dead.
-    w_spurious: float = 0.0
-    #: stress instances built per gold query (Methods A/B/C combined, capped
-    #: at this count); more instances cost more SQL executions per reward call.
-    n_stress_instances: int = 5
-    #: directory the generated stress-instance .sqlite copies are cached
-    #: under, keyed by (db path, gold SQL). None => a .stress_cache/ folder
-    #: next to the original database file.
-    stress_cache_dir: Optional[str] = None
-    #: Remove a query's generated SQLite copies after its rollout group has
-    #: been scored. Essential for large corpora whose source DBs can be GBs;
-    #: leave false when later epochs should reuse the on-disk instances.
-    cleanup_stress_cache: bool = False
-    #: "weighted" = the weighted sum in DebateReward (w_clip, w_atomic, ...).
-    #: "paper" = main_latentsql.pdf Eq. (13):
-    #:   s(Y) = R_atomic(Y) + 1[EX=1] * (R_spur(Y) + R_brev(Y))
-    #: with R_atomic = phi(Jaccard) on every rollout, R_spur = 1 only if Y
-    #: matches gold on every stress instance (Eq. 16), R_brev = max(0,
-    #: 1 - |Y|/L_max) (Eq. 17), and no memory/format terms. Weights are ignored.
-    reward_mode: str = "weighted"
-
-
-@dataclass
-class GRPOConfig:
-    """Stage 2 - internalization via GRPO with dynamic reward scheduling."""
-
-    model_name_or_path: str = "outputs/sft"
-    output_dir: str = "outputs/grpo"
-    epochs: float = 2.0
-    lr: float = 1e-6
-    group_size: int = 8             # k candidates per query
-    batch_prompts: int = 2
-    grad_accum: int = 4
-    max_new_tokens: int = 2048
-    temperature: float = 1.0
-    top_p: float = 1.0
-    kl_beta: float = 0.02
-    clip_eps: float = 0.2
-    max_grad_norm: float = 1.0
-    seed: int = 0
-    logging_steps: int = 1
-    save_steps: int = 100
-    device: str = "auto"
-    bf16: bool = True
-    quantization: str = "none"      # none | 4bit | 8bit
-    #: rollouts pushed through the policy at once when accumulating the group
-    #: gradient. 1 keeps peak memory flat in group_size; raise it only if the
-    #: prompts are short.
-    micro_batch: int = 1
-    #: sample rollouts from a LatentMAS debate prefix instead of written text,
-    #: and backpropagate through the latent steps. The debate then costs zero
-    #: tokens by construction, so w_fmt/length annealing has nothing to do -
-    #: set w_fmt_start = w_fmt_end = 0 and let the reward be accuracy alone.
-    latent_rollouts: bool = False
-    #: lossless rollout acceleration (Iso et al. 2026). A draft model proposes
-    #: `spec_k` tokens, the policy verifies them in one pass, and the rejection
-    #: rule keeps the sampling distribution exactly the policy's - so the
-    #: gradient is unchanged. Speedup is bounded by the generation share of the
-    #: step, and a weak draft can be *slower* than plain decoding, so the
-    #: acceptance length is logged every step.
-    spec_decode: bool = False
-    #: True = original GRPO advantages (r - mean) / std; False = Dr. GRPO
-    #: r - mean. Kept only for the before/after ablation (rewards.group_advantages).
-    std_normalize_advantages: bool = False
-    #: latent path only: also sample group_size rollouts that stop after each
-    #: earlier role and jump to <|consensus|>; every depth gets the full reward
-    #: and all depths share one advantage baseline (per-role credit)
-    role_credit: bool = False
-    spec_draft_model: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-    #: Iso et al. Table 4: acceptance length rises with k but realized speedup
-    #: falls - k=3 was best in both their settings and k>=5 was *slower* than
-    #: plain autoregression. Longer drafts are a trap.
-    spec_k: int = 3
-    gradient_checkpointing: bool = True
-    lora: bool = True
-    reward: RewardConfig = field(default_factory=RewardConfig)
 
 
 @dataclass
 class LatentConfig:
-    """LatentMAS-style latent thoughts + latent working memory (paper 3.1/3.2)."""
+    """Recurrent latent reasoning (Sec. 3.2, 4.2, 4.4; Table 3)."""
 
-    enabled: bool = False
-    latent_steps: int = 8           # m latent steps per internal agent
-    roles: List[str] = field(
-        default_factory=lambda: ["divide_conquer", "query_plan", "dail_icl", "consensus"]
-    )
-    align: str = "soft_embed"       # soft_embed | linear | identity
-    soft_embed_top_k: int = 32
-    soft_embed_temperature: float = 1.0
-    # r1 (schema selection) aligner: vocab | schema | hard | identity
-    align_r1: str = "vocab"
-    schema_top_k: int = 10          # n_S
-    schema_tau: float = 0.5
-    schema_beta: float = 0.3        # FK propagation weight
-    exec_heads: bool = False        # execution-property heads on r2.. latent states
-    share_working_memory: bool = True   # prepend previous roles' KV caches
-    train_latent_slots: bool = False    # curriculum-replace agent spans with latent slots
-    max_context_tokens: Optional[int] = None  # optional runtime KV-prefix cap; strict
-                                             # COCONUT training should normally filter
-                                             # long records before training rather than
-                                             # silently truncating the supervised chain.
+    #: J role blocks, in order
+    roles: List[str] = field(default_factory=lambda: list(ROLES))
+    #: m latent steps per role
+    latent_steps: int = 2
+    #: n_top and tau of the token-space alignment A (Eq. 12), roles r2 and r3
+    top_k: int = 10
+    temperature: float = 0.5
+    #: schema-space alignment A_S for r1 (Eq. 13-15); false = A for every role
+    schema_alignment: bool = True
+    #: n_S, tau and beta of A_S (Eq. 13-15)
+    schema_top_k: int = 10
+    schema_temperature: float = 0.5
+    schema_beta: float = 0.3
 
 
 @dataclass
-class SteeringConfig:
-    """Agent-subspace probing via difference-in-means / CAA (IMAD section 3)."""
+class CurriculumConfig:
+    """Warm-up on teacher traces, then the text-to-latent curriculum (Sec. 4.2)."""
 
-    layer: int = -8                 # negative = counted from the last layer
-    alpha: float = 1.0
-    n_pairs: int = 128
-    normalize: bool = True
-    positions: str = "response_mean"   # response_mean | last_token
+    #: warm-up on the full verified traces (stage 0); false = "w/o role traces"
+    use_role_traces: bool = True
+    #: internalise one role per stage; false = all roles latent at once ("w/o curriculum")
+    curriculum: bool = True
+    epochs_per_stage: int = 3
+    batch_size: int = 16
+    #: learning rate of the warm-up and stage 1
+    lr: float = 5e-5
+    #: smaller learning rate of stages 2 and 3
+    lr_late: float = 1e-5
+    max_grad_norm: float = 1.0
+    #: lambda and kappa of L_probe (Eq. 18-19)
+    probe_weight: float = 0.5
+    probe_tokens: int = 24
+    #: lambda_S of L_schema (Eq. 16, 19)
+    schema_weight: float = 0.5
+    #: learning rate of W_S, which lives outside the LoRA adapter
+    schema_lr: float = 1e-3
+    #: training records longer than this (prompt + written roles) are dropped
+    max_record_tokens: int = 4096
+    logging_steps: int = 10
+    seed: int = 0
 
 
 @dataclass
-class MixConfig:
-    """A single training/eval set drawn from BIRD *and* Spider.
+class RLConfig:
+    """Dr. GRPO with dense and spurious rewards (Sec. 4.3; Table 3)."""
 
-    Selected with ``dataset: mix`` (equivalently ``bird+spider``). The two
-    halves are sampled independently and interleaved by ratio, so slicing the
-    result with ``--limit`` still gives the configured mixture. ``dataset`` is
-    preserved per example so results stay reportable per benchmark.
-    """
-
-    bird: Optional[int] = None        # questions to draw from BIRD (None = all)
-    spider: Optional[int] = None      # questions to draw from Spider
-    #: which split each half is drawn from. ``None`` means "follow whatever
-    #: split the caller asked for", so trace building reads train and
-    #: evaluation reads dev from the same config - set one explicitly only to
-    #: pin a half against the caller.
-    bird_split: Optional[str] = None
-    spider_split: Optional[str] = None
-    shuffle: bool = True
+    group_size: int = 8
+    clip_eps: float = 0.2
+    temperature: float = 1.0
+    lr: float = 1e-6
+    #: maximum query length in tokens
+    max_new_tokens: int = 256
+    epochs: float = 1.0
+    batch_prompts: int = 2
+    grad_accum: int = 4
+    max_grad_norm: float = 1.0
+    #: reward terms (Eq. 21); each can be switched off for the ablations of Table 2
+    use_atomic: bool = True
+    use_spurious: bool = True
+    use_counterexamples: bool = True
+    #: initial instances per gold query and maximum pool size (Appendix B)
+    n_initial_instances: int = 5
+    max_pool_size: int = 20
+    #: counterexample search: "verieql" (paper), or "mutation" (no external
+    #: dependency: random small edits of D; for machines without VeriEQL)
+    verifier: str = "verieql"
+    verieql_python: Optional[str] = None
+    verieql_dir: Optional[str] = None
+    #: VeriEQL row bound b and timeout t_max
+    verieql_bound: int = 5
+    verieql_timeout: float = 10.0
+    #: delete a question's generated instances after its rollout group
+    cleanup_instances: bool = True
+    max_train_examples: Optional[int] = None
+    logging_steps: int = 1
+    save_steps: int = 100
+    seed: int = 0
 
 
 @dataclass
 class EvalConfig:
-    n_samples: int = 100
-    split: str = "dev"
-    dataset: str = "bird"           # bird | spider | mix | synthetic
-    mode: str = "internalized"      # single | mas | sft_trace | internalized | latent
-    max_new_tokens: int = 1024
-    temperature: float = 0.0
-    batch_size: int = 1
-    report_ves: bool = True
-    seed: int = 0
+    max_new_tokens: int = 512
+    temperature: float = 0.0            # greedy decoding (Table 3)
+    execution_timeout: float = 30.0
 
 
 @dataclass
 class Config:
     paths: PathConfig = field(default_factory=PathConfig)
-    llm: LLMConfig = field(default_factory=LLMConfig)
-    mas: MASConfig = field(default_factory=MASConfig)
-    trace: TraceConfig = field(default_factory=TraceConfig)
-    sft: SFTConfig = field(default_factory=SFTConfig)
-    dpo: DPOConfig = field(default_factory=DPOConfig)
-    grpo: GRPOConfig = field(default_factory=GRPOConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    teacher: TeacherConfig = field(default_factory=TeacherConfig)
+    student: StudentConfig = field(default_factory=StudentConfig)
     latent: LatentConfig = field(default_factory=LatentConfig)
-    steering: SteeringConfig = field(default_factory=SteeringConfig)
-    mix: MixConfig = field(default_factory=MixConfig)
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    rl: RLConfig = field(default_factory=RLConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     seed: int = 0
 
@@ -435,15 +224,11 @@ class Config:
         return asdict(self)
 
     def dump(self, path: str) -> None:
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(self.to_dict(), fh, indent=4)
 
 
-# --------------------------------------------------------------------------
-# loading
-# --------------------------------------------------------------------------
 def _merge(dc: Any, patch: Dict[str, Any]) -> Any:
     """Recursively overwrite dataclass fields from a nested dict."""
     for key, value in patch.items():
@@ -461,26 +246,55 @@ def _read_structured(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     if path.endswith((".yaml", ".yml")):
-        try:
-            import yaml  # type: ignore
-        except ImportError as exc:  # pragma: no cover - depends on env
-            raise RuntimeError(
-                "pyyaml is required to read YAML configs; "
-                "either `pip install pyyaml` or use a .json config"
-            ) from exc
-        return yaml.safe_load(text) or {}
-    return json.loads(text)
+        import yaml
+
+        data = yaml.safe_load(text) or {}
+    else:
+        data = json.loads(text)
+    # a config may extend another one: ``base: configs/default.yaml``
+    base = data.pop("base", None)
+    if base:
+        if not os.path.isabs(base) and not os.path.exists(base):
+            base = os.path.join(os.path.dirname(path), base)
+        merged = _read_structured(base)
+        _deep_update(merged, data)
+        return merged
+    return data
 
 
-def load_config(path: Optional[str] = None, **overrides: Any) -> Config:
-    """Load defaults, apply an optional YAML/JSON file, then keyword overrides."""
+def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_update(dst[k], v)
+        else:
+            dst[k] = v
+
+
+def parse_override(text: str) -> Dict[str, Any]:
+    """``"rl.lr=2e-6"`` -> ``{"rl": {"lr": 2e-06}}`` (value parsed as YAML)."""
+    import yaml
+
+    key, _, raw = text.partition("=")
+    if not key or not _:
+        raise ValueError(f"override must look like section.key=value, got {text!r}")
+    value = yaml.safe_load(raw)
+    out: Dict[str, Any] = {}
+    cur = out
+    parts = key.strip().split(".")
+    for p in parts[:-1]:
+        cur = cur.setdefault(p, {})
+    cur[parts[-1]] = value
+    return out
+
+
+def load_config(path: Optional[str] = None, overrides: Optional[List[str]] = None) -> Config:
+    """Defaults, then an optional YAML/JSON file, then ``section.key=value`` overrides."""
     cfg = Config()
     if path:
         _merge(cfg, _read_structured(path))
-    if overrides:
-        _merge(cfg, overrides)
+    for text in overrides or []:
+        _merge(cfg, parse_override(text))
     cfg.paths.resolve_env()
-    # local-first: the HF backend and the student both read from the same hub
-    if cfg.llm.hub_dir is None:
-        cfg.llm.hub_dir = cfg.paths.hf_hub
+    if cfg.teacher.hub_dir is None:
+        cfg.teacher.hub_dir = cfg.paths.hf_hub
     return cfg

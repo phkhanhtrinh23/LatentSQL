@@ -1,7 +1,8 @@
 """OpenAI-compatible chat backend (OpenAI, vLLM, SGLang, Ollama, ...).
 
 Uses ``urllib`` so there is no hard dependency on the ``openai`` package; point
-``base_url`` at any server that speaks ``/v1/chat/completions``.
+``base_url`` at any server that speaks ``/v1/chat/completions``. The paper's
+teacher is GPT-5.4 through the OpenAI API.
 """
 from __future__ import annotations
 
@@ -31,16 +32,20 @@ class OpenAICompatBackend(LLMBackend):
         payload: Dict[str, Any] = {
             "model": kw.get("model", self.cfg.model),
             "messages": list(messages),
-            "temperature": kw.get("temperature", self.cfg.temperature),
-            "top_p": kw.get("top_p", self.cfg.top_p),
         }
+        # GPT-5-family models accept only their default sampling parameters;
+        # leave temperature / top_p unset (None) to use the provider default
+        for key in ("temperature", "top_p"):
+            value = kw.get(key, getattr(self.cfg, key, None))
+            if value is not None:
+                payload[key] = value
         max_tokens = kw.get("max_tokens", self.cfg.max_tokens)
         if max_tokens:
-            payload["max_tokens"] = int(max_tokens)
-        if kw.get("n"):
-            payload["n"] = int(kw["n"])
+            # api.openai.com expects max_completion_tokens; most compatible servers max_tokens
+            key = "max_completion_tokens" if "api.openai.com" in self.base_url else "max_tokens"
+            payload[key] = int(max_tokens)
         if getattr(self.cfg, "seed", None) is not None:
-            payload["seed"] = int(self.cfg.seed) + int(kw.get("sample_index", 0))
+            payload["seed"] = int(self.cfg.seed)
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -72,7 +77,13 @@ class OpenAICompatBackend(LLMBackend):
                 if self.record_log:
                     self.log.append({"tag": kw.get("tag", ""), "output": text})
                 return text
-            except (urllib.error.URLError, urllib.error.HTTPError, KeyError, TimeoutError) as exc:
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+                last_err = f"HTTP {exc.code}: {body}"
+                if exc.code in (400, 401, 403, 404):   # not transient
+                    break
+                time.sleep(min(2 ** attempt, 30))
+            except (urllib.error.URLError, KeyError, TimeoutError) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(min(2 ** attempt, 30))
         raise RuntimeError(f"chat completion failed after retries: {last_err}")

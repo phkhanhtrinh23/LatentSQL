@@ -1,26 +1,10 @@
-# core (tier-1 pipeline: teacher MAS, traces, rewards, evaluation)
-#   the teacher, the trace format, the executor and every reward term run on
-#   the standard library alone. Only pyyaml is needed for the config files.
-pyyaml>=6.0
-
-# optional - spurious-correctness reward (w_spurious > 0, see
-#   latentsql/db/spurious.py). Without it, stress-instance generation falls
-#   back to Method C (random row bootstrap) alone; with it, the stronger
-#   Method A/B (gold query literal boundaries) are also used. w_spurious
-#   defaults to 0 - nothing above needs this unless it is explicitly enabled.
-# sqlglot>=25.0
-
-# tier-2 (distillation: SFT, GRPO, latent thoughts, steering)
-#   install a torch build that matches your CUDA, e.g.
-#     pip install torch --index-url https://download.pytorch.org/whl/cu121
-#   or CPU-only:
-#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Python >= 3.10. Install a torch build that matches your CUDA first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.3
-transformers>=4.44
+transformers>=4.51       # Qwen3 support
 peft>=0.11
 accelerate>=0.30
-
-# optional
-#   huggingface_hub  - only needed if the smoke test has to download a model
-#   sentence-transformers - optional embedding re-rank in the value retriever
-huggingface_hub>=0.23
+safetensors>=0.4
+sqlglot>=25.0            # atomic operations, database instances
+pyyaml>=6.0
+# optional: bitsandbytes (student.quantization: 4bit / 8bit)

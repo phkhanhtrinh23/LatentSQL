@@ -1,11 +1,5 @@
-"""Local HuggingFace ``transformers`` backend.
-
-Used two ways:
-
-1. as a *teacher* driver when the teacher itself is an open-weight model, and
-2. as the *student* at evaluation time, where ``ModelBundle`` is shared with
-   the SFT / GRPO / latent modules so nothing loads the weights twice.
-"""
+"""Local HuggingFace ``transformers`` models: the student, and optionally an
+open-weight teacher."""
 from __future__ import annotations
 
 import os
@@ -16,18 +10,8 @@ from .base import LLMBackend, Usage
 
 
 def resolve_device(spec: str = "auto") -> str:
-    """Pick the compute device, optionally refusing a silent CPU downgrade.
-
-    ``torch.cuda.is_available()`` can transiently return False - e.g. while a
-    predecessor process is still tearing down its CUDA context - and the
-    "auto" path then quietly returns "cpu". Nothing downstream notices: a 7B
-    bf16 model loads into ~18 GB of host RAM and trains, just ~500x slower.
-    Observed on the 2026-09-03 stage-4 retrain, where a batch burned 1h53m of
-    CPU time without logging a single step before it was killed.
-
-    Set ``LATENTSQL_REQUIRE_CUDA=1`` (the training/eval runners do) to turn
-    that silent downgrade into an immediate, loud failure instead.
-    """
+    """Pick the compute device. ``LATENTSQL_REQUIRE_CUDA=1`` turns a silent
+    CPU fallback (e.g. a CUDA context that is still being released) into an error."""
     import os
 
     import torch
@@ -159,15 +143,7 @@ def load_model(
 ) -> ModelBundle:
     """Load a causal LM, optionally attaching a PEFT adapter.
 
-    ``hub_dir`` is set as ``HF_HOME``/``HF_HUB_CACHE`` before import so that an
-    offline hub mirror (e.g. ``/mnt/win_d/hub``) is picked up.
-
-    ``quantization`` is ``none`` (default), ``4bit`` (NF4 + double quantisation,
-    the bitsandbytes QLoRA recipe) or ``8bit``. It roughly quarters/halves the
-    weight memory, which is what lets a 7B teacher and a 3B student take turns
-    on one 24GB card with room for activations. It is not free: bitsandbytes
-    dequantises on every forward pass, so single-stream decoding is *slower*
-    than bf16 when the model already fits.
+    ``quantization`` is ``none`` (default, bf16/fp32), ``4bit`` (NF4, QLoRA) or ``8bit``.
     """
     if hub_dir and os.path.isdir(hub_dir):
         os.environ.setdefault("HF_HOME", hub_dir)
@@ -249,7 +225,7 @@ class HFLocalBackend(LLMBackend):
                 cfg.model,
                 hub_dir=hub,
                 fallbacks=getattr(cfg, "model_fallbacks", ()) or (),
-                local_only=getattr(cfg, "local_only", True),
+                local_only=getattr(cfg, "local_only", False),
             )
             bundle = load_model(
                 path,
@@ -266,7 +242,7 @@ class HFLocalBackend(LLMBackend):
         tok, model = self.bundle.tokenizer, self.bundle.model
         prompt = render_chat(tok, messages)
         enc = tok(prompt, return_tensors="pt").to(self.bundle.device)
-        temperature = float(kw.get("temperature", self.cfg.temperature))
+        temperature = float(kw.get("temperature", self.cfg.temperature) or 0.0)
         gen_kwargs: Dict[str, Any] = {
             "max_new_tokens": int(kw.get("max_tokens", self.cfg.max_tokens)),
             "pad_token_id": tok.pad_token_id,
@@ -274,7 +250,7 @@ class HFLocalBackend(LLMBackend):
         if temperature > 0:
             gen_kwargs.update(
                 do_sample=True, temperature=temperature,
-                top_p=float(kw.get("top_p", self.cfg.top_p)),
+                top_p=float(kw.get("top_p", self.cfg.top_p) or 1.0),
             )
         else:
             gen_kwargs.update(do_sample=False)

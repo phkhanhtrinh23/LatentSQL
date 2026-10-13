@@ -1,58 +1,22 @@
-# virtualenvs / caches
+# environments / caches
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .ipynb_checkpoints/
+.claude/
 
-# papers: fetched on demand by scripts/fetch_papers.sh (copyright + repo size)
-pdfs/*.pdf
-pdfs/txt/
+# converted benchmarks and run outputs
+data/
+outputs/
 
-# experiment outputs. The two recorded test logs referenced by the README are
-# force-added; everything else here is regenerable.
-outputs/*
-!outputs/.gitkeep
-!outputs/smoke_test_output.txt
-!outputs/unit_test_output.txt
-
-# model checkpoints / adapters
+# checkpoints
 *.safetensors
 *.bin
 *.pt
-!latentsql/**/*.py
-
-# LaTeX build artifacts - keep only the .tex source and the compiled .pdf
-*.aux
-*.log
-*.out
-*.toc
-*.lof
-*.lot
-*.synctex.gz
-*.fls
-*.fdb_latexmk
-*.bbl
-*.bcf
-*.blg
-*.run.xml
-*.nav
-*.snm
-*.vrb
-*.idx
-*.ilg
-*.ind
-*.glo
-*.gls
-*.glg
-*.acn
-*.acr
-*.alg
 
 # os
 .DS_Store
 Thumbs.db
-
-# third-party repo cloned in for reference (FINER-SQL, ICDE 2026).
-# It has its own git history and upstream, so it is not vendored here.
-finer-sql/
+datasets/

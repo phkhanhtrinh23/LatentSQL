@@ -1,0 +1,61 @@
+# LatentSQL defaults = the hyperparameters of the paper (Appendix A.3, Table 3).
+# Every key is optional; omitted keys take the values in latentsql/config.py.
+paths:
+  data_dir: data
+  output_dir: outputs/latentsql
+  cache_dir: outputs/cache
+
+data:
+  train_benchmarks: [wikisql, bird, spider, kaggledbqa, sparc, cosql, ehrsql, livesqlbench]
+  eval_benchmarks:  [wikisql, bird, spider, kaggledbqa, sparc, cosql, ehrsql, livesqlbench]
+  heldout_fraction: 0.3        # KaggleDBQA / LiveSQLBench: 70:30 split
+  split_seed: 0
+
+teacher:                       # Sec. 4.1
+  backend: openai
+  model: gpt-5.4
+  max_revisions: 1
+
+student:                       # LoRA, Table 3
+  model: Qwen/Qwen3-8B
+  bf16: true
+  lora_r: 32
+  lora_alpha: 64
+
+latent:                        # Sec. 4.2, Table 3
+  roles: [schema_selector, candidate_generator, reviser]   # J = 3
+  latent_steps: 2              # m
+  top_k: 10                    # n_top
+  temperature: 0.5             # tau
+  schema_alignment: true       # A_S for r1
+  schema_top_k: 10             # n_S
+  schema_beta: 0.3             # beta
+
+curriculum:                    # Sec. 4.2, Table 3
+  use_role_traces: true
+  curriculum: true
+  epochs_per_stage: 3
+  batch_size: 16
+  lr: 5.0e-5                   # warm-up and stage 1
+  lr_late: 1.0e-5              # stages 2 and 3
+  max_grad_norm: 1.0
+  probe_weight: 0.5            # lambda
+  probe_tokens: 24             # kappa
+  schema_weight: 0.5           # lambda_S
+
+rl:                            # Sec. 4.3, Table 3
+  group_size: 8
+  clip_eps: 0.2
+  temperature: 1.0
+  lr: 1.0e-6
+  max_new_tokens: 256
+  n_initial_instances: 5
+  max_pool_size: 20
+  verifier: verieql
+  verieql_bound: 5             # b
+  verieql_timeout: 10          # t_max (s)
+  # verieql_python: /path/to/verieql-env/bin/python
+  # verieql_dir: /path/to/VeriEQL
+
+eval:
+  temperature: 0.0             # greedy

@@ -1,74 +1,28 @@
-# Tiny config used by scripts/smoke_test.py and for a first end-to-end dry run.
-# Everything is deliberately small enough to finish on a CPU in minutes.
-#
-#   python scripts/smoke_test.py --config configs/smoke.yaml
-#
-# The `mock` backend is an offline TEST DOUBLE, not a language model: it reads
-# the gold SQL and returns per-agent perturbations of it. Accuracy numbers
-# produced with it measure orchestration plumbing only. Never report them.
-
+# Tiny offline configuration: synthetic data, mock teacher, a tiny random model,
+# mutation verifier. Checks that the pipeline runs end to end; numbers are meaningless.
+base: default.yaml
 paths:
-  output_dir: outputs/_smoke
-  cache_dir: outputs/_smoke/cache
-
-llm:
+  output_dir: outputs/smoke
+data:
+  train_benchmarks: [synthetic]
+  eval_benchmarks: [synthetic]
+teacher:
   backend: mock
-  model: mock
-  temperature: 0.7
-  max_tokens: 512
-
-mas:
-  agents: [divide_conquer, query_plan, dail_icl]
-  rounds: 2
-  selector: unit_test
-  n_unit_tests: 3
-  dail_shots: 3
-  execution_timeout: 10.0
-
-trace:
-  require_consensus: true
-  require_correct: true
-  max_trace_chars: 20000
-
-sft:
-  model_name_or_path: HuggingFaceTB/SmolLM2-135M-Instruct
-  output_dir: outputs/_smoke/sft
-  epochs: 1
-  batch_size: 1
-  grad_accum: 2
-  max_seq_len: 1024
-  lora: true
-  lora_r: 8
-  lora_alpha: 16
+student:
+  model: hf-internal-testing/tiny-random-LlamaForCausalLM
   bf16: false
   gradient_checkpointing: false
-  device: cpu
-
-grpo:
-  output_dir: outputs/_smoke/grpo
-  epochs: 1
+latent:
+  top_k: 4
+curriculum:
+  epochs_per_stage: 1
+  batch_size: 4
+rl:
   group_size: 2
+  max_new_tokens: 16
   batch_prompts: 1
   grad_accum: 1
-  max_new_tokens: 24
-  bf16: false
-  device: cpu
-  reward:
-    len_start: 64
-    len_end: 16
-
-latent:
-  enabled: true
-  latent_steps: 3
-  roles: [divide_conquer, query_plan, consensus]
-
-steering:
-  layer: -1
-  n_pairs: 6
-
+  max_train_examples: 2
+  verifier: mutation
 eval:
-  dataset: synthetic
-  n_samples: 6
-  max_new_tokens: 32
-
-seed: 0
+  max_new_tokens: 16

@@ -1,37 +1,26 @@
-"""Counterexample-guided database instances (main_latentsql.pdf Sec. 4.3, Eq. 22).
+"""Counterexample-guided growth of the database-instance pool (Sec. 4.3).
 
-The fixed stress instances of ``spurious.py`` are built from the gold query
-alone, so they can miss the particular mistake a student keeps making. Here,
-during RL, a rollout Y that is correct on D and on every instance in the pool
-but whose atomic operations differ from the gold's is attacked directly: we
-search for a small edit Delta of D (at most ``n_delta`` inserted or modified
-rows) such that
+The initial instances of ``instances.py`` are built from the gold query alone,
+so they can miss the mistakes the student actually makes. During RL, when a
+rollout Y passes every instance in the pool I(Y*) but its atomic operations
+differ from those of Y*, a verifier searches for a database on which Y and Y*
+disagree (counterexample-guided synthesis, Solar-Lezama et al., 2006). A found
+database joins the pool, up to ``max_pool_size`` instances in total, and every
+later rollout of the question is checked against it.
 
-    exec(Y, D + Delta) != exec(Y*, D + Delta).
+Verifiers:
 
-A found edit joins the question's pool (up to ``k_max`` instances counting the
-fixed ones) and every later rollout of that question is checked against it.
-If the budget runs out, Y is treated as equivalent to Y* (CEGIS,
-Solar-Lezama et al., 2006).
+* ``verieql`` (paper): VeriEQL (He et al., 2024), a bounded SMT-based
+  equivalence checker, run in its own Python environment through
+  ``scripts/verieql_worker.py``. It either proves Y and Y* equivalent on every
+  database with at most ``bound`` rows per table, or returns such a database
+  on which they differ. The database is written to SQLite with the original
+  CREATE TABLE statements and re-checked by executing both queries.
+* ``mutation``: a dependency-free fallback that tries small edits of D (at most
+  ``n_delta`` inserted or modified rows built from the predicate constants of
+  Y and Y*). Useful when VeriEQL is not installed; it is not what the paper used.
 
-An instance is stored as its edit script, not a database copy: one writable
-copy of D per database is kept, and each check applies the edit inside a
-SAVEPOINT and rolls it back. Candidate values come from the constants and
-boundary values of the predicates in Y and Y*; edits never write primary-key
-or foreign-key columns except to give an inserted row a fresh integer key, so
-key and FK constraints hold. Training-only: evaluation uses the original
-databases and the gold-only instances.
-
-When mutation search finds nothing, an optional second verifier runs:
-VeriEQL (He et al., OOPSLA 2024), an SMT-based bounded equivalence checker,
-in its own Python environment (``scripts/verieql_worker.py``). Given the
-involved tables, their primary and foreign keys and both queries, it either
-proves the pair equivalent for every database with at most ``bound`` rows per
-table or returns such a database on which they differ. That small database is
-written to SQLite with the original CREATE TABLE statements, re-checked by
-executing both queries (VeriEQL works in its own SQL semantics, e.g. it
-upper-cases string literals), and joins the pool as a separate instance.
-Equivalent, unsupported or timed-out pairs keep their reward.
+Pools live only for training; evaluation uses the original databases.
 """
 from __future__ import annotations
 
@@ -49,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .execute import ExecResult, gold_is_ordered, is_read_only, result_match
-from .spurious import (MAX_STRESS_DB_BYTES, BoundaryLiteral, _neighbor, extract_literals)
+from .instances import (MAX_STRESS_DB_BYTES, BoundaryLiteral, _neighbor, extract_literals)
 
 Edit = Tuple[str, Tuple[Any, ...]]          # (sql, params)
 
@@ -91,8 +80,15 @@ class CounterexamplePool:
                  budget: int = 40, timeout: float = 5.0, seed: int = 0,
                  max_db_bytes: int = MAX_STRESS_DB_BYTES,
                  verieql_python: Optional[str] = None, verieql_dir: Optional[str] = None,
-                 verieql_bound: int = 2, verieql_timeout: float = 60.0):
+                 verieql_bound: int = 5, verieql_timeout: float = 10.0,
+                 verifier: str = "verieql"):
         self.cache_dir = cache_dir
+        if verifier not in ("verieql", "mutation"):
+            raise ValueError(f"verifier must be 'verieql' or 'mutation', got {verifier!r}")
+        if verifier == "verieql" and not (verieql_python and verieql_dir):
+            raise ValueError("verifier='verieql' needs rl.verieql_python and rl.verieql_dir "
+                             "(see README, 'VeriEQL'); or set rl.verifier=mutation")
+        self.verifier = verifier
         self.verieql_python, self.verieql_dir = verieql_python, verieql_dir
         self.verieql_bound, self.verieql_timeout = int(verieql_bound), float(verieql_timeout)
         self._inst_conns: Dict[str, sqlite3.Connection] = {}
@@ -341,10 +337,12 @@ class CounterexamplePool:
 
     def _search(self, db_path: str, pred: str, gold: str) -> bool:
         self.stats["searches"] += 1
-        if self._mutation_search(db_path, pred, gold):
-            self.stats["found_mutation"] += 1
-            return True
-        if self.verieql_python and self.verieql_dir and self._verieql_search(db_path, pred, gold):
+        if self.verifier == "mutation":
+            if self._mutation_search(db_path, pred, gold):
+                self.stats["found_mutation"] += 1
+                return True
+            return False
+        if self._verieql_search(db_path, pred, gold):
             self.stats["found_verieql"] += 1
             self.stats["found"] += 1
             return True

@@ -1,0 +1,6 @@
+# LatentSQL with Qwen/Qwen3-8B as the student (Table 1).
+base: default.yaml
+paths:
+  output_dir: outputs/qwen3_8b
+student:
+  model: Qwen/Qwen3-8B

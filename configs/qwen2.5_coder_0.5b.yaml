@@ -1,0 +1,6 @@
+# LatentSQL with Qwen/Qwen2.5-Coder-0.5B-Instruct as the student (Table 1).
+base: default.yaml
+paths:
+  output_dir: outputs/qwen2.5_coder_0.5b
+student:
+  model: Qwen/Qwen2.5-Coder-0.5B-Instruct

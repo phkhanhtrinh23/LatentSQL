@@ -1,201 +1,118 @@
-"""Scoring: execution accuracy, VES, and the token-efficiency numbers.
-
-IMAD's headline table reports accuracy *and* average token consumption
-(input + output) per question, because the claim is "match the multi-agent
-system at a fraction of the cost". We report the same pair, plus BIRD's VES and
-a per-difficulty breakdown.
-"""
+"""Execution accuracy, efficiency counters, and mean +- 95% CI over runs."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-from ..db.execute import execution_accuracy, valid_efficiency_score
+from ..db.execute import execution_accuracy
 
 
 @dataclass
 class Prediction:
     qid: str
+    dataset: str
     db_id: str
     db_path: str
     question: str
     gold_sql: str
     pred_sql: Optional[str]
-    correct: Optional[bool] = None
-    ves: Optional[float] = None
     difficulty: str = ""
-    dataset: str = ""              # which benchmark the question came from
+    correct: Optional[bool] = None
     prompt_tokens: int = 0
+    #: generated tokens (the SQL only, for LatentSQL)
     completion_tokens: int = 0
+    latent_steps: int = 0
+    #: KV-cache positions spent on reasoning (role tags, latent steps, <sql>)
+    reasoning_positions: int = 0
     latency_s: float = 0.0
     raw_output: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-@dataclass
-class EvalReport:
-    method: str
-    dataset: str
-    n: int
-    ex: float                      # execution accuracy
-    ves: Optional[float] = None
-    avg_total_tokens: float = 0.0
-    avg_completion_tokens: float = 0.0
-    avg_latency_s: float = 0.0
-    by_difficulty: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    #: EX per source benchmark. Only meaningful for a combined set, where a
-    #: single headline number would average two benchmarks of very different
-    #: difficulty; on a single-benchmark run it holds one entry.
-    by_dataset: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    n_unparseable: int = 0
-    #: peak GPU memory and device seen while this method ran
-    resources: Dict[str, Any] = field(default_factory=dict)
-    notes: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    def as_row(self) -> str:
-        ves = f"{self.ves:.3f}" if self.ves is not None else "  -  "
-        return (
-            f"{self.method:<18} {self.dataset:<10} n={self.n:<5} "
-            f"EX={self.ex * 100:6.2f}%  VES={ves}  "
-            f"tok={self.avg_total_tokens:8.1f}  out={self.avg_completion_tokens:7.1f}  "
-            f"{self.avg_latency_s:6.2f}s"
-            + (f"   [{self.per_dataset_text()}]" if len(self.by_dataset) > 1 else "")
-        )
-
-    def per_dataset_text(self) -> str:
-        return "  ".join(
-            f"{k}: {v['ex'] * 100:.2f}% (n={int(v['n'])})"
-            for k, v in sorted(self.by_dataset.items())
-        )
-
-
-def score_predictions(
-    preds: Sequence[Prediction],
-    timeout: float = 30.0,
-    compute_ves: bool = False,
-) -> None:
-    """Fill in ``correct`` (and optionally ``ves``) in place."""
+def score(preds: Sequence[Prediction], timeout: float = 30.0) -> None:
+    """Fill ``correct`` = EX(Y, Y*, D) in place."""
     for p in preds:
         if p.correct is None:
-            ok, _pr, _gr = execution_accuracy(p.db_path, p.pred_sql, p.gold_sql, timeout=timeout)
-            p.correct = ok
-        if compute_ves and p.ves is None:
-            p.ves = valid_efficiency_score(p.db_path, p.pred_sql, p.gold_sql, timeout=timeout)
+            p.correct, _, _ = execution_accuracy(p.db_path, p.pred_sql, p.gold_sql, timeout=timeout)
 
 
-def build_report(
-    preds: Sequence[Prediction],
-    method: str,
-    dataset: str,
-    compute_ves: bool = False,
-    notes: str = "",
-) -> EvalReport:
-    n = len(preds)
-    if n == 0:
-        return EvalReport(method=method, dataset=dataset, n=0, ex=0.0, notes=notes)
+def _mean(xs: Sequence[float]) -> float:
+    return round(statistics.fmean(xs), 4) if xs else 0.0
 
-    ex = sum(1 for p in preds if p.correct) / n
 
-    # VES is a BIRD metric (it needs BIRD's runtime-efficiency definition), so
-    # on a combined set average it over the BIRD rows only rather than diluting
-    # it with Spider rows that have no meaningful value.
-    ves = None
-    if compute_ves:
-        scored = [p for p in preds if p.dataset in ("", "bird")] or list(preds)
-        ves = sum(p.ves or 0.0 for p in scored) / len(scored)
-
-    by_diff: Dict[str, Dict[str, float]] = {}
+def report(preds: Sequence[Prediction]) -> Dict[str, Any]:
+    """EX and efficiency per benchmark, with a per-difficulty breakdown."""
+    out: Dict[str, Any] = {}
+    by_ds: Dict[str, List[Prediction]] = {}
     for p in preds:
-        key = p.difficulty or "all"
-        bucket = by_diff.setdefault(key, {"n": 0.0, "correct": 0.0})
-        bucket["n"] += 1
-        bucket["correct"] += 1.0 if p.correct else 0.0
-    for key, bucket in by_diff.items():
-        bucket["ex"] = round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0
-
-    by_ds: Dict[str, Dict[str, float]] = {}
-    for p in preds:
-        bucket = by_ds.setdefault(p.dataset or dataset, {"n": 0.0, "correct": 0.0})
-        bucket["n"] += 1
-        bucket["correct"] += 1.0 if p.correct else 0.0
-    for bucket in by_ds.values():
-        bucket["ex"] = round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0
-
-    from ..utils.telemetry import gpu_stats
-
-    return EvalReport(
-        method=method,
-        dataset=dataset,
-        n=n,
-        ex=ex,
-        ves=ves,
-        resources=gpu_stats(),
-        avg_total_tokens=round(statistics.fmean(p.total_tokens for p in preds), 2),
-        avg_completion_tokens=round(statistics.fmean(p.completion_tokens for p in preds), 2),
-        avg_latency_s=round(statistics.fmean(p.latency_s for p in preds), 3),
-        by_difficulty=by_diff,
-        by_dataset=by_ds,
-        n_unparseable=sum(1 for p in preds if not p.pred_sql),
-        notes=notes,
-    )
+        by_ds.setdefault(p.dataset, []).append(p)
+    for ds, ps in sorted(by_ds.items()):
+        diff: Dict[str, Dict[str, float]] = {}
+        for p in ps:
+            d = diff.setdefault(p.difficulty or "all", {"n": 0, "correct": 0})
+            d["n"] += 1
+            d["correct"] += int(bool(p.correct))
+        for d in diff.values():
+            d["ex"] = round(100.0 * d["correct"] / d["n"], 2)
+        out[ds] = {
+            "n": len(ps),
+            "ex": round(100.0 * sum(bool(p.correct) for p in ps) / len(ps), 2),
+            "by_difficulty": diff,
+            "avg_prompt_tokens": _mean([p.prompt_tokens for p in ps]),
+            "avg_generated_tokens": _mean([p.completion_tokens for p in ps]),
+            "avg_latent_steps": _mean([p.latent_steps for p in ps]),
+            "avg_reasoning_positions": _mean([p.reasoning_positions for p in ps]),
+            "avg_latency_s": _mean([p.latency_s for p in ps]),
+            "total_latency_s": round(sum(p.latency_s for p in ps), 2),
+            "n_unparseable": sum(1 for p in ps if not p.pred_sql),
+        }
+    return out
 
 
 def save_predictions(preds: Sequence[Prediction], path: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         for p in preds:
             fh.write(json.dumps(p.to_dict(), ensure_ascii=False) + "\n")
 
 
-def save_reports(reports: Sequence[EvalReport], path: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump([r.to_dict() for r in reports], fh, indent=4)
+def load_predictions(path: str) -> List[Prediction]:
+    with open(path, "r", encoding="utf-8") as fh:
+        return [Prediction(**json.loads(line)) for line in fh if line.strip()]
 
 
-def render_table(reports: Sequence[EvalReport]) -> str:
-    """A markdown table in IMAD's shape: accuracy next to token consumption."""
-    # a combined BIRD+Spider run gets one EX column per benchmark, because the
-    # blended number on its own is not comparable to any published result
-    sources = sorted({k for r in reports for k in r.by_dataset})
-    split = [s for s in sources if s in ("bird", "spider")] if len(sources) > 1 else []
+# --------------------------------------------------------------------------
+# mean and 95% confidence interval across runs (Table 1, Table 2)
+# --------------------------------------------------------------------------
+#: two-sided 97.5% quantiles of Student's t, by degrees of freedom
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
+         9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+         16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086, 25: 2.060, 30: 2.042}
 
-    extra_head = "".join(f" EX {s} (%) |" for s in split)
-    head = (
-        "| Method | Dataset | n | EX (%) |" + extra_head + " VES | Avg tokens | "
-        "Avg output tokens | Tokens vs MAS |\n"
-        "|---|---|---:|---:|" + "---:|" * len(split) +
-        "---:|---:|---:|---:|\n"
-    )
-    base = next(
-        (r.avg_total_tokens for r in reports if r.method in ("fusion_mas", "mas")), None
-    )
-    rows = []
-    for r in reports:
-        rel = (
-            f"{100.0 * r.avg_total_tokens / base:.1f}%"
-            if base and base > 0 else "-"
-        )
-        ves = f"{r.ves:.3f}" if r.ves is not None else "-"
-        cells = ""
-        for s in split:
-            b = r.by_dataset.get(s)
-            cells += f" {b['ex'] * 100:.2f} |" if b and b["n"] else " - |"
-        rows.append(
-            f"| {r.method} | {r.dataset} | {r.n} | {r.ex * 100:.2f} |" + cells +
-            f" {ves} | {r.avg_total_tokens:.1f} | {r.avg_completion_tokens:.1f} | {rel} |"
-        )
-    return head + "\n".join(rows)
+
+def t_quantile(df: int) -> float:
+    if df in _T975:
+        return _T975[df]
+    if df > 30:
+        return 1.96 + 2.4 / df          # close to the normal quantile
+    return _T975[max(k for k in _T975 if k <= df)]
+
+
+def mean_ci95(values: Sequence[float]) -> Dict[str, float]:
+    """Mean and half-width of the 95% t-interval (0 for a single run)."""
+    n = len(values)
+    if n == 0:
+        return {"mean": float("nan"), "ci95": float("nan"), "n_runs": 0}
+    m = statistics.fmean(values)
+    if n == 1:
+        return {"mean": round(m, 2), "ci95": 0.0, "n_runs": 1}
+    sd = statistics.stdev(values)
+    return {"mean": round(m, 2), "ci95": round(t_quantile(n - 1) * sd / math.sqrt(n), 2),
+            "n_runs": n}

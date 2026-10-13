@@ -1,8 +1,8 @@
-"""Backend-agnostic chat interface used by every teacher agent.
+"""Backend-agnostic chat interface used by the teacher.
 
-The teacher MAS only ever calls :meth:`LLMBackend.ask`, so the same agent code
-runs against a hosted API, a local vLLM server, a local HuggingFace model, or
-the deterministic offline stub in ``latentsql.llm.mock``.
+The teacher only calls :meth:`LLMBackend.ask`, so the same code runs against a
+hosted API, an OpenAI-compatible server (vLLM, SGLang), a local HuggingFace
+model, or the offline stub in ``latentsql.llm.mock``.
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class LLMBackend(ABC):
 
 
 # --------------------------------------------------------------------------
-# output parsing helpers shared by every agent
+# output parsing helpers
 # --------------------------------------------------------------------------
 _FENCE = re.compile(r"```([a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 _SQL_START = re.compile(r"(?is)\b(WITH|SELECT)\b")
